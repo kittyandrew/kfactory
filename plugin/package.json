@@ -1,0 +1,12 @@
+{
+  "name": "factory-plugin-typecheck",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@types/node": "24.12.2",
+    "@opencode-ai/plugin": "1.15.4"
+  },
+  "devDependencies": {
+    "typescript": "5.8.2"
+  }
+}

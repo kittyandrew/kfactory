@@ -1,0 +1,75 @@
+#compdef kfactory
+# zsh completion for kfactory. Installed by default.nix into
+# $out/share/zsh/site-functions/_kfactory; nixpkgs adds that path to zsh's
+# fpath automatically via pkgs.zsh's setup-hook (environment.pathsToLink
+# includes share/zsh). No .zshrc edit required.
+#
+# Static completion: subcommand names, `auth` subgroup names, common
+# flags. Workspace-ID dynamic completion is intentionally deferred --
+# would require an HTTP fetch per TAB which adds latency.
+
+_kfactory() {
+  local -a commands auth_subs
+  commands=(
+    'auth:login / logout / status / refresh'
+    'list:show workspaces'
+    'attach:attach opencode TUI to a workspace'
+    'dispatch:create workspace + session + async prompt'
+    'delete:delete workspace + wipe on-disk clone'
+    'help:show usage'
+  )
+  auth_subs=(
+    'login:OIDC device-flow login (persists tokens)'
+    'logout:delete the token file'
+    'status:who am i, token state, server reachability'
+    'refresh:ensure access token is fresh (used by opencode TUI)'
+  )
+
+  local state
+  _arguments -C \
+    '1: :->cmd' \
+    '*::arg:->args'
+
+  case "$state" in
+    cmd)
+      _describe 'command' commands
+      ;;
+    args)
+      case "${words[1]}" in
+        auth)
+          if (( CURRENT == 2 )); then
+            _describe 'auth subcommand' auth_subs
+          else
+            case "${words[2]}" in
+              login)
+                _arguments \
+                  '--server[server URL]:url:' \
+                  '--issuer[OIDC issuer]:url:' \
+                  '--client-id[OIDC client id]:id:' \
+                  '--audience[OIDC audience]:id:'
+                ;;
+              status)
+                _arguments '--no-verify[skip server reachability ping]'
+                ;;
+            esac
+          fi
+          ;;
+        delete)
+          _arguments \
+            '(-y --yes)'{-y,--yes}'[skip confirmation]' \
+            '*:workspace ref (id|slug|index):'
+          ;;
+        attach)
+          _arguments '*:workspace ref (id|slug|index):'
+          ;;
+        dispatch)
+          _arguments \
+            '1:repo url (any git-clone-able URL):' \
+            '*:prompt:'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_kfactory "$@"
