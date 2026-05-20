@@ -1,0 +1,24 @@
+# Known-noise baseline for `factory-opencode-typecheck`. Each non-comment
+# line below is an `error TS<n>: ...` we expect tsc to emit against the
+# patched opencode source -- noise from opencode upstream that is NOT
+# our patches' responsibility. The check fails on ANY diff: a new error
+# means a regression to investigate; a missing baseline entry means
+# upstream fixed something and the corresponding line should be removed
+# here.
+#
+# Conventions:
+#   - Lines starting with `#` are comments and ignored by the diff.
+#   - Blank lines are ignored.
+#   - Empty file (no error-TS lines) = "expect zero tsc errors."
+#   - Multi-line tsc diagnostics: only the leading line (`<file>(line,col): error TS<n>: ...`)
+#     appears here; tsc's follow-up "Type X is not assignable to Y" lines
+#     are dropped by the `grep "error TS"` filter in the check.
+#   - Path normalization: `/build/source/` is stripped before comparison
+#     so the baseline is build-stable.
+#
+# Adding entries: run `nix build .#checks.x86_64-linux.factory-opencode-typecheck`,
+# copy the offending `error TS` line(s) from the diff, append below.
+# Removing entries: if a baseline line stops appearing in actual output,
+# the diff will surface it -- delete the line.
+
+../core/src/filesystem.ts(5,24): error TS7016: Could not find a declaration file for module 'mime-types'. 'node_modules/.bun/mime-types@3.0.2/node_modules/mime-types/index.js' implicitly has an 'any' type.

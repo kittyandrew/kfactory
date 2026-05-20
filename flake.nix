@@ -76,8 +76,30 @@
       kfactory = pkgs.callPackage ./. {};
       default = self.packages.${system}.kfactory;
 
+      # opencode-kfactory: opencode with both patches applied + the
+      # experimental-workspaces env var baked into the wrapper, so the
+      # workspace-routing middleware (added by the patches) is actually
+      # exercised at runtime. Consumers using the raw `patches.*` exports
+      # are responsible for setting OPENCODE_EXPERIMENTAL_WORKSPACES
+      # themselves.
       opencode-kfactory = opencode.packages.${system}.default.overrideAttrs (old: {
-        patches = (old.patches or []) ++ [./patches/opencode-bearer-auth.patch];
+        # @WARNING: DO NOT REORDER. opencode-kfactory-refresh.patch is
+        #   line-pinned against opencode-bearer-and-routing.patch's
+        #   post-apply hashes; its hunks have context lines that include
+        #   the first patch's additions. Reordering will make `patch`
+        #   reject loudly or fuzzy-apply at the wrong offset.
+        patches =
+          (old.patches or [])
+          ++ [
+            ./patches/opencode-bearer-and-routing.patch
+            ./patches/opencode-kfactory-refresh.patch
+          ];
+        postFixup =
+          (old.postFixup or "")
+          + ''
+            wrapProgram $out/bin/opencode \
+              --set OPENCODE_EXPERIMENTAL_WORKSPACES true
+          '';
       });
 
       oauth2-proxy-kfactory = pkgs.oauth2-proxy.overrideAttrs (old: {
@@ -117,10 +139,21 @@
     # Patch file paths for consumers to apply via overrideAttrs.
     #
     #   opencodePkg = inputs.opencode.packages.${system}.default.overrideAttrs (old: {
-    #     patches = (old.patches or []) ++ [inputs.kfactory.patches.opencode-bearer-auth];
+    #     patches = (old.patches or []) ++ [
+    #       inputs.kfactory.patches.opencode-bearer-and-routing
+    #       inputs.kfactory.patches.opencode-kfactory-refresh  # optional
+    #     ];
     #   });
+    #
+    # @WARNING: DO NOT REORDER the two opencode patches. opencode-kfactory-refresh
+    #   is line-pinned against opencode-bearer-and-routing's post-apply hashes;
+    #   its hunks have context lines that include the first patch's additions.
+    #   Apply in the order shown above or `patch` will reject loudly (or worse,
+    #   fuzzy-apply at the wrong offset). Consumers who only want the
+    #   upstreamable subset may include just opencode-bearer-and-routing.
     patches = {
-      opencode-bearer-auth = ./patches/opencode-bearer-auth.patch;
+      opencode-bearer-and-routing = ./patches/opencode-bearer-and-routing.patch;
+      opencode-kfactory-refresh = ./patches/opencode-kfactory-refresh.patch;
       oauth2-proxy-pkce-no-secret = ./patches/oauth2-proxy-pkce-no-secret.patch;
     };
 
@@ -171,13 +204,21 @@
         factory-opencode-patch-applies =
           pkgs.runCommand "factory-opencode-patch-applies" {
             src = opencode.outPath;
-            patch = ./patches/opencode-bearer-auth.patch;
+            patch1 = ./patches/opencode-bearer-and-routing.patch;
+            patch2 = ./patches/opencode-kfactory-refresh.patch;
             nativeBuildInputs = [pkgs.patch];
           } ''
             cp -R "$src" ./opencode
             chmod -R +w ./opencode
             cd ./opencode
-            patch -p1 --dry-run < "$patch"
+            # Apply BOTH patches for real in sequence -- mirrors how
+            # opencode-kfactory's configurePhase applies them, and
+            # catches cases where patch2 dry-runs cleanly but real
+            # apply fails (e.g., overlapping hunks at the same offset).
+            # The resulting tree is discarded; only the success/failure
+            # of patch -p1 matters.
+            patch -p1 < "$patch1"
+            patch -p1 < "$patch2"
             touch $out
           '';
 
@@ -194,10 +235,78 @@
             touch $out
           '';
 
+        # factory-plugin-token-discipline -- enforces the constants-block
+        # rule from `.claude/rules/010-plugin.md`: `pkgs.replaceVars`'s
+        # checkPhase fails on ANY leftover `@xxx@` pattern at build time,
+        # so placeholders may only appear in the dedicated constants block
+        # near the top of factory-adapter.ts. This check catches violations
+        # earlier (CI fails on the cheap grep instead of the more expensive
+        # build that would fail anyway).
+        factory-plugin-token-discipline =
+          pkgs.runCommand "factory-plugin-token-discipline" {
+            adapter = ./plugin/factory-adapter.ts;
+          } ''
+            # The constants block lives between the `// ---- Nix-substituted`
+            # marker comment and the next `// ----` section header. Anything
+            # `@[A-Z_]+@` outside that range is forbidden.
+            awk '
+              /^\/\/ ---- Nix-substituted/ { inblock=1; next }
+              inblock && /^\/\/ ----/      { inblock=0 }
+              !inblock && /@[A-Z_]+@/      { print FILENAME":"NR": forbidden placeholder: "$0; bad=1 }
+              END { exit bad }
+            ' "$adapter"
+            touch $out
+          '';
+
+        # factory-completion-loads -- sanity-checks the zsh completion
+        # file by force-parsing the function body in a sandboxed zsh
+        # and asserting no parse/load errors. Future flag additions or
+        # syntax slips in `_arguments` specs surface here instead of
+        # only when an operator's shell explodes mid-tab.
+        #
+        # `autoload -U` alone only marks a function as autoloadable
+        # without parsing the body until first call -- syntax errors
+        # inside `case` branches would slip past such a check. `autoload
+        # +X` forces the body to be parsed now, but its exit code is
+        # always 0 even when parsing emits diagnostics to stderr -- so
+        # we capture stderr separately and fail if it's non-empty.
+        #
+        # The check does NOT simulate completion against the actual CLI
+        # flag set; for that, see `kfactory --help` and grep
+        # cross-reference.
+        factory-completion-loads =
+          pkgs.runCommand "factory-completion-loads" {
+            completion = ./completions/_kfactory;
+            nativeBuildInputs = [pkgs.zsh];
+          } ''
+            mkdir compdir
+            cp "$completion" compdir/_kfactory
+            export HOME=$TMPDIR
+            errlog=$TMPDIR/autoload.err
+            zsh -fc '
+              fpath=('"$PWD"'/compdir $fpath)
+              autoload -Uz compinit
+              compinit -u -d '"$PWD"'/zcompdump
+              # +X forces parse-time evaluation; any diagnostics
+              # (unmatched quote, bad _arguments spec, etc.) print to
+              # stderr but do NOT change the exit code -- so we
+              # consult stderr below.
+              autoload +X _kfactory
+            ' 2> $errlog
+            if [ -s $errlog ]; then
+              echo "factory-completion-loads: zsh emitted diagnostics:" >&2
+              cat $errlog >&2
+              exit 1
+            fi
+            echo "_kfactory parsed OK"
+            touch $out
+          '';
+
         # factory-opencode-typecheck -- runs tsc --noEmit against the
         # patched opencode source. Closes the spec.md §7 gap where
-        # type-semantic drift inside opencode-bearer-auth.patch was not
-        # caught by CI (bun's bundler strips types without checking).
+        # type-semantic drift inside the bearer-auth + refresh patches
+        # was not caught by CI (bun's bundler strips types without
+        # checking).
         #
         # Builds on top of `opencode-kfactory` -- its configurePhase
         # already applies our patch and copies the upstream-prepared
@@ -214,25 +323,41 @@
         # tsc-in-opencode transitively resolves @opencode-ai/core types
         # via workspace references anyway, so the single hunk in
         # packages/core/src/flag/flag.ts is still indirectly covered.
-        factory-opencode-typecheck = self.packages.${system}.opencode-kfactory.overrideAttrs (old: {
+        factory-opencode-typecheck = self.packages.${system}.opencode-kfactory.overrideAttrs (_: {
           pname = "factory-opencode-typecheck";
+          baseline = ./checks/factory-opencode-typecheck.baseline;
           buildPhase = ''
             runHook preBuild
             cd packages/opencode
-            # tsc exits non-zero on any TS error; capture and post-filter
-            # the known opencode-upstream noise so only patch-induced
-            # errors fail the check.
+            # tsc exits non-zero on any TS error; we compare the FULL set
+            # of error lines against a checked-in baseline (the known
+            # opencode-upstream noise). Any diff fails the check --
+            # additions = new patch-induced errors; deletions = baseline
+            # noise that upstream has fixed (and should be removed here).
+            #
+            # Normalization: strip ANSI colors; strip the Nix store
+            # /build/source/ prefix so the baseline is build-stable.
             log=$(./node_modules/.bin/tsc --noEmit 2>&1 || true)
             echo "$log"
-            # Known upstream issue: opencode's packages/core/src/filesystem.ts
-            # imports `mime-types` without an @types/mime-types dep declared,
-            # so tsc reports TS7016 every time. Not our patch; filter it.
-            # If THIS pattern stops appearing in upstream (they add the types
-            # package), the grep will be a no-op -- no harm.
-            patch_errs=$(echo "$log" | grep "error TS" | grep -v "filesystem.ts.*mime-types" || true)
-            if [ -n "$patch_errs" ]; then
-              echo "factory-opencode-typecheck: patch-induced type errors:" >&2
-              echo "$patch_errs" >&2
+            # Match only real tsc error lines (file:loc - error TSnnnn:).
+            # Avoids picking up prose containing the substring "error TS"
+            # in the baseline's header comments.
+            errPattern='error TS[0-9]'
+            actual=$(printf '%s\n' "$log" \
+              | sed -E 's/\x1b\[[0-9;]*m//g' \
+              | grep -E "$errPattern" \
+              | sed -E 's|/build/source/?||g' \
+              | sort -u)
+            # Baseline allows leading `# comment` and blank lines.
+            expected=$(grep -E "$errPattern" < $baseline | sort -u)
+            if [ "$actual" != "$expected" ]; then
+              echo "factory-opencode-typecheck: tsc errors differ from baseline" >&2
+              echo "--- expected ($baseline) ---" >&2
+              printf '%s\n' "$expected" >&2
+              echo "--- actual ---" >&2
+              printf '%s\n' "$actual" >&2
+              echo "--- diff (- removed, + added) ---" >&2
+              diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
               exit 1
             fi
             runHook postBuild
@@ -242,7 +367,12 @@
             touch $out
             runHook postInstall
           '';
+          # opencode-kfactory adds postInstall (shell completion) and
+          # postFixup (env-var wrap) that operate on $out/bin/opencode --
+          # which the typecheck never produces. Clear both, plus the
+          # install-check that exercises the binary.
           postInstall = "";
+          postFixup = "";
           doInstallCheck = false;
         });
       });

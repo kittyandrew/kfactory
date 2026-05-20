@@ -52,13 +52,19 @@ func runDispatch(args []string) {
 	fmt.Fprintf(os.Stderr, "kfactory: opening session\n")
 	sess, err := createSession(ctx, tok, server, ws.ID)
 	if err != nil {
-		fail("dispatch: create session: %v", err)
+		fail("dispatch: create session: %v\n"+
+			"       workspace %s was created but no session attached.\n"+
+			"       clean it up with: kfactory delete %s",
+			err, ws.ID, ws.ID)
 	}
 	fmt.Fprintf(os.Stderr, "kfactory: session %s\n", sess.ID)
 
 	fmt.Fprintf(os.Stderr, "kfactory: sending prompt (async)\n")
 	if err := sendPromptAsync(ctx, tok, server, ws.ID, sess.ID, prompt); err != nil {
-		fail("dispatch: send prompt: %v", err)
+		fail("dispatch: send prompt: %v\n"+
+			"       workspace %s + session %s exist but no prompt was queued.\n"+
+			"       you can attach and re-send, or delete with: kfactory delete %s",
+			err, ws.ID, sess.ID, ws.ID)
 	}
 
 	fmt.Fprintf(os.Stderr, "kfactory: dispatched. attach with: kfactory attach %s\n", ws.ID)

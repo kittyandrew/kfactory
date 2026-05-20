@@ -182,6 +182,63 @@ proxy, all workspaces in opencode see the same authenticated identity.
 There is no per-workspace credential check inside opencode. Accepted
 under the trusted-agent threat model.
 
+### Shared auth-cache schema (Go ↔ patched TUI)
+
+The Go CLI and the patched opencode TUI both read and write
+`$XDG_CONFIG_HOME/kfactory/auth.json` (mode 0600). The schema is
+versioned via the top-level `schema_version` integer; both sides assert
+they understand it before using the contents.
+
+Authoritative definition: the `tokenFile` Go struct in
+`cmd/kfactory/auth.go` (and the `authFileSchemaVersion` constant next
+to it). The TS reader in `patches/opencode-kfactory-refresh.patch`
+(`AuthFile` interface in the attach.ts hunk) mirrors a SUBSET of the
+fields it actually consumes (`schema_version`, `access_token`,
+`expires_at`); the rest are opaque to TS.
+
+Version bumps: either side adding a non-backward-compatible field must
+bump `authFileSchemaVersion` (Go) AND the matching constant in the TS
+hunk. A missing/zero `schema_version` on disk is treated as v1 for
+back-compat with files written before the field was introduced.
+
+**Bootstrap mismatch caveat**: the TUI reads the file synchronously at
+`createBearerRefreshFetch` wire-up, BEFORE the toast-bus subscription
+in `app.tsx` has mounted. A schema version mismatch at that moment
+throws out of `opencode attach` with a clear `auth.json schema_version
+N != supported M` line on stderr rather than a toast hint. This is
+acceptable -- the failure mode is loud and the operator's recourse
+(`kfactory auth login` on a binary that matches the TUI version) is
+direct -- but it is NOT the same surface as runtime refresh failures
+that DO get a toast. Operators upgrading kfactory must coexist with a
+TUI built against the new schema.
+
+**Asymmetric reader caveat**: there are TWO readers of `auth.json`
+inside the patched opencode process:
+
+  1. `createBearerRefreshFetch` (in `attach.ts`) -- asserts
+     `schema_version === AUTH_FILE_SCHEMA_VERSION` and throws on
+     mismatch. Used to build the dynamic refresh-fetch wrapper.
+  2. `bearerFromCache` (in `server/auth.ts`, called from
+     `ServerAuth.header()`) -- does NOT assert. Used to construct the
+     static `Authorization` header at attach setup before the refresh
+     wrapper is wired in.
+
+Reader 1 runs second; the schema-mismatch throw from reader 1 fires
+before any unchecked bearer from reader 2 can be observed by the
+server. So the contract is intact today via ordering, not via reader
+symmetry. If anyone refactors `attach.ts` to call `validateSession`
+(or any other server-hitting code) BEFORE `createBearerRefreshFetch`,
+the unchecked read in reader 2 becomes the live failure surface and
+the version contract silently degrades. The principled fix is to
+mirror the `schema_version` assert in `bearerFromCache` -- deferred
+until either: (a) the asymmetry causes a real bug, or (b) the next
+opencode bump forces a re-diff of the refresh patch anyway.
+
+The cross-component exit-code contract for `kfactory auth refresh`
+(spawned by the TUI as a subprocess) is documented next to the named
+exit-code constants in `cmd/kfactory/exit.go` and mirrored in the
+TS-side `spawnKfactoryRefresh` comment in the patch.
+
 ## 5. Persistence contract
 
 **Workspace DATA is never auto-deleted.** Workspace clones,
@@ -249,17 +306,25 @@ relevant to a consumer.
   0600). Operator runs kfactory in their own terminal -- the CLI stays
   out of window management.
 
-- **`opencode-bearer-auth.patch` is mandatory.** Upstream opencode
-  v1.15.x's `opencode attach` only knows HTTP Basic auth. The patch
-  adds: `--bearer` / `OPENCODE_SERVER_BEARER` for Bearer-token attach;
-  cross-process token refresh against a shared file cache (see next
-  bullet); workspace-routing header fallback for non-GET requests
-  (SDK only rewrites header -> query for GET/HEAD); post-`adapter.create`
-  project re-resolve (next-but-one bullet). Bearer + workspace flags +
-  workspace-routing fallback + project re-resolve are upstreamable;
-  the file-cache refresh is deployment glue. Maintained locally until
-  the upstreamable pieces land. Verified on every opencode bump by the
-  `factory-opencode-patch-applies` flake check.
+- **Split opencode patches.** Upstream opencode v1.15.x's
+  `opencode attach` only knows HTTP Basic auth. Two patches, applied
+  in order:
+  - `opencode-bearer-and-routing.patch` -- upstreamable subset:
+    `--bearer` / `OPENCODE_SERVER_BEARER` for Bearer attach;
+    `--workspace` flag plumbed through `tui()` into `SDKProvider`,
+    `ProjectProvider`, AND `validateSession` (so the pre-attach probe
+    runs against the requested workspace); workspace-routing header
+    fallback for non-GET requests (the SDK only rewrites header ->
+    query for GET/HEAD); post-`adapter.create` project re-resolve in
+    `Workspace.create`.
+  - `opencode-kfactory-refresh.patch` -- kfactory-specific deployment
+    glue, applied on top: `OPENCODE_SERVER_BEARER_CACHE_PATH` env +
+    `bearerFromCache()`; subprocess `kfactory auth refresh` spawn via
+    `createBearerRefreshFetch`; shared auth.json schema with
+    `schema_version` assertion; toast subscription for refresh hints.
+  Maintained locally until the upstreamable half lands upstream.
+  Verified on every opencode bump by the `factory-opencode-patch-applies`
+  flake check (both patches must apply cleanly in order).
 
 - **Subprocess-delegated token refresh (kfactory owns; TUI spawns).**
   kfactory (Go) is the single source of truth for OIDC token refresh:
@@ -270,16 +335,20 @@ relevant to a consumer.
   The patched opencode TUI doesn't replicate any of that -- when the
   access token is near expiry the TUI spawns `kfactory auth refresh`,
   captures its stderr (NOT inherits -- inheriting would corrupt the
-  Ink alternate-screen mid-render), branches on the exit code, and
-  surfaces a one-time hint via `process.stderr.write` for
-  `not_logged_in` / `spawn_error` / `other_error`. Concurrent attaches
-  against the same operator desktop are serialized by kfactory's flock
-  regardless of which process initiated the refresh. This keeps
-  refresh logic in one place (Go, with its own tests) and shrinks the
-  TS patch vs an alternative file-cache-in-TS design. See
+  Ink alternate-screen mid-render), and branches on the exit code
+  (`exitOK`/`exitNotLoggedIn`/`exitOther` per `cmd/kfactory/exit.go`).
+  Refresh outcomes feed into an in-process pub/sub channel
+  (`refreshHintSubscribers`); an `onMount` subscription in `app.tsx`
+  surfaces a single error toast (`toast.show({variant: "error",
+  duration: 8000, ...})`) per failure mode per TUI session for
+  `not_logged_in` / `spawn_error` / `other_error`. Concurrent
+  attaches against the same operator desktop are serialized by
+  kfactory's flock regardless of which process initiated the refresh.
+  This keeps refresh logic in one place (Go, with its own tests) and
+  shrinks the TS patch vs an alternative file-cache-in-TS design. See
   `cmd/kfactory/auth.go:runAuthRefresh` and the TS fetch wrapper at
   `packages/opencode/src/cli/cmd/tui/attach.ts:createBearerRefreshFetch`
-  in the bearer-auth patch.
+  in `patches/opencode-kfactory-refresh.patch`.
 
 - **Bearer token is env-only / cache-file-only (never on argv).**
   kfactory passes `OPENCODE_SERVER_BEARER_CACHE_PATH` to the TUI; the
@@ -353,6 +422,13 @@ relevant to a consumer.
     semantics in workspace-routing.ts (the SDK only rewrites the
     header to a query string on GET/HEAD; the bearer-auth patch makes
     the server read both for all methods).
+  - `WorkspaceAdapter.remove` caller set. The plugin's `remove()`
+    does `rm -rf` of the workspace directory, trusting opencode to
+    only invoke it via operator-initiated DELETE
+    `/experimental/workspace/<id>`. A future upstream feature that
+    calls `remove()` from a different path (orphan GC, rollback after
+    failed create, etc.) would silently wipe clones contrary to the
+    persistence contract (§5). Audit the call sites on every bump.
 
 - **No slash commands; permission rules ARE the supervision
   mechanism.** Earlier designs had `/commit` and `/yield` slash
@@ -360,6 +436,17 @@ relevant to a consumer.
   `rm -rf /*`, `sudo *`, etc.) force the agent to ASK before
   destructive ops, and the operator's approval IS the supervision
   pause point. No separate yield primitive needed.
+
+- **`factory-opencode-typecheck` Nix check.** Reuses the
+  `opencode-kfactory` build (patched source + opencode's own
+  `node_modules.nix`-built deps) and runs `tsc --noEmit` against
+  `packages/opencode/`. Uses standard `tsc` rather than `tsgo` (which
+  needs a postinstall-downloaded native binary that opencode's
+  `bun install --ignore-scripts` skips). A baseline-diff filter
+  excludes opencode-upstream noise (e.g. missing `@types/mime-types`
+  in `packages/core/src/filesystem.ts`); any new patch-induced type
+  error fails the check. Closes the type-semantic drift gap the
+  original v1 of this spec listed as frontier work.
 
 ## 7. Scope frontier
 
@@ -395,22 +482,6 @@ repo's runbook, not in this spec):
   llm-trace + permission-trace JSONL per workspace for later
   analysis. Implementation belongs in the consumer.
 
-- **`factory-opencode-typecheck` Nix-side flake check.** Today CI
-  builds the patched opencode (`checks.opencode-kfactory`) which
-  catches patch-application errors and bundle-time failures in the
-  patched TS. It does NOT catch type-semantic drift -- bun's bundler
-  strips types and doesn't run `tsc`. A future check would apply the
-  patch + run opencode's own `bun turbo typecheck` against the result.
-  Implementation is non-trivial because nixpkgs lacks clean
-  bun-deps-in-sandbox support: bun install needs network for
-  postinstall scripts (turbo + tsgo bring per-platform native
-  binaries); `--ignore-scripts` leaves the .bin symlinks dangling;
-  workspace catalog deps trip plain tsc. The right path is probably
-  a bun-equivalent of nixpkgs' `buildNpmPackage` setup-hook, or a
-  patchShebangs-based shim that lets `bun install` run cleanly. Until
-  shipped, the manual procedure on opencode bumps is: cd to source,
-  apply patch, `bun install`, `bun turbo typecheck`.
-
 - **VM-restart auto-continue for in-flight sessions.** Today the
   heal-on-boot SQLite pass marks interrupted sessions as
   `finish: "interrupted-by-restart"`. The operator must reattach and
@@ -426,7 +497,9 @@ repo's runbook, not in this spec):
 cmd/kfactory/         Go CLI (auth / list / attach / dispatch / delete)
 completions/_kfactory zsh completion (auto-installed via $out/share/zsh/site-functions)
 plugin/               factory-adapter.ts + package.json + tsconfig.json
-patches/              opencode-bearer-auth.patch + oauth2-proxy-pkce-no-secret.patch
+patches/              opencode-bearer-and-routing.patch
+                      + opencode-kfactory-refresh.patch
+                      + oauth2-proxy-pkce-no-secret.patch
 default.nix           kfactory CLI build (empty endpoint defaults; ldflags-injectable)
 flake.nix             packages.kfactory / lib.mkFactoryAdapter / patches.* / checks.*
 .claude/rules/        plugin editing + patch re-diff workflows

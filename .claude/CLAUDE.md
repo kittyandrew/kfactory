@@ -31,9 +31,12 @@ via `nix develop -c <cmd>`. To match CI locally, prefix with `nix develop -c`.
 - `nix develop -c actionlint && nix develop -c zizmor .github/workflows`
   -- workflow lint + security audit.
 - `nix flake check` -- builds every `packages.${system}.*` (registered
-  as checks via `flake.nix`) plus `factory-plugin-typecheck` and
-  `factory-opencode-patch-applies`. Adding a new package automatically
-  becomes a CI gate; no workflow edit needed.
+  as checks via `flake.nix`) plus the bespoke `factory-*` checks defined
+  in the `checks` attrset. The authoritative list lives in `flake.nix`;
+  query at runtime with
+  `nix eval --json .#checks.x86_64-linux --apply 'attrs: builtins.attrNames attrs'`.
+  Adding a new package or check automatically becomes a CI gate; no
+  workflow edit needed.
 - `nix build .#kfactory` -- builds the CLI binary. Defaults are empty;
   consumer `overrideAttrs` injects via `-ldflags -X` (see README).
 - `nix build .#opencode-kfactory` / `.#oauth2-proxy-kfactory` -- patched
@@ -54,7 +57,11 @@ Before claiming work done: run `nix flake check`, `golangci-lint`, and
   `defaultClientID`, `defaultAudience` in `main.go`). Consumers bake values
   via `overrideAttrs` + `-ldflags -X main.<name>=...`; operators can also
   pass `--server` / `--issuer` / `--client-id` / `--audience` on first
-  `kfactory auth login`.
+  `kfactory auth login`. **Exception**: `defaultAudienceScopeTemplate`
+  ships with the Zitadel URN `urn:zitadel:iam:org:project:id:%s:aud` as
+  a default so existing Zitadel deployments keep working without
+  ldflags. Non-Zitadel deployers override or empty-string it via
+  `-X main.defaultAudienceScopeTemplate=...`.
 - Token state: `$XDG_CONFIG_HOME/kfactory/auth.json` (mode 0600),
   cross-process refresh coordinated via POSIX `flock(2)` on
   `auth.json.lock`.
@@ -67,4 +74,4 @@ Before claiming work done: run `nix flake check`, `golangci-lint`, and
 
 `flake.nix` pins `inputs.opencode` to a specific tag because patches are
 line-number-pinned to that source. Bumping is documented in
-`.claude/rules/patches.md`.
+`.claude/rules/020-patches.md`.

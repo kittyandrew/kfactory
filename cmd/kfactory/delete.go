@@ -46,7 +46,11 @@ func runDelete(args []string) {
 		answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if a := strings.TrimSpace(strings.ToLower(answer)); a != "y" && a != "yes" {
 			fmt.Fprintln(os.Stderr, "kfactory: aborted")
-			os.Exit(1)
+			// Exit 0: user said no, command finished cleanly. Distinct
+			// from exitNotLoggedIn (1) and exitOther (2) per exit.go,
+			// so scripts can branch on "operator declined" vs "tried
+			// and failed."
+			return
 		}
 	}
 

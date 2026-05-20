@@ -1,3 +1,7 @@
 result
 result-*
 .direnv
+
+# `go build ./cmd/kfactory` drops the compiled binary in the repo root.
+# Don't track it.
+/kfactory

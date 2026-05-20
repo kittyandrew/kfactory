@@ -71,7 +71,7 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		usage()
-		os.Exit(1)
+		os.Exit(exitOther)
 	}
 
 	cmd, rest := args[0], args[1:]
@@ -91,7 +91,7 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "kfactory: unknown command %q\n\n", cmd)
 		usage()
-		os.Exit(1)
+		os.Exit(exitOther)
 	}
 }
 
@@ -99,8 +99,7 @@ func main() {
 // this subgroup -- one canonical path, no top-level aliases.
 func runAuth(args []string) {
 	if len(args) == 0 {
-		fmt.Fprint(os.Stderr, "kfactory: usage: kfactory auth <login|logout|status|refresh>\n")
-		os.Exit(1)
+		fail("auth: usage: kfactory auth <login|logout|status|refresh>")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -133,5 +132,5 @@ func usage() {
 
 func fail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "kfactory: "+format+"\n", args...)
-	os.Exit(1)
+	os.Exit(exitOther)
 }

@@ -1,0 +1,297 @@
+Bearer + --workspace flags + workspace-routing fallback + project re-resolve.
+
+Adds the genuinely-upstreamable subset of opencode-bearer-auth changes.
+This patch is independent of any deployment glue and is intended to be
+proposed upstream once the API stabilises.
+
+What this adds:
+  - `OPENCODE_SERVER_BEARER` env (core/flag/flag.ts) and a Bearer
+    response from `ServerAuth.header()` (server/auth.ts). The bearer
+    can also be passed via `opencode attach --bearer`.
+  - `opencode attach --workspace <id>` propagates through `tui()` into
+    `SDKProvider` (passed as `experimental_workspaceID`) and into
+    `ProjectProvider` (which seeds the workspace into the project store
+    so downstream components -- including `WorkspaceProvider`, which
+    reads `store.workspace.current` -- target the chosen workspace).
+    Net effect: the TUI's home prompt opens new sessions against the
+    workspace named on the command line.
+  - `validateSession` honours the workspace argument.
+  - Workspace-routing middleware reads `x-opencode-workspace` for ALL
+    methods, not just GET/HEAD. The SDK only rewrites header->query
+    for GET/HEAD, leaving POST/PUT/DELETE with the header verbatim;
+    upstream's server used to ignore the header on those methods.
+  - Post-`adapter.create` project re-resolve in `Workspace.create`.
+    Upstream copies the requesting instance's `project.id` at row
+    insert time; for an unscoped `POST /experimental/workspace` that
+    resolves to the front-opencode's cwd-based project (typically
+    `global` for a non-git cwd), and every workspace ends up sharing
+    `project_id = global`. Cascades into broken session lists,
+    broken SPA "review changes" widget, and broken workspace-scoped
+    `--continue`. This hunk runs `Project.fromDirectory(info.directory)`
+    after `WorkspaceAdapterRuntime.create` resolves and UPDATEs the
+    workspace row's `project_id` to the git-root OID.
+
+Server-side opencode does NOT validate the Bearer -- this patch only
+adds the surface area for clients to send it. Deployments fronting
+opencode with a JWT-validating reverse proxy can use this; deployments
+without a proxy continue to use HTTP Basic via `--password`.
+
+diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
+index 3ed67bb..59c1109 100644
+--- a/packages/core/src/flag/flag.ts
++++ b/packages/core/src/flag/flag.ts
+@@ -28,6 +28,7 @@ export const Flag = {
+   OPENCODE_FAKE_VCS: process.env["OPENCODE_FAKE_VCS"],
+   OPENCODE_SERVER_PASSWORD: process.env["OPENCODE_SERVER_PASSWORD"],
+   OPENCODE_SERVER_USERNAME: process.env["OPENCODE_SERVER_USERNAME"],
++  OPENCODE_SERVER_BEARER: process.env["OPENCODE_SERVER_BEARER"],
+ 
+   // Experimental
+   OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
+diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
+index 19a15a2..e9e5063 100644
+--- a/packages/opencode/src/cli/cmd/tui/app.tsx
++++ b/packages/opencode/src/cli/cmd/tui/app.tsx
+@@ -161,6 +161,7 @@ export function tui(input: {
+   args: Args
+   config: TuiConfig.Resolved
+   onSnapshot?: () => Promise<string[]>
++  workspace?: string
+   directory?: string
+   fetch?: typeof fetch
+   headers?: RequestInit["headers"]
+@@ -216,11 +217,12 @@ export function tui(input: {
+                         <SDKProvider
+                           url={input.url}
+                           directory={input.directory}
++                          workspace={input.workspace}
+                           fetch={input.fetch}
+                           headers={input.headers}
+                           events={input.events}
+                         >
+-                          <ProjectProvider>
++                          <ProjectProvider workspace={input.workspace}>
+                             <SyncProvider>
+                               <SyncProviderV2>
+                                 <ThemeProvider mode={mode}>
+diff --git a/packages/opencode/src/cli/cmd/tui/attach.ts b/packages/opencode/src/cli/cmd/tui/attach.ts
+index 2897a41..6f64955 100644
+--- a/packages/opencode/src/cli/cmd/tui/attach.ts
++++ b/packages/opencode/src/cli/cmd/tui/attach.ts
+@@ -43,6 +43,16 @@ export const AttachCommand = cmd({
+         alias: ["u"],
+         type: "string",
+         describe: "basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')",
++      })
++      .option("bearer", {
++        alias: ["b"],
++        type: "string",
++        describe: "bearer token (defaults to OPENCODE_SERVER_BEARER); overrides password/username",
++      })
++      .option("workspace", {
++        alias: ["w"],
++        type: "string",
++        describe: "experimental workspace ID for /experimental/workspace dispatch (x-opencode-workspace header)",
+       }),
+   handler: async (args) => {
+     const unguard = win32InstallCtrlCGuard()
+@@ -65,7 +75,11 @@ export const AttachCommand = cmd({
+           return args.dir
+         }
+       })()
+-      const headers = ServerAuth.headers({ password: args.password, username: args.username })
++      const headers = ServerAuth.headers({
++        password: args.password,
++        username: args.username,
++        bearer: args.bearer,
++      })
+       const config = await TuiConfig.get()
+       const { tui } = await import("./app")
+ 
+@@ -74,6 +88,7 @@ export const AttachCommand = cmd({
+           url: args.url,
+           sessionID: args.session,
+           directory,
++          workspace: args.workspace,
+           headers,
+         })
+       } catch (error) {
+@@ -91,6 +106,7 @@ export const AttachCommand = cmd({
+           fork: args.fork,
+         },
+         directory,
++        workspace: args.workspace,
+         headers,
+       })
+     } finally {
+diff --git a/packages/opencode/src/cli/cmd/tui/context/project.tsx b/packages/opencode/src/cli/cmd/tui/context/project.tsx
+index 22dd94b..f4aa162 100644
+--- a/packages/opencode/src/cli/cmd/tui/context/project.tsx
++++ b/packages/opencode/src/cli/cmd/tui/context/project.tsx
+@@ -8,7 +8,7 @@ type WorkspaceStatus = "connected" | "connecting" | "disconnected" | "error"
+ 
+ export const { use: useProject, provider: ProjectProvider } = createSimpleContext({
+   name: "Project",
+-  init: () => {
++  init: (props: { workspace?: string } = {}) => {
+     const sdk = useSDK()
+ 
+     const defaultPath = {
+@@ -27,7 +27,7 @@ export const { use: useProject, provider: ProjectProvider } = createSimpleContex
+         path: defaultPath,
+       },
+       workspace: {
+-        current: undefined as string | undefined,
++        current: props.workspace,
+         list: [] as Workspace[],
+         status: {} as Record<string, WorkspaceStatus>,
+       },
+diff --git a/packages/opencode/src/cli/cmd/tui/context/sdk.tsx b/packages/opencode/src/cli/cmd/tui/context/sdk.tsx
+index 96fa544..31c0e0b 100644
+--- a/packages/opencode/src/cli/cmd/tui/context/sdk.tsx
++++ b/packages/opencode/src/cli/cmd/tui/context/sdk.tsx
+@@ -13,6 +13,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+   name: "SDK",
+   init: (props: {
+     url: string
++    workspace?: string
+     directory?: string
+     fetch?: typeof fetch
+     headers?: RequestInit["headers"]
+@@ -26,6 +27,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+         baseUrl: props.url,
+         signal: abort.signal,
+         directory: props.directory,
++        experimental_workspaceID: props.workspace,
+         fetch: props.fetch,
+         headers: props.headers,
+       })
+diff --git a/packages/opencode/src/cli/cmd/tui/validate-session.ts b/packages/opencode/src/cli/cmd/tui/validate-session.ts
+index 31329a6..7edd37c 100644
+--- a/packages/opencode/src/cli/cmd/tui/validate-session.ts
++++ b/packages/opencode/src/cli/cmd/tui/validate-session.ts
+@@ -7,6 +7,7 @@ const decodeSessionID = Schema.decodeUnknownSync(SessionID)
+ export async function validateSession(input: {
+   url: string
+   sessionID?: string
++  workspace?: string
+   directory?: string
+   fetch?: typeof fetch
+   headers?: RequestInit["headers"]
+@@ -23,6 +24,7 @@ export async function validateSession(input: {
+   await createOpencodeClient({
+     baseUrl: input.url,
+     directory: input.directory,
++    experimental_workspaceID: input.workspace,
+     fetch: input.fetch,
+     headers: input.headers,
+   }).session.get({ sessionID }, { throwOnError: true })
+diff --git a/packages/opencode/src/control-plane/workspace.ts b/packages/opencode/src/control-plane/workspace.ts
+index a50df57..dc5b289 100644
+--- a/packages/opencode/src/control-plane/workspace.ts
++++ b/packages/opencode/src/control-plane/workspace.ts
+@@ -1,4 +1,4 @@
+-import { Context, Effect, FiberMap, Iterable, Layer, Schema, Stream } from "effect"
++import { Context, Effect, FiberMap, Iterable, Layer, Option, Schema, Stream } from "effect"
+ import { FetchHttpClient, HttpBody, HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http"
+ import { Database } from "@/storage/db"
+ import { asc } from "drizzle-orm"
+@@ -177,6 +177,12 @@ export const layer = Layer.effect(
+     const vcs = yield* Vcs.Service
+     const flags = yield* RuntimeFlags.Service
+     const fs = yield* AppFileSystem.Service
++    // Project.Service is hoisted to the outer layer-effect so that the
++    // post-adapter.create re-resolve hunk in `create` can call
++    // `projectSvc.fromDirectory(...)` without leaking Project.Service
++    // into the `create` method's effect requirements (which the Service
++    // Interface declares as `never`).
++    const projectSvc = yield* Project.Service
+     const connections = new Map<WorkspaceID, ConnectionStatus>()
+     const syncFibers = yield* FiberMap.make<WorkspaceID, void, SyncLoopError>()
+ 
+@@ -572,6 +578,29 @@ export const layer = Layer.effect(
+       }
+ 
+       yield* WorkspaceAdapterRuntime.create(adapter, config, env)
++
++      // kfactory: re-resolve the workspace's project from its directory
++      // AFTER adapter.create runs (clone completes). Without this, every
++      // new workspace inherits the requesting instance's project --
++      // typically `global` because the front-opencode's cwd isn't a git
++      // repo -- which makes session lists, SPA "review changes", and
++      // workspace-scoped routing all stay wrong for the lifetime of
++      // the workspace. With this hunk, workspaces whose adapter sets
++      // a usable directory get re-stamped with the directory's
++      // git-root-derived project ID.
++      if (info.directory) {
++        const resolved = yield* projectSvc.fromDirectory(info.directory).pipe(Effect.option)
++        if (Option.isSome(resolved) && resolved.value.project.id !== info.projectID) {
++          yield* db((db) => {
++            db.update(WorkspaceTable)
++              .set({ project_id: resolved.value.project.id })
++              .where(eq(WorkspaceTable.id, info.id))
++              .run()
++          })
++          info.projectID = resolved.value.project.id
++        }
++      }
++
+       yield* Effect.all(
+         [
+           waitEvent({
+diff --git a/packages/opencode/src/server/auth.ts b/packages/opencode/src/server/auth.ts
+index 9630ddb..5e979d9 100644
+--- a/packages/opencode/src/server/auth.ts
++++ b/packages/opencode/src/server/auth.ts
+@@ -7,6 +7,7 @@ import { Config as EffectConfig, Context, Option, Redacted } from "effect"
+ export type Credentials = {
+   password?: string
+   username?: string
++  bearer?: string
+ }
+ 
+ export type DecodedCredentials = {
+@@ -34,6 +35,9 @@ export function authorized(credentials: DecodedCredentials, config: Info) {
+ }
+ 
+ export function header(credentials?: Credentials) {
++  const bearer = credentials?.bearer ?? Flag.OPENCODE_SERVER_BEARER
++  if (bearer) return `Bearer ${bearer}`
++
+   const password = credentials?.password ?? Flag.OPENCODE_SERVER_PASSWORD
+   if (!password) return undefined
+ 
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
+index cd9376f..80cc650 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
+@@ -63,9 +63,18 @@ function configuredWorkspaceID(): WorkspaceID | undefined {
+   return Flag.OPENCODE_WORKSPACE_ID ? WorkspaceID.make(Flag.OPENCODE_WORKSPACE_ID) : undefined
+ }
+ 
+-function selectedWorkspaceID(url: URL, sessionWorkspaceID?: WorkspaceID): WorkspaceID | undefined {
++function selectedWorkspaceID(
++  request: HttpServerRequest.HttpServerRequest,
++  url: URL,
++  sessionWorkspaceID?: WorkspaceID,
++): WorkspaceID | undefined {
++  // The SDK only rewrites `x-opencode-workspace` header -> `?workspace=`
++  // query for GET/HEAD requests (sdk/js/src/v2/client.ts rewrite()). For
++  // POST/PUT/DELETE the header stays, query is absent. Read both.
+   const workspaceParam = url.searchParams.get("workspace")
+-  return sessionWorkspaceID ?? (workspaceParam ? WorkspaceID.make(workspaceParam) : undefined)
++  const headerWorkspace = request.headers["x-opencode-workspace"]
++  const ref = workspaceParam ?? headerWorkspace
++  return sessionWorkspaceID ?? (ref ? WorkspaceID.make(ref) : undefined)
+ }
+ 
+ function defaultDirectory(request: HttpServerRequest.HttpServerRequest, url: URL): string {
+@@ -149,7 +158,7 @@ function planRequest(
+   return Effect.gen(function* () {
+     const url = requestURL(request)
+     const envWorkspaceID = configuredWorkspaceID()
+-    const workspaceID = selectedWorkspaceID(url, sessionWorkspaceID)
++    const workspaceID = selectedWorkspaceID(request, url, sessionWorkspaceID)
+     const workspace = yield* resolveWorkspace(workspaceID, envWorkspaceID)
+ 
+     if (workspaceID && workspace === undefined && !envWorkspaceID) {

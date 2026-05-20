@@ -27,15 +27,15 @@ func serverFor(t *tokenFile) string {
 }
 
 // Workspace mirrors the WorkspaceInfo shape returned by opencode's
-// /experimental/workspace endpoint. Only the fields kfactory consumes.
+// /experimental/workspace endpoint. Only the fields kfactory consumes;
+// unknown fields are dropped by the json decoder.
 type Workspace struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	Name      string          `json:"name"`
-	Directory string          `json:"directory"`
-	Extra     json.RawMessage `json:"extra"`
-	ProjectID string          `json:"projectID"`
-	TimeUsed  int64           `json:"timeUsed"`
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Name      string `json:"name"`
+	Directory string `json:"directory"`
+	ProjectID string `json:"projectID"`
+	TimeUsed  int64  `json:"timeUsed"`
 }
 
 // newRequest builds an HTTP request with the bearer token attached when
@@ -65,16 +65,20 @@ func newRequest(ctx context.Context, t *tokenFile, server, method, path string, 
 	return req, nil
 }
 
+// httpClient is reused across all factory API calls so multi-call paths
+// (dispatch: create workspace -> session -> prompt) get HTTP keep-alive
+// instead of opening a fresh TCP connection per call.
+var httpClient = &http.Client{Timeout: 60 * time.Second}
+
 func doJSON(req *http.Request, into any) error {
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", req.Method, req.URL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("server returned 401; token rejected -- run `kfactory login`")
+		return fmt.Errorf("server returned 401; token rejected -- run `kfactory auth login`")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("%s %s: %s: %s", req.Method, req.URL, resp.Status, strings.TrimSpace(string(body)))
@@ -197,6 +201,13 @@ func resolveWorkspace(ctx context.Context, t *tokenFile, server, ref string) (*W
 //
 // Resolution is in that order: most-specific wins. Ambiguous prefix ->
 // error listing the candidates so the operator picks something narrower.
+//
+// @NOTE: numeric-prefix slugs are unreachable by prefix when the prefix
+//
+//	parses as a valid index (e.g. slug `12something--repo--1234` cannot
+//	be matched by `12` when only ~10 workspaces exist -- the numeric
+//	path errors "index out of range" before prefix matching runs).
+//	Operators with digit-prefixed slugs must use the full slug or id.
 func findWorkspace(ws []Workspace, ref string) (*Workspace, error) {
 	// Exact id.
 	for i := range ws {

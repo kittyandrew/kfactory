@@ -38,8 +38,20 @@ func runAttach(args []string) {
 		fail("attach: opencode not on PATH: %v", err)
 	}
 
+	// The patched opencode TUI spawns `kfactory auth refresh` as a
+	// subprocess when its bearer nears expiry (see
+	// patches/opencode-kfactory-refresh.patch). If `kfactory` itself
+	// isn't on PATH at the point the TUI runs, refresh fails forever
+	// and the operator only finds out after the first 401 mid-session.
+	// Surface early.
+	if _, err := exec.LookPath("kfactory"); err != nil {
+		fail("attach: kfactory not on PATH for subprocess refresh: %v\n"+
+			"       opencode TUI will fail to refresh the access token; reattach won't help",
+			err)
+	}
+
 	// Shared refresh-token cache: the opencode TUI (patched via
-	// patches/opencode-bearer-auth.patch) reads
+	// patches/opencode-kfactory-refresh.patch) reads
 	// OPENCODE_SERVER_BEARER_CACHE_PATH and pulls the access token from
 	// the file at attach time. When the token nears expiry the TUI
 	// spawns `kfactory auth refresh` (subprocess) which refreshes under a

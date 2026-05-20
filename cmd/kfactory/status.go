@@ -1,11 +1,20 @@
 // `kfactory auth status`: show who the operator is logged in as, the
 // access-token expiry state, whether a refresh token is present, and
 // (with --verify, the default) whether the server actually accepts the
-// current token. Exits 0 if usable, 1 if not logged in or token rejected.
+// current token. Exit codes follow the cross-component contract in
+// exit.go: exitOK if usable, exitNotLoggedIn if no token / token
+// rejected, exitOther for build/network/other failures.
+//
+// @WARNING: NOT side-effect-free. The verify path goes through
+//
+//	ensureFresh, which rotates persisted state if the access token is
+//	expired (POSTs the refresh_token, atomic-renames the new tokens).
+//	Use `--no-verify` for a truly read-only inspection.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -29,7 +38,7 @@ func runAuthStatus(args []string) {
 		if os.IsNotExist(err) {
 			fmt.Println("kfactory: not logged in (no token file)")
 			fmt.Println("       run `kfactory auth login`")
-			os.Exit(1)
+			os.Exit(exitNotLoggedIn)
 		}
 		fail("auth status: %v", err)
 	}
@@ -75,7 +84,12 @@ func runAuthStatus(args []string) {
 	fresh, err := ensureFresh(ctx)
 	if err != nil {
 		fmt.Printf("  server:    ✗ cannot refresh token (%v)\n", err)
-		os.Exit(1)
+		// errNotLoggedIn = refresh_token rejected; anything else =
+		// transient (M2 work in ensureFresh classifies these).
+		if errors.Is(err, errNotLoggedIn) {
+			os.Exit(exitNotLoggedIn)
+		}
+		os.Exit(exitOther)
 	}
 	// Refresh may have rotated `t` -- re-pull. Note: t and fresh point
 	// to the same file content after ensureFresh persisted any rotation.
@@ -84,13 +98,15 @@ func runAuthStatus(args []string) {
 	req, err := newRequest(ctx, t, server, http.MethodGet, "/experimental/workspace", nil)
 	if err != nil {
 		fmt.Printf("  verify:    ✗ build request: %v\n", err)
-		os.Exit(1)
+		os.Exit(exitOther)
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	// Reuse the package-level client; the 10s budget here comes from
+	// the ctx above (`context.WithTimeout(... 10*time.Second)`), which
+	// is tighter than httpClient.Timeout (60s) and wins.
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("  verify:    ✗ unreachable (%v)\n", err)
-		os.Exit(1)
+		os.Exit(exitOther)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
@@ -98,22 +114,19 @@ func runAuthStatus(args []string) {
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized:
 		fmt.Println("  verify:    ✗ 401 -- token rejected (run `kfactory auth login`)")
-		os.Exit(1)
+		os.Exit(exitNotLoggedIn)
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		count := strings.Count(string(body), "\"id\":")
 		fmt.Printf("  verify:    ✓ %s (%d workspace%s)\n", resp.Status, count, plural(count))
 	default:
 		fmt.Printf("  verify:    ✗ %s: %s\n", resp.Status, strings.TrimSpace(string(body)))
-		os.Exit(1)
+		os.Exit(exitOther)
 	}
 }
 
-// truncDur rounds a duration down to seconds for the "valid" case, or
-// minutes when it's > 5min. Avoids "11h53m42.18s" in the status output.
+// truncDur rounds a duration to second precision under 5 minutes and to
+// minute precision above that. Avoids "11h53m42.18s" in the status output.
 func truncDur(d time.Duration) string {
-	if d < time.Minute {
-		return d.Truncate(time.Second).String()
-	}
 	if d < 5*time.Minute {
 		return d.Truncate(time.Second).String()
 	}

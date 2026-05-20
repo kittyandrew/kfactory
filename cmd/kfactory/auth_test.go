@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -41,6 +42,36 @@ func withTempHome(t *testing.T) string {
 	t.Setenv("XDG_CONFIG_HOME", tmp)
 	t.Setenv("HOME", tmp)
 	return tmp
+}
+
+func TestAcquireLockCtxCancel(t *testing.T) {
+	withTempHome(t)
+
+	// Hold the lock on a background fd.
+	f1, err := acquireLock(context.Background())
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	defer releaseLock(f1)
+
+	// Second acquire with a short ctx must return ctx.Err() promptly
+	// (not block until the holder releases).
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	f2, err := acquireLock(ctx)
+	elapsed := time.Since(start)
+	if err == nil {
+		releaseLock(f2)
+		t.Fatalf("expected ctx-cancel error while holder still holds")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+	// Allow up to one poll interval of slack on the cancel responsiveness.
+	if elapsed > 100*time.Millisecond+lockPollInterval+50*time.Millisecond {
+		t.Fatalf("ctx-cancel took %v; expected ~100ms (poll interval %v)", elapsed, lockPollInterval)
+	}
 }
 
 func TestAcquireLockContention(t *testing.T) {
@@ -107,7 +138,7 @@ func TestAcquireLockReleaseAndReacquire(t *testing.T) {
 	releaseLock(f2)
 }
 
-func TestAcquireLockSerializesAllWaiters(t *testing.T) {
+func TestAcquireLockAllWaitersEventuallyWin(t *testing.T) {
 	withTempHome(t)
 
 	ctx := context.Background()
@@ -195,7 +226,7 @@ func TestSaveAndLoadTokensRoundTrip(t *testing.T) {
 }
 
 func TestLoginScopesIncludesAudienceScope(t *testing.T) {
-	scopes := loginScopes("project123")
+	scopes := loginScopes("project123", "urn:zitadel:iam:org:project:id:%s:aud")
 	want := "urn:zitadel:iam:org:project:id:project123:aud"
 	found := false
 	for _, s := range scopes {
@@ -209,11 +240,7 @@ func TestLoginScopesIncludesAudienceScope(t *testing.T) {
 }
 
 func TestLoginScopesEmptyTemplateSkipsAudience(t *testing.T) {
-	orig := defaultAudienceScopeTemplate
-	defaultAudienceScopeTemplate = ""
-	defer func() { defaultAudienceScopeTemplate = orig }()
-
-	scopes := loginScopes("project123")
+	scopes := loginScopes("project123", "")
 	for _, s := range scopes {
 		if len(s) > 4 && s[:4] == "urn:" {
 			t.Fatalf("unexpected urn scope with empty template: %q", s)

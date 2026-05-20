@@ -70,16 +70,20 @@ function parseExtra(info: Pick<WorkspaceInfo, "extra">): {repoUrl: string} {
 // 16-bit collision space is plenty at ≤10 workspaces.
 //
 // Durability: opencode persists configure()'s returned `info.name` and
-// passes it back on subsequent adapter calls. Detect "this is our slug
-// already" by structure; otherwise mint a fresh suffix.
+// passes it back on subsequent adapter calls. If `info.name` already
+// matches our slug shape we short-circuit -- the slug carries identity,
+// extra.repoUrl is only required for the FIRST mint and for create().
+// This matters because configure() re-runs on every adapter call; if a
+// later call sees `extra` nulled (DB round-trip dropped it, schema
+// change, etc.) we still must return the existing slug or workspace
+// identity would re-mint and target() would point at a fresh empty dir.
 function buildWorkspaceSlug(info: Pick<WorkspaceInfo, "name" | "extra">): string {
-  const {repoUrl} = parseExtra(info)
-  const {owner, repo} = parseOwnerRepo(repoUrl)
-  const prefix = `${owner}--${repo}--`
-  if (info.name?.startsWith(prefix) && /^[a-f0-9]{4}$/.test(info.name.slice(prefix.length))) {
+  if (info.name && /^[^/]+--[^/]+--[a-f0-9]{4}$/.test(info.name)) {
     return info.name
   }
-  return `${prefix}${randomBytes(2).toString("hex")}`
+  const {repoUrl} = parseExtra(info)
+  const {owner, repo} = parseOwnerRepo(repoUrl)
+  return `${owner}--${repo}--${randomBytes(2).toString("hex")}`
 }
 
 function workspaceDir(slug: string): string {
@@ -124,6 +128,12 @@ async function cloneRepoInto(slug: string, repoUrl: string): Promise<void> {
     // "destination path '.' already exists and is not an empty directory".
     // The persistence contract applies to SUCCESSFUL workspaces; a never-
     // cloned slug isn't yet a workspace.
+    //
+    // @NOTE: this rm races a concurrent create() on the same slug.
+    //   Practically impossible at v1 because configure() mints a random
+    //   suffix per call, so two creates always pick distinct slugs --
+    //   but worth flagging if a future change makes slug minting
+    //   deterministic across concurrent configure() calls.
     await rm(dir, {recursive: true, force: true}).catch(() => {})
     throw err
   }
