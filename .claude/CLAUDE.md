@@ -1,21 +1,24 @@
 # kfactory
 
-Opencode factory deployment toolkit -- standalone CLI (`kfactory`), plugin
-(`factory-adapter.ts`), and source patches (opencode + oauth2-proxy) that
-together let you run opencode behind an OIDC reverse proxy with one
-workspace per repo. Three deliverables, one flake.
+Opencode factory deployment toolkit -- standalone CLI (`kfactory`),
+opencode plugins (`kfactory-adapter` + `ntfy` + `loop`), and source
+patches (opencode + oauth2-proxy) that together let you run opencode
+behind an OIDC reverse proxy with one workspace per repo. Five
+deliverables, one flake.
 
 ## Layout
 
 ```
-cmd/kfactory/         Go CLI (package main, single binary)
-completions/          shell-completion scripts (zsh `_kfactory`)
-plugin/               opencode WorkspaceAdapter plugin (TS, pkgs.replaceVars-substituted)
-patches/              opencode + oauth2-proxy source patches (line-pinned)
-docs/spec.md          architecture intent + decisions log (portable; no kittyos refs)
-flake.nix             packages.kfactory + lib.mkFactoryAdapter + patches.* + checks.* + devShells.default
-.github/workflows/    ci.yml (two-job: quality + cached build on default branch)
-.claude/rules/        rules auto-loaded by Claude Code on every session
+cmd/kfactory/                Go CLI (package main, single binary)
+completions/                 shell-completion scripts (zsh `_kfactory`)
+plugins/kfactory-adapter/    opencode WorkspaceAdapter plugin (TS, env-driven)
+plugins/ntfy/                ntfy.sh notification plugin (TS, vendored MIT subset)
+plugins/loop/                /loop auto-continuation plugin (TS, slash command + tools)
+patches/                     opencode + oauth2-proxy source patches (line-pinned)
+docs/spec.md                 architecture intent + decisions log (portable; no kittyos refs)
+flake.nix                    packages.kfactory + plugins.* + patches.* + checks.* + devShells.default
+.github/workflows/           ci.yml (two-job: quality + cached build on default branch)
+.claude/rules/                rules auto-loaded by Claude Code on every session
 ```
 
 ## Build & test
@@ -65,10 +68,14 @@ Before claiming work done: run `nix flake check`, `golangci-lint`, and
 - Token state: `$XDG_CONFIG_HOME/kfactory/auth.json` (mode 0600),
   cross-process refresh coordinated via POSIX `flock(2)` on
   `auth.json.lock`.
-- Patches live under `patches/`. Never hand-edit hunk headers. Always
-  use the re-diff workflow -- see `.claude/rules/020-patches.md`.
-- Plugin lives under `plugin/`. Editing rules + the at-signed
-  placeholder discipline -- see `.claude/rules/010-plugin.md`.
+- Patches live under `patches/` (three opencode + one oauth2-proxy).
+  Never hand-edit hunk headers. Always use the four-way re-diff
+  workflow -- see `.claude/rules/020-patches.md`.
+- Plugins live under `plugins/<name>/`, each its own npm-package-shaped
+  directory with `src/`, `package.json`, lockfile, `tsconfig.json`.
+  Plugins read config from env vars with sensible defaults; no Nix
+  substitution at build time. Editing rules in
+  `.claude/rules/010-plugin.md`.
 
 ## Upstream pin
 

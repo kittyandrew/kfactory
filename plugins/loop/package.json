@@ -1,0 +1,23 @@
+{
+  "name": "@kfactory/loop",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "opencode plugin: /loop slash command that auto-continues a session until a user-defined sentinel string appears in the agent's output",
+  "license": "AGPL-3.0-only",
+  "main": "./src/index.ts",
+  "exports": {
+    "./server": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "commands"
+  ],
+  "dependencies": {
+    "@types/node": "24.12.2",
+    "@opencode-ai/plugin": "1.15.4"
+  },
+  "devDependencies": {
+    "typescript": "5.8.2"
+  }
+}

@@ -81,17 +81,45 @@ environment.systemPackages = [
       "-X main.defaultAudience=YOUR_OIDC_AUDIENCE"
     ];
   }))
-  kfactory.packages.x86_64-linux.opencode-kfactory       # patched + env-wrapped
+  (kfactory.packages.x86_64-linux.opencode-kfactory.overrideAttrs (old: {
+    # Plugins read config from env vars. Wrap opencode with absolute
+    # store paths for predictability (no PATH dependency at runtime).
+    postFixup = (old.postFixup or "") + ''
+      wrapProgram $out/bin/opencode \
+        --set KFACTORY_ADAPTER_GIT "${pkgs.git}/bin/git" \
+        --set KFACTORY_ADAPTER_OPENSSH_SSH "${pkgs.openssh}/bin/ssh" \
+        --set KFACTORY_ADAPTER_WORKSPACES_DIR "/var/lib/factory/workspaces"
+    '';
+  }))
   kfactory.packages.x86_64-linux.oauth2-proxy-kfactory
 ];
-environment.etc."opencode/plugin/factory-adapter.ts".source =
-  kfactory.lib.mkFactoryAdapter {
-    inherit pkgs;
-    gitBin = "${pkgs.git}/bin/git";
-    openSSHBin = "${pkgs.openssh}/bin/ssh";
-    workspacesDir = "/var/lib/factory/workspaces";
-  };
+
+# Generate opencode.json from the NixOS module so the plugin store paths
+# are interpolated at evaluation time. opencode's PluginLoader accepts
+# absolute directory paths and resolves package.json's exports["./server"]
+# to find the entrypoint -- no `/etc` indirection needed.
+environment.etc."opencode/opencode.json".text = builtins.toJSON {
+  plugin = [
+    "${kfactory.plugins.x86_64-linux.kfactory-adapter}"
+    "${kfactory.plugins.x86_64-linux.ntfy}"
+    "${kfactory.plugins.x86_64-linux.loop}"
+  ];
+  # ... the rest of your opencode config (permission, providers, etc.)
+};
+
+# Loop plugin slash commands -- wire each command markdown file from
+# the plugin's flake output into opencode's command dir. Plugins do not
+# auto-install commands; this keeps the workspace-vs-global boundary
+# explicit.
+environment.etc."opencode/command/loop.md".source =
+  "${kfactory.plugins.x86_64-linux.loop}/commands/loop.md";
+environment.etc."opencode/command/loop-stop.md".source =
+  "${kfactory.plugins.x86_64-linux.loop}/commands/loop-stop.md";
 ```
+
+The ntfy plugin reads its config from
+`$XDG_CONFIG_HOME/opencode/notification-ntfy.json` (per-event enable
+toggles, shorthand-duration `notifyAfter` debounce, ntfy topic + token).
 
 **Raw patches** (bring your own opencode/oauth2-proxy pin):
 
@@ -99,23 +127,63 @@ environment.etc."opencode/plugin/factory-adapter.ts".source =
 opencodePkg = opencode.packages.x86_64-linux.default.overrideAttrs (old: {
   patches = (old.patches or []) ++ [
     kfactory.patches.opencode-bearer-and-routing      # required
+    kfactory.patches.opencode-session-subscribers     # optional; only if you use plugins/ntfy
     kfactory.patches.opencode-kfactory-refresh        # optional; only if you use `kfactory attach`
   ];
 });
 ```
 
-⚠️ Patch order matters: the refresh patch is line-pinned against the
-bearer-and-routing patch's post-apply hashes. Don't swap them.
+⚠️ Patch order matters and is fixed: the refresh patch is line-pinned
+against the post-apply hashes of the patches above it. Don't swap them.
 Raw-patches consumers must also set
 `OPENCODE_EXPERIMENTAL_WORKSPACES=true` in opencode's runtime env (the
 `opencode-kfactory` wrapper does this for you).
 
+## Plugins
+
+Three plugins live under `plugins/<name>/`:
+
+- **`kfactory-adapter`** -- opencode WorkspaceAdapter making one
+  `opencode serve` host per-repo workspaces via `InstanceStore.provide`
+  in-process. Reads `KFACTORY_ADAPTER_GIT` / `KFACTORY_ADAPTER_OPENSSH_SSH`
+  / `KFACTORY_ADAPTER_WORKSPACES_DIR` from env with PATH-resolved defaults.
+- **`ntfy`** -- ntfy.sh push notifications for `session.idle`,
+  `session.error`, `permission.asked`. Per-event `notifyAfter` shorthand-
+  duration ("3s", "5m", "1h30m") debounce window; if any operator attaches
+  via TUI or web during the window, the pending notification is cancelled
+  (always-on, not configurable). Carved out of
+  [lannuttia/opencode-ntfy.sh](https://github.com/lannuttia/opencode-ntfy.sh) +
+  [lannuttia/opencode-notification-sdk](https://github.com/lannuttia/opencode-notification-sdk)
+  (both MIT; full notice + copyright inlined at the top of every
+  vendored source file).
+- **`loop`** -- `/loop` slash command. Auto-continues the current
+  session until a user-defined sentinel string appears as the LAST
+  non-empty line of the assistant's response. Configurable via
+  `--max N` (iteration cap, default 100, range [1, 10000]) and
+  `--sentinel "<exact phrase>"` (last-line trimmed equality,
+  case-sensitive; default `<promise>EXHAUSTIVELY COMPLETED</promise>`).
+  Mid-response mentions of the sentinel do NOT terminate -- only a
+  clean trailing match does. State persisted at
+  `$XDG_STATE_HOME/kfactory-loop/<workspace-hash>.json`
+  (outside the workspace tree). Session captured from `ToolContext.sessionID`
+  at start time; subagent idles filtered out. Slash command markdown is
+  shipped as part of the plugin's flake output -- consumers wire it via
+  NixOS module (no auto-install). No coupling to the
+  session-subscribers patch -- the loop runs on `session.idle` alone.
+  Pattern inspired by
+  [charfeng1/opencode-ralph-loop](https://github.com/charfeng1/opencode-ralph-loop) (MIT).
+
+Each plugin is a `flake.nix` output (`plugins.${system}.<name>`).
+Adding a new plugin under `plugins/<name>/` and a corresponding entry
+in `pluginSrcs` registers it automatically as a build + typecheck CI gate.
+
 ## CI
 
-`nix flake check` builds every `packages.${system}.*` plus a set of
-`factory-*` checks (patch-application, plugin + opencode typecheck, zsh
-completion parse, plugin-placeholder discipline). Adding a new package
-or check auto-registers as a gate. List with
+`nix flake check` builds every `packages.${system}.*` + every
+`plugins.${system}.*` plus a set of `factory-*` checks (patch-application,
+opencode typecheck, zsh completion parse) and per-plugin typechecks
+(`<name>-typecheck`). Adding a new package, plugin, or check
+auto-registers as a gate. List with
 `nix eval --json .#checks.x86_64-linux --apply 'attrs: builtins.attrNames attrs'`.
 
 ## License

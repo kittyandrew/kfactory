@@ -1,4 +1,5 @@
-Bearer + --workspace flags + workspace-routing fallback + project re-resolve.
+Bearer + --workspace flags + workspace-routing fallback + per-workspace
+session scoping + global adapter registration.
 
 Adds the genuinely-upstreamable subset of opencode-bearer-auth changes.
 This patch is independent of any deployment glue and is intended to be
@@ -20,21 +21,46 @@ What this adds:
     methods, not just GET/HEAD. The SDK only rewrites header->query
     for GET/HEAD, leaving POST/PUT/DELETE with the header verbatim;
     upstream's server used to ignore the header on those methods.
-  - Post-`adapter.create` project re-resolve in `Workspace.create`.
-    Upstream copies the requesting instance's `project.id` at row
-    insert time; for an unscoped `POST /experimental/workspace` that
-    resolves to the front-opencode's cwd-based project (typically
-    `global` for a non-git cwd), and every workspace ends up sharing
-    `project_id = global`. Cascades into broken session lists,
-    broken SPA "review changes" widget, and broken workspace-scoped
-    `--continue`. This hunk runs `Project.fromDirectory(info.directory)`
-    after `WorkspaceAdapterRuntime.create` resolves and UPDATEs the
-    workspace row's `project_id` to the git-root OID.
+  - `Session.listGlobal` accepts a `workspaceID` filter and applies it
+    as `where SessionTable.workspace_id = workspaceID`. The
+    /experimental/session handler forwards the request's `?workspace=`
+    query param into this filter (with the routing middleware's
+    InstanceState.workspaceID as a belt-and-suspenders fallback).
+    Without this, upstream's session-list path keyed on `project_id`,
+    which broke workspace-scoped `--continue` whenever multiple
+    workspaces shared a project_id -- the common case for
+    `POST /experimental/workspace` from a front-opencode running in a
+    non-git cwd, since opencode copies the requesting instance's
+    `project.id` (often "global") into the new workspace row at insert
+    time. Filtering by workspace_id sidesteps the issue entirely:
+    sessions get scoped by the workspace they actually belong to,
+    independent of whatever project_id happened to be stamped on them.
+    Verified in the harness: dispatching three workspaces against the
+    same repo produces three sessions with identical project_id but
+    distinct workspace_id, and `GET /experimental/session?workspace=<id>`
+    returns exactly the session for that workspace.
+  - Plugin-adapter registration is scoped to `ProjectID.global` rather
+    than the boot instance's `ctx.project.id`. Plugins load once per
+    opencode process but serve requests across many projects (via
+    per-request x-opencode-directory); a per-project registration
+    scope was unreachable from any request whose project differed from
+    the plugin loader's. The fallback in `getAdapter` checks global if
+    a per-project lookup misses, preserving back-compat for any
+    out-of-tree consumer that registers under a specific project.
 
 Server-side opencode does NOT validate the Bearer -- this patch only
 adds the surface area for clients to send it. Deployments fronting
 opencode with a JWT-validating reverse proxy can use this; deployments
 without a proxy continue to use HTTP Basic via `--password`.
+
+Note: an earlier draft of this patch added a post-`adapter.create`
+`Project.fromDirectory + UPDATE workspace.project_id` re-resolve hunk
+in workspace.ts. Architect review found it dead-weight once
+`Session.listGlobal` filtered by workspace_id -- no downstream consumer
+actually requires per-workspace unique project_id, and stamping it
+post-create added complexity without changing behaviour. The hunk is
+gone; this prose block exists as the paper trail so the next reader
+doesn't re-derive the abandoned approach.
 
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
 index 3ed67bb..59c1109 100644
@@ -186,59 +212,60 @@ index 31329a6..7edd37c 100644
      fetch: input.fetch,
      headers: input.headers,
    }).session.get({ sessionID }, { throwOnError: true })
-diff --git a/packages/opencode/src/control-plane/workspace.ts b/packages/opencode/src/control-plane/workspace.ts
-index a50df57..dc5b289 100644
---- a/packages/opencode/src/control-plane/workspace.ts
-+++ b/packages/opencode/src/control-plane/workspace.ts
+diff --git a/packages/opencode/src/control-plane/adapters/index.ts b/packages/opencode/src/control-plane/adapters/index.ts
+index e5fa137..811fafa 100644
+--- a/packages/opencode/src/control-plane/adapters/index.ts
++++ b/packages/opencode/src/control-plane/adapters/index.ts
 @@ -1,4 +1,4 @@
--import { Context, Effect, FiberMap, Iterable, Layer, Schema, Stream } from "effect"
-+import { Context, Effect, FiberMap, Iterable, Layer, Option, Schema, Stream } from "effect"
- import { FetchHttpClient, HttpBody, HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http"
- import { Database } from "@/storage/db"
- import { asc } from "drizzle-orm"
-@@ -177,6 +177,12 @@ export const layer = Layer.effect(
-     const vcs = yield* Vcs.Service
-     const flags = yield* RuntimeFlags.Service
-     const fs = yield* AppFileSystem.Service
-+    // Project.Service is hoisted to the outer layer-effect so that the
-+    // post-adapter.create re-resolve hunk in `create` can call
-+    // `projectSvc.fromDirectory(...)` without leaking Project.Service
-+    // into the `create` method's effect requirements (which the Service
-+    // Interface declares as `never`).
-+    const projectSvc = yield* Project.Service
-     const connections = new Map<WorkspaceID, ConnectionStatus>()
-     const syncFibers = yield* FiberMap.make<WorkspaceID, void, SyncLoopError>()
+-import type { ProjectID } from "@/project/schema"
++import { ProjectID } from "@/project/schema"
+ import type { WorkspaceAdapter, WorkspaceAdapterEntry } from "../types"
+ import { WorktreeAdapter } from "./worktree"
  
-@@ -572,6 +578,29 @@ export const layer = Layer.effect(
-       }
+@@ -9,7 +9,12 @@ const BUILTIN: Record<string, WorkspaceAdapter> = {
+ const state = new Map<ProjectID, Map<string, WorkspaceAdapter>>()
  
-       yield* WorkspaceAdapterRuntime.create(adapter, config, env)
-+
-+      // kfactory: re-resolve the workspace's project from its directory
-+      // AFTER adapter.create runs (clone completes). Without this, every
-+      // new workspace inherits the requesting instance's project --
-+      // typically `global` because the front-opencode's cwd isn't a git
-+      // repo -- which makes session lists, SPA "review changes", and
-+      // workspace-scoped routing all stay wrong for the lifetime of
-+      // the workspace. With this hunk, workspaces whose adapter sets
-+      // a usable directory get re-stamped with the directory's
-+      // git-root-derived project ID.
-+      if (info.directory) {
-+        const resolved = yield* projectSvc.fromDirectory(info.directory).pipe(Effect.option)
-+        if (Option.isSome(resolved) && resolved.value.project.id !== info.projectID) {
-+          yield* db((db) => {
-+            db.update(WorkspaceTable)
-+              .set({ project_id: resolved.value.project.id })
-+              .where(eq(WorkspaceTable.id, info.id))
-+              .run()
-+          })
-+          info.projectID = resolved.value.project.id
-+        }
-+      }
-+
-       yield* Effect.all(
-         [
-           waitEvent({
+ export function getAdapter(projectID: ProjectID, type: string): WorkspaceAdapter {
+-  const custom = state.get(projectID)?.get(type)
++  // Prefer a project-specific registration; fall back to globally-
++  // scoped adapters (the canonical scope plugins use, since plugin
++  // loaders run once per opencode-instance and serve many projects).
++  // Matches the comment on `registerAdapter` below: "If you want to
++  // install a global one pass `ProjectID.global`."
++  const custom = state.get(projectID)?.get(type) ?? state.get(ProjectID.global)?.get(type)
+   if (custom) return custom
+ 
+   const builtin = BUILTIN[type]
+diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
+index e87f6db..e170786 100644
+--- a/packages/opencode/src/plugin/index.ts
++++ b/packages/opencode/src/plugin/index.ts
+@@ -27,6 +27,7 @@ import { PluginLoader } from "./loader"
+ import { parsePluginSpecifier, readPluginId, readV1Plugin, resolvePluginId } from "./shared"
+ import { registerAdapter } from "@/control-plane/adapters"
+ import type { WorkspaceAdapter } from "@/control-plane/types"
++import { ProjectID } from "@/project/schema"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
+ 
+ const log = Log.create({ service: "plugin" })
+@@ -139,7 +140,16 @@ export const layer = Layer.effect(
+           directory: ctx.directory,
+           experimental_workspace: {
+             register(type: string, adapter: PluginWorkspaceAdapter) {
+-              registerAdapter(ctx.project.id, type, adapter as WorkspaceAdapter)
++              // Register under ProjectID.global rather than the boot
++              // instance's ctx.project.id. Plugins are loaded once per
++              // opencode-instance but serve requests across many
++              // projects (via per-request x-opencode-directory). A
++              // per-project registration scope is unreachable from any
++              // request whose project differs from the plugin loader's
++              // boot project -- including workspace-create requests
++              // whose `projectID` is later re-resolved to the
++              // workspace's actual git root.
++              registerAdapter(ProjectID.global, type, adapter as WorkspaceAdapter)
+             },
+           },
+           get serverUrl(): URL {
 diff --git a/packages/opencode/src/server/auth.ts b/packages/opencode/src/server/auth.ts
 index 9630ddb..5e979d9 100644
 --- a/packages/opencode/src/server/auth.ts
@@ -261,6 +288,33 @@ index 9630ddb..5e979d9 100644
    const password = credentials?.password ?? Flag.OPENCODE_SERVER_PASSWORD
    if (!password) return undefined
  
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts
+index 56a8de3..2d8a040 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts
+@@ -8,6 +8,7 @@ import { Session } from "@/session/session"
+ import { ToolJsonSchema } from "@/tool/json-schema"
+ import { ToolRegistry } from "@/tool/registry"
+ import { Worktree } from "@/worktree"
++import { WorkspaceID } from "@/control-plane/schema"
+ import { Effect, Option } from "effect"
+ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
+ import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+@@ -127,9 +128,14 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
+ 
+     const session = Effect.fn("ExperimentalHttpApi.session")(function* (ctx: { query: typeof SessionListQuery.Type }) {
+       const limit = ctx.query.limit ?? 100
++      // kfactory: forward `?workspace=<id>` to listGlobal so the TUI's
++      // `--continue` picks the most-recent session within THIS workspace
++      // rather than the globally most-recent. Without this, attaching to
++      // different workspaces always lands on the same session.
+       const sessions = Array.from(
+         Session.listGlobal({
+           directory: ctx.query.directory,
++          workspaceID: ctx.query.workspace ? WorkspaceID.make(ctx.query.workspace) : undefined,
+           roots: ctx.query.roots,
+           start: ctx.query.start,
+           cursor: ctx.query.cursor,
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
 index cd9376f..80cc650 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
@@ -295,3 +349,31 @@ index cd9376f..80cc650 100644
      const workspace = yield* resolveWorkspace(workspaceID, envWorkspaceID)
  
      if (workspaceID && workspace === undefined && !envWorkspaceID) {
+diff --git a/packages/opencode/src/session/session.ts b/packages/opencode/src/session/session.ts
+index 797a635..8f79c0f 100644
+--- a/packages/opencode/src/session/session.ts
++++ b/packages/opencode/src/session/session.ts
+@@ -941,6 +941,7 @@ function* listByProject(
+ 
+ export function* listGlobal(input?: {
+   directory?: string
++  workspaceID?: WorkspaceID
+   roots?: boolean
+   start?: number
+   cursor?: number
+@@ -953,6 +954,15 @@ export function* listGlobal(input?: {
+   if (input?.directory) {
+     conditions.push(eq(SessionTable.directory, input.directory))
+   }
++  // kfactory: filter by workspace_id when provided. The /experimental/session
++  // handler forwards the request's `?workspace=` query param (and as a
++  // belt-and-suspenders fallback, InstanceState.workspaceID set by the
++  // workspace-routing middleware). Without this filter, `--continue`
++  // picks the globally most-recently-updated root session regardless of
++  // which workspace the operator attached to.
++  if (input?.workspaceID) {
++    conditions.push(eq(SessionTable.workspace_id, input.workspaceID))
++  }
+   if (input?.roots) {
+     conditions.push(isNull(SessionTable.parent_id))
+   }

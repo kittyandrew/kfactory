@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "ntfy plugin config for the test harness. The 'server' is the harness's",
+    "ntfy container reachable on the Docker bridge by name; 'topic' matches",
+    "what the operator opens in the host browser at http://localhost:8080/<topic>.",
+    "notifyAfter uses shorthand duration ('3s' = 3 seconds) so the harness",
+    "loop can validate the wait window quickly. fetchTimeout same shape."
+  ],
+  "enabled": true,
+  "events": {
+    "session.idle": {
+      "enabled": true,
+      "notifyAfter": "3s"
+    },
+    "session.error": {
+      "enabled": true,
+      "notifyAfter": "0s"
+    },
+    "permission.asked": {
+      "enabled": true,
+      "notifyAfter": "0s"
+    }
+  },
+  "backend": {
+    "topic": "kfactory-harness",
+    "server": "http://kfactory-ntfy:80",
+    "priority": "default",
+    "fetchTimeout": "5s"
+  }
+}

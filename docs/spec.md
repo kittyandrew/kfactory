@@ -117,7 +117,7 @@ for the frontier.
 | layer | what runs |
 |-------|-----------|
 | host | Reverse proxy at the edge + your OIDC IdP integration. Opencode binds to a private interface only; external reach blocked at the proxy layer. |
-| opencode serve | One process, FactoryAdapter plugin loaded in. Owns the workspaces dir and the opencode SQLite DB. |
+| opencode serve | One process, KfactoryAdapter plugin loaded in (registered as workspace type `"kfactory"`). Owns the workspaces dir and the opencode SQLite DB. |
 | in-process workspace context | `InstanceStore.provide({directory: <workspaces-dir>/<slug>}, effect)` switches the Effect Service tree per request. Same OS process, same UID, same netns -- isolation is `directory` + opencode's `permission` rules, nothing more. |
 
 There are no per-workspace processes, no per-workspace memory caps, no
@@ -248,7 +248,7 @@ upgrades. The operator is the only one who can delete workspace data.
 
 The opencode SQLite DB is the source of truth for workspace identity.
 Specifically: opencode's `WorkspaceTable` row, keyed by `info.id`
-(`wrk_<ts>`), carries the slug as `info.name`. The FactoryAdapter
+(`wrk_<ts>`), carries the slug as `info.name`. The KfactoryAdapter
 detects the slug shape on subsequent `configure()` calls and
 round-trips the name unchanged. There are NO adapter-side state files
 -- v1 maintained a parallel JSON index; v2 deleted it entirely. The
@@ -295,10 +295,12 @@ relevant to a consumer.
   The trade is workspace-to-workspace process isolation -- accepted
   under the trusted-agent threat model.
 
-- **FactoryAdapter `target: {type:"local"}` returns clone directory.**
+- **KfactoryAdapter `target: {type:"local"}` returns clone directory.**
   opencode dispatches via `InstanceStore.provide({directory}, effect)`
   in-process. No HTTP proxy, no worker URL, no port. The adapter is
-  ~185 LOC end-to-end.
+  ~185 LOC end-to-end. Registered with opencode's experimental workspace
+  API under the key `"kfactory"`; the CLI POSTs `{"type":"kfactory"}` to
+  `/experimental/workspace` to invoke it.
 
 - **kfactory CLI shape.** Subcommands: `auth login/logout/status/refresh`,
   `list`, `attach <id|slug|#>`, `dispatch <repo> <prompt>`, `delete`.
@@ -306,8 +308,9 @@ relevant to a consumer.
   0600). Operator runs kfactory in their own terminal -- the CLI stays
   out of window management.
 
-- **Split opencode patches.** Upstream opencode v1.15.x's
-  `opencode attach` only knows HTTP Basic auth. Two patches, applied
+- **Three-patch opencode stack.** Upstream opencode v1.15.x's
+  `opencode attach` only knows HTTP Basic auth and the plugin API has
+  no surface for SSE subscriber lifecycle. Three patches, applied
   in order:
   - `opencode-bearer-and-routing.patch` -- upstreamable subset:
     `--bearer` / `OPENCODE_SERVER_BEARER` for Bearer attach;
@@ -315,16 +318,38 @@ relevant to a consumer.
     `ProjectProvider`, AND `validateSession` (so the pre-attach probe
     runs against the requested workspace); workspace-routing header
     fallback for non-GET requests (the SDK only rewrites header ->
-    query for GET/HEAD); post-`adapter.create` project re-resolve in
-    `Workspace.create`.
+    query for GET/HEAD); `Session.listGlobal` filter by workspace_id
+    so `--continue` and session-list scope to the attached workspace
+    (sidesteps upstream's project_id-based scoping, which collapsed
+    when multiple workspaces shared a project_id); plugin-adapter
+    registration scoped to `ProjectID.global` rather than the boot
+    instance's `ctx.project.id` (so per-request workspaces can find
+    the adapter regardless of which project the plugin loader ran in).
+  - `opencode-session-subscribers.patch` -- publishes
+    `kfactory.subscribers.changed` with the ABSOLUTE per-workspace
+    count `{count: N}` on every SSE attach / detach in `event.ts`. A
+    per-instance counter (keyed on the Bus.Interface via a WeakMap)
+    tracks live subscribers; the publish carries the post-change
+    total. The instance bus is workspace-scoped so each publish only
+    reaches plugins running in the same workspace. Used by
+    `plugins/ntfy` to derive a per-workspace "is anyone watching"
+    signal so notifications are skipped (or cancelled mid-wait) when
+    the operator is attached. Absolute-count semantics eliminates the
+    cold-start asymmetry inherent to delta accumulation -- a plugin
+    that loads after a subscriber attached can't reconstruct state
+    from deltas alone, but trivially assigns from the next published
+    count. ~30 LOC; lives in a file neither
+    neighbour patch touches, so stacking is mechanical rather than
+    line-pinned.
   - `opencode-kfactory-refresh.patch` -- kfactory-specific deployment
     glue, applied on top: `OPENCODE_SERVER_BEARER_CACHE_PATH` env +
     `bearerFromCache()`; subprocess `kfactory auth refresh` spawn via
     `createBearerRefreshFetch`; shared auth.json schema with
     `schema_version` assertion; toast subscription for refresh hints.
-  Maintained locally until the upstreamable half lands upstream.
-  Verified on every opencode bump by the `factory-opencode-patch-applies`
-  flake check (both patches must apply cleanly in order).
+  Maintained locally until the upstreamable halves (bearer-and-routing,
+  session-subscribers) land upstream. Verified on every opencode bump
+  by the `factory-opencode-patch-applies` flake check (all three must
+  apply cleanly in order).
 
 - **Subprocess-delegated token refresh (kfactory owns; TUI spawns).**
   kfactory (Go) is the single source of truth for OIDC token refresh:
@@ -377,34 +402,165 @@ relevant to a consumer.
   flip to v2 happens without a regression; row counts log so the flip
   is observable.
 
-- **Patch opencode `Workspace.create` to re-resolve project from
-  workspace directory after adapter.create.** Upstream opencode copies
-  the requesting instance's `project.id` into the new workspace row at
-  insert time. For an unscoped `POST /experimental/workspace` that
-  resolves to the front-opencode's cwd-based project (`global`,
-  non-git), and every workspace ends up sharing
-  `project_id = global`. Cascades into broken session lists
-  (`Session.list` filters by project), broken SPA "review changes"
-  widget (reads `project.vcs`), and broken workspace-scoped
-  `--continue`. The patch hunk runs `Project.fromDirectory(info.directory)`
-  after `WorkspaceAdapterRuntime.create` resolves and UPDATEs the
-  workspace row's `project_id` to the git-root OID. ~25 LOC TS in the
-  bearer-auth patch. Upstream-PR-worthy.
+- **Patch opencode `Session.listGlobal` to filter by workspace_id.**
+  Upstream opencode copies the requesting instance's `project.id` into
+  the new workspace row at insert time. For an unscoped `POST
+  /experimental/workspace` that resolves to the front-opencode's
+  cwd-based project (`global`, non-git), and every workspace ends up
+  sharing `project_id = global`. Upstream's session list filtered by
+  `project_id`, so `--continue` and root-session listing collapsed
+  across workspaces -- attaching to workspace A would resume the
+  globally-most-recently-touched session regardless of where it lived.
+  The patch adds an optional `workspaceID` filter to `listGlobal`
+  applying `where SessionTable.workspace_id = workspaceID`, plumbed
+  through `/experimental/session` from the request's `?workspace=`
+  query param (with the routing middleware's InstanceState.workspaceID
+  as a fallback). Sessions get scoped by the workspace they actually
+  belong to, independent of project_id. ~15 LOC TS in the bearer-auth
+  patch. Upstream-PR-worthy.
 
-- **Plugin file is `.ts`, not `.ts.in`, with constants block
-  discipline.** Placeholders live inside string literals at a single
-  dedicated constants block near the top of `factory-adapter.ts` --
-  syntactically valid TS, so tsc/biome work directly. `@TOKEN@`
-  patterns must NEVER appear anywhere else in the file (comments, tag
-  comments, JSDoc examples, string content outside the constants
-  block): `pkgs.replaceVars`'s `checkPhase` fails the build on any
-  leftover `@xxx@` pattern, regardless of context.
+  Verified in the harness (2026-05): three workspaces dispatched
+  against the same repo share project_id (the git-root OID, assigned
+  by opencode at session-creation time, NOT at workspace creation) but
+  carry distinct workspace_id. `GET /experimental/session?workspace=<id>`
+  returns exactly the matching workspace's session for each of the
+  three.
 
-- **Plugin typecheck via flake check.** `checks.factory-plugin-typecheck`
-  runs `tsc --noEmit` against the plugin with `@opencode-ai/plugin` +
-  `@types/node` resolved offline via `buildNpmPackage`. Catches
-  WorkspaceAdapter API drift on every `nix flake check`. See
+  An earlier draft of the patch took a different approach:
+  post-`adapter.create` re-resolve via `Project.fromDirectory(info.directory)`
+  + UPDATE workspace.project_id. Architect review found it dead-weight
+  once `listGlobal` filtered by workspace_id -- no downstream consumer
+  actually requires per-workspace unique project_id. That hunk is
+  gone; this note exists so the next reader doesn't re-derive it.
+
+  Possible residual: the SPA "review changes" widget reads
+  `project.vcs` via the workspace's `project_id`. If the SPA path
+  exposes a per-workspace VCS view, it'd see whatever project_id
+  ended up on the row at insert time (typically `global` for the
+  kfactory CLI flow). The kfactory CLI doesn't exercise the SPA path
+  so this is invisible to the current product surface; revisit if a
+  future deployment surfaces the SPA widget.
+
+- **Plugins read config from env vars, not Nix-substituted placeholders.**
+  Earlier plugins ran through `pkgs.replaceVars` to inject `@GIT@` etc.
+  as absolute Nix store paths at build time. Gone -- replaced with
+  `process.env.KFACTORY_ADAPTER_GIT` (and friends), defaulting to PATH-
+  resolved binaries (`git`, `ssh`) and `/var/lib/factory/workspaces`.
+  Consumers wrap opencode with the env vars they want (typically
+  absolute store paths so PATH lookup isn't load-bearing at runtime).
+  This eliminates the build-step indirection (`lib.mkFactoryAdapter` is
+  gone), keeps the plugin source greppable + tsc-clean, and matches the
+  user-supplied convention for `plugins/<name>/` packages.
+
+- **Per-plugin typechecks via flake check.** Every plugin under
+  `plugins/<name>/` ships its own `package.json` + lockfile + tsconfig
+  and gets a `<name>-typecheck` flake check (`tsc --noEmit` against
+  `@opencode-ai/plugin` + `@types/node` resolved offline via
+  `buildNpmPackage`). Adding a new plugin under `plugins/<name>/` plus
+  an entry in `pluginSrcs` registers it automatically. See
   `.claude/rules/010-plugin.md`.
+
+- **Carved-out ntfy plugin under `plugins/ntfy/`.** Sends push
+  notifications via ntfy.sh for `session.idle` / `session.error` /
+  `permission.asked` events. Vendored as a subset of two upstream MIT
+  projects by Anthony Lannutti:
+  [opencode-ntfy.sh](https://github.com/lannuttia/opencode-ntfy.sh) (the
+  HTTP backend) and
+  [opencode-notification-sdk](https://github.com/lannuttia/opencode-notification-sdk)
+  (event routing + subagent suppression + config schema). The two-package
+  upstream architecture is collapsed into a single self-contained plugin
+  -- the SDK indirection added a layer kfactory doesn't need (we have
+  exactly one backend), and inlining the routing makes the
+  wait + skip-on-connect modifications below land in one obvious place.
+  Each vendored source file inlines the full MIT permission notice +
+  Anthony Lannutti's copyright (per-file headers ARE the MIT notice;
+  there is no separate LICENSE-MIT). Upstream commit pins + the
+  "kfactory modifications" list live in the same header so a future
+  bump's diff stays greppable. Project LICENSE stays AGPLv3 (more
+  restrictive than MIT, combining direction is fine).
+
+- **`plugins/loop/` `/loop` auto-continuation plugin.** Minimal
+  in-process loop driver inspired by
+  [charfeng1/opencode-ralph-loop](https://github.com/charfeng1/opencode-ralph-loop)
+  (MIT) and Anthropic's ralph-wiggum technique. After the operator runs
+  `/loop --max 50 --sentinel "ALL DONE" <task>`, every subsequent
+  `session.idle` for that session fires a check: read the last assistant
+  message, compare the LAST non-empty line (trimmed) against the
+  configured sentinel for case-sensitive equality. If it doesn't match
+  and `iteration < max`, inject a continuation prompt via
+  `client.session.prompt`. Default sentinel
+  `<promise>EXHAUSTIVELY COMPLETED</promise>` is intentionally verbose
+  so the model is unlikely to emit it speculatively. Last-line equality
+  (rather than substring-anywhere) means a model that mentions the
+  sentinel mid-response -- in a plan, a paraphrase, a quoted prompt --
+  does NOT terminate the loop; only a clean trailing sentinel does.
+  Trailing punctuation ("ALL DONE." instead of "ALL DONE") also leaves
+  the loop running, which is intentional: the matcher demands a clean
+  emission so the operator's contract with the model is unambiguous.
+  The session that owns the loop is captured
+  at `loop-start` time from `ToolContext.sessionID` (no first-idle latch
+  race); subagent idles are filtered via `client.session.get(...).data.parentID`.
+  Per-session promise chain serializes concurrent idle handlers. State
+  lives at `$XDG_STATE_HOME/kfactory-loop/<hash>.json` (NOT inside the
+  workspace tree, so accidental `git add .` doesn't capture it). HTTP
+  errors on `prompt` count toward a 3-consecutive-failures cap before
+  the loop stops; `messages` errors are recoverable (treated as
+  no-sentinel). Slash command markdown files (`commands/loop.md`,
+  `commands/loop-stop.md`) are shipped as part of the plugin's flake
+  output -- consumers wire them via NixOS module
+  (`environment.etc."opencode/command/loop.md".source = ...`); the
+  plugin does NOT auto-install (avoids a workspace-scope plugin
+  mutating operator-global config on every load). Deliberately
+  uncoupled from the `opencode-session-subscribers` patch -- the loop
+  fires whether the operator is attached or not. Footgun control is
+  the operator's job (`/loop-stop`).
+
+- **`notifyAfter` debounce + always-on subscriber suppression.** The
+  ntfy plugin per-event knob in `~/.config/opencode/notification-ntfy.json`:
+  - `notifyAfter` (shorthand duration: `"3s"`, `"5m"`, `"1h30m"`; default
+    `"0s"`): wait this long before firing. If a previous timer for the
+    same `(session, event)` pair is pending, the new event replaces it
+    (latest wins).
+
+  Subscriber suppression is **non-configurable** and ALWAYS on: if any
+  subscriber is attached at event time the notification is suppressed,
+  and if any subscriber attaches mid-wait the pending timer is
+  cancelled. Cancellation is per-timer (not per-key) -- a subsequent
+  event after the operator detaches schedules a fresh timer normally.
+  An earlier shape exposed a `skipWhenWatched` per-event opt-out; we
+  dropped it because the plugin's whole purpose is "notify only when
+  nobody's watching." An even earlier shape latched the cancel as
+  process-lifetime sticky-state; that broke the common case (operator
+  peeks at a workspace, comes back hours later, never gets a
+  notification again) and is gone.
+  Subscriber state is fed by the `opencode-session-subscribers` patch's
+  `kfactory.subscribers.changed` bus event. The patch publishes the
+  ABSOLUTE per-workspace count `{count: N}` after every SSE attach /
+  detach -- counter lives in a `WeakMap<Bus.Interface, number>` so it's
+  per-instance (workspace-scoped); plugins assign rather than
+  accumulate. Absolute count was chosen over `{delta: ±1}` because
+  delta accumulation cannot recover from cold-start asymmetry: a
+  plugin that loads after a subscriber attached has no way to know
+  the true count from deltas alone, so it'd either miss the first
+  +1 (and notify with an operator attached) or clamp negative on the
+  first -1 (and stay stuck). Absolute counts make the "is anyone
+  watching" decision a single read against the latest published
+  value. Without the patch no `kfactory.subscribers.changed` events
+  arrive, so the count stays at 0 and notifications fire on every
+  `notifyAfter` expiry regardless of who is watching -- acceptable
+  degraded mode for development. `fetchTimeout` on ntfy POSTs defaults
+  to 10s so a hung ntfy server can't stall the plugin's event hook
+  indefinitely.
+  Note on session-level granularity: the count is **per-workspace**,
+  not per-session, because the bus is workspace-scoped and the
+  per-workspace `is anyone watching` signal is what the suppression
+  rule needs. A side-effect is that subscribing to ANY session inside
+  a workspace suppresses notifications for ALL sessions in that
+  workspace. This is intentional (operators typically rotate through
+  sessions in a workspace and "watching" is a workspace-level
+  concept), but it's worth knowing if you tail one session's events
+  in another shell -- you'll miss notifications from concurrent
+  sessions in the same workspace.
 
 - **Upstream-contract watch list.** opencode is EXPERIMENTAL (gated by
   `OPENCODE_EXPERIMENTAL_WORKSPACES`); re-verifying these on every
@@ -494,15 +650,29 @@ repo's runbook, not in this spec):
 ## 8. What's in this repo
 
 ```
-cmd/kfactory/         Go CLI (auth / list / attach / dispatch / delete)
-completions/_kfactory zsh completion (auto-installed via $out/share/zsh/site-functions)
-plugin/               factory-adapter.ts + package.json + tsconfig.json
-patches/              opencode-bearer-and-routing.patch
-                      + opencode-kfactory-refresh.patch
-                      + oauth2-proxy-pkce-no-secret.patch
-default.nix           kfactory CLI build (empty endpoint defaults; ldflags-injectable)
-flake.nix             packages.kfactory / lib.mkFactoryAdapter / patches.* / checks.*
-.claude/rules/        plugin editing + patch re-diff workflows
+cmd/kfactory/                       Go CLI (auth / list / attach / dispatch / delete)
+completions/_kfactory               zsh completion (auto-installed via $out/share/zsh/site-functions)
+plugins/kfactory-adapter/           opencode WorkspaceAdapter (env-driven)
+  src/index.ts                        KfactoryAdapter export
+  package.json + package-lock.json    @kfactory/kfactory-adapter; main + exports.server -> src/index.ts
+  tsconfig.json
+plugins/ntfy/                       ntfy.sh notification plugin
+  src/{index,backend,config}.ts       event dispatch + wait + skip-on-connect / HTTP / config + shorthand-duration parser
+                                      (each file inlines the full MIT notice for the vendored subset)
+  package.json + package-lock.json    @kfactory/ntfy
+  tsconfig.json
+plugins/loop/                       /loop auto-continuation plugin
+  src/index.ts                        session.idle hook + user-defined sentinel + 3-failures-stop
+  commands/{loop,loop-stop}.md        slash command markdown (consumer wires via NixOS module)
+  package.json + package-lock.json    @kfactory/loop
+  tsconfig.json
+patches/                            opencode-bearer-and-routing.patch
+                                    + opencode-session-subscribers.patch
+                                    + opencode-kfactory-refresh.patch
+                                    + oauth2-proxy-pkce-no-secret.patch
+default.nix                         kfactory CLI build (empty endpoint defaults; ldflags-injectable)
+flake.nix                           packages.kfactory / plugins.* / patches.* / checks.*
+.claude/rules/                      plugin editing + patch re-diff workflows
 ```
 
 Wiring (reverse proxy config, oauth2-proxy systemd unit, host/VM

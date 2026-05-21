@@ -105,12 +105,16 @@ func listWorkspaces(ctx context.Context, t *tokenFile, server string) ([]Workspa
 	return ws, nil
 }
 
-// createWorkspace POSTs a new factory workspace for the given repo URL.
-// The factory adapter assigns the random 4-hex slug suffix; we don't
-// pass branch (clone resolves to remote HEAD).
+// createWorkspace POSTs a new kfactory workspace for the given repo URL.
+// The kfactory-adapter plugin assigns the random 4-hex slug suffix; we
+// don't pass branch (clone resolves to remote HEAD).
+//
+// `type: "kfactory"` is the WorkspaceAdapter registration key used by
+// the kfactory-adapter plugin (plugins/kfactory-adapter/src/index.ts);
+// opencode dispatches creation through whichever adapter registered that key.
 func createWorkspace(ctx context.Context, t *tokenFile, server, repoURL string) (*Workspace, error) {
 	payload := map[string]any{
-		"type": "factory",
+		"type": "kfactory",
 		"extra": map[string]any{
 			"repoUrl": repoURL,
 		},

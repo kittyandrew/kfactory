@@ -10,6 +10,5 @@
     "allowImportingTsExtensions": false,
     "esModuleInterop": true
   },
-  "include": ["factory-adapter.ts"]
+  "include": ["src/**/*.ts"]
 }
-

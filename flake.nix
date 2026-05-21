@@ -1,12 +1,12 @@
 {
-  description = "kfactory -- opencode factory deployment toolkit: kfactory CLI + factory-adapter plugin + opencode/oauth2-proxy patches";
+  description = "kfactory -- opencode factory deployment toolkit: kfactory CLI + kfactory-adapter & ntfy plugins + opencode/oauth2-proxy patches";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # Patches under patches/ are line-number-pinned against this exact
     # opencode tag. To bump: change the tag, run `nix flake check` to
-    # see if the patch still applies (factory-opencode-patch-applies
+    # see if the patches still apply (factory-opencode-patch-applies
     # check). If hunks drift, re-diff against the new source -- the
     # workflow is documented in .claude/rules/020-patches.md.
     opencode.url = "github:sst/opencode/v1.15.4";
@@ -18,6 +18,89 @@
     opencode,
   }: let
     forAllSystems = nixpkgs.lib.genAttrs ["x86_64-linux" "aarch64-linux"];
+
+    # mkPlugin -- buildNpmPackage wrapper for kfactory plugins. Plugins
+    # under plugins/<name>/ each have:
+    #   - package.json + package-lock.json (typecheck deps; no runtime deps
+    #     today since opencode supplies @opencode-ai/plugin at load time)
+    #   - tsconfig.json (typecheck config)
+    #   - src/*.ts (loaded directly by opencode via Bun's TS runtime)
+    #   - optional LICENSE-MIT for vendored upstream code
+    #
+    # The result store path contains the full package tree (src/, node_modules/,
+    # package.json) so consumers can either point opencode at the directory
+    # (Bun resolves `exports["./server"]`) or at a specific file inside.
+    mkPlugin = pkgs: {
+      name,
+      src,
+      npmDepsHash,
+    }:
+      pkgs.buildNpmPackage {
+        pname = "kfactory-plugin-${name}";
+        version = "0.0.1";
+        inherit src npmDepsHash;
+        # No compile step: plugins ship as .ts and Bun loads them directly.
+        # See research note in docs/spec.md decisions log re: opencode's
+        # PluginLoader -- it `await import()`s the entrypoint, and Bun's
+        # runtime transpiles TS on the fly.
+        dontNpmBuild = true;
+        # `npm ci` (which buildNpmPackage runs in install) populates
+        # node_modules/. We copy the whole package tree to $out so consumers
+        # can either reference $out/src/<entrypoint>.ts directly or point
+        # opencode at $out (which resolves via package.json's exports).
+        installPhase = ''
+          runHook preInstall
+          mkdir -p $out
+          cp -r . $out/
+          # Drop nix-specific files that the operator doesn't need at runtime
+          rm -rf $out/node_modules/.package-lock.json
+          runHook postInstall
+        '';
+      };
+
+    # mkPluginTypecheck -- same wrapper, but runs `tsc --noEmit` and emits
+    # only a marker file. Separate from mkPlugin so the plugin build itself
+    # is fast (no tsc compile time) and the typecheck is its own gated check.
+    mkPluginTypecheck = pkgs: {
+      name,
+      src,
+      npmDepsHash,
+    }:
+      pkgs.buildNpmPackage {
+        pname = "kfactory-plugin-${name}-typecheck";
+        version = "0";
+        inherit src npmDepsHash;
+        dontNpmBuild = true;
+        buildPhase = ''
+          runHook preBuild
+          npx tsc --noEmit
+          runHook postBuild
+        '';
+        installPhase = ''
+          runHook preInstall
+          touch $out
+          runHook postInstall
+        '';
+      };
+
+    # Per-plugin source + npm deps hash. To refresh the hash after a
+    # package-lock.json change:
+    #   nix shell nixpkgs#prefetch-npm-deps -c prefetch-npm-deps \
+    #     plugins/<name>/package-lock.json
+    pluginSrcs = {
+      kfactory-adapter = {
+        src = ./plugins/kfactory-adapter;
+        npmDepsHash = "sha256-yfmTlJxns5IspiKhy/Q8z0WbPKCLSXMN/3LKcZz11w4=";
+      };
+      ntfy = {
+        src = ./plugins/ntfy;
+        npmDepsHash = "sha256-awaMDsw5DpycXJLGFMFBgYSB33Y8Lax3jbXQqvhZj3E=";
+      };
+      loop = {
+        src = ./plugins/loop;
+        npmDepsHash = "sha256-FuWKV8HBa6mKB5xUaxRZ8GHI2j7ZlxKW/1sOacSNDxs=";
+      };
+    };
   in {
     formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.alejandra);
 
@@ -38,7 +121,7 @@
           # Go (kfactory CLI)
           go
           golangci-lint
-          # TypeScript plugin (dep-bump workflow per .claude/rules/010-plugin.md)
+          # TypeScript plugins (dep-bump workflow per .claude/rules/010-plugin.md)
           nodejs_22
           prefetch-npm-deps
           # Patch re-diff workflow per .claude/rules/020-patches.md
@@ -61,9 +144,10 @@
     # patches applied. Building them here means CI exercises the FULL
     # build (not just `patch --dry-run`), which catches more failure
     # modes:
-    #   - opencode-kfactory: bundle-time errors from the patched TS, missing
-    #     imports introduced by the patch, etc. (does NOT catch type-level
-    #     drift -- bun's bundler doesn't typecheck; see docs/spec.md §7).
+    #   - opencode-kfactory: bundle-time errors from the patched TS,
+    #     missing imports introduced by the patches, etc. (does NOT
+    #     catch type-level drift -- bun's bundler doesn't typecheck;
+    #     see docs/spec.md §7).
     #   - oauth2-proxy-kfactory: Go compile catches everything for that
     #     package.
     #
@@ -76,22 +160,27 @@
       kfactory = pkgs.callPackage ./. {};
       default = self.packages.${system}.kfactory;
 
-      # opencode-kfactory: opencode with both patches applied + the
+      # opencode-kfactory: opencode with all three patches applied + the
       # experimental-workspaces env var baked into the wrapper, so the
       # workspace-routing middleware (added by the patches) is actually
       # exercised at runtime. Consumers using the raw `patches.*` exports
       # are responsible for setting OPENCODE_EXPERIMENTAL_WORKSPACES
       # themselves.
       opencode-kfactory = opencode.packages.${system}.default.overrideAttrs (old: {
-        # @WARNING: DO NOT REORDER. opencode-kfactory-refresh.patch is
-        #   line-pinned against opencode-bearer-and-routing.patch's
-        #   post-apply hashes; its hunks have context lines that include
-        #   the first patch's additions. Reordering will make `patch`
-        #   reject loudly or fuzzy-apply at the wrong offset.
+        # @WARNING: DO NOT REORDER. The three patches must apply in this
+        #   exact order:
+        #     1. opencode-bearer-and-routing  (upstreamable surface)
+        #     2. opencode-session-subscribers (kfactory.subscribers.changed
+        #        bus event used by plugins/ntfy)
+        #     3. opencode-kfactory-refresh    (kfactory-specific deployment
+        #        glue; line-pinned against patches #1 + #2 above)
+        #   Reordering will make `patch` reject loudly or fuzzy-apply at
+        #   the wrong offset. See .claude/rules/020-patches.md.
         patches =
           (old.patches or [])
           ++ [
             ./patches/opencode-bearer-and-routing.patch
+            ./patches/opencode-session-subscribers.patch
             ./patches/opencode-kfactory-refresh.patch
           ];
         postFixup =
@@ -105,93 +194,185 @@
       oauth2-proxy-kfactory = pkgs.oauth2-proxy.overrideAttrs (old: {
         patches = (old.patches or []) ++ [./patches/oauth2-proxy-pkce-no-secret.patch];
       });
+
+      # ---- Test harness OCI images (see harness/README.md) ----
+      #
+      # These are dev-only images for the end-to-end Docker-based test
+      # harness. They are NOT meant for production -- they bake in a
+      # fake OIDC bearer (kfactory-cli) and run opencode unauthenticated
+      # (opencode-image). The harness exists so the `kfactory attach`
+      # path can be debugged against a known-good opencode + plugin
+      # config without bringing up the full OIDC stack.
+      opencode-image = pkgs.callPackage ./harness/opencode-image.nix {
+        opencode-kfactory = self.packages.${system}.opencode-kfactory;
+        plugins = self.plugins.${system};
+        testRepo = pkgs.callPackage ./harness/test-repo.nix {};
+      };
+      kfactory-cli-image = pkgs.callPackage ./harness/kfactory-cli-image.nix {
+        kfactory = self.packages.${system}.kfactory;
+        opencode-kfactory = self.packages.${system}.opencode-kfactory;
+        testRepo = pkgs.callPackage ./harness/test-repo.nix {};
+      };
     });
 
-    # `lib.mkFactoryAdapter` substitutes the at-signed placeholders in
-    # plugin/factory-adapter.ts with deployment-specific absolute paths
-    # and returns the resulting store path. Consumer's opencode.jsonc
-    # references it via the `plugin` array:
+    # `nix run .#dev-up` / `.#dev-down` / `.#dev-clean` / `.#dev-test` --
+    # lifecycle scripts for the Docker-based E2E harness. See
+    # harness/README.md for the manual test workflow.
+    apps = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      scripts = import ./harness/scripts {inherit pkgs;};
+      mkApp = drv: name: {
+        type = "app";
+        program = "${drv}/bin/${name}";
+      };
+    in {
+      dev-up = mkApp scripts.dev-up "dev-up";
+      dev-down = mkApp scripts.dev-down "dev-down";
+      dev-clean = mkApp scripts.dev-clean "dev-clean";
+      dev-test = mkApp scripts.dev-test "dev-test";
+    });
+
+    # `nix build .#plugins.<system>.<name>` builds a single plugin and
+    # returns its store path (containing the package's full tree: src/,
+    # node_modules/, package.json). Consumers reference the store path
+    # DIRECTLY in opencode.jsonc -- no `/etc/opencode/plugins/...` symlink
+    # detour. opencode's PluginLoader accepts absolute paths; when given
+    # a directory it resolves the package.json `exports["./server"]`
+    # field to find the entrypoint.
     #
-    #   let
-    #     adapter = inputs.kfactory.lib.mkFactoryAdapter {
-    #       inherit pkgs;
-    #       gitBin = "${pkgs.git}/bin/git";
-    #       openSSHBin = "${pkgs.openssh}/bin/ssh";
-    #       workspacesDir = "/var/lib/factory/workspaces";
-    #     };
-    #   in {
-    #     environment.etc."opencode/plugin/factory-adapter.ts".source = adapter;
-    #   }
-    lib = {
-      mkFactoryAdapter = {
-        pkgs,
-        gitBin,
-        openSSHBin,
-        workspacesDir,
-      }:
-        pkgs.replaceVars ./plugin/factory-adapter.ts {
-          GIT = gitBin;
-          OPENSSH_SSH = openSSHBin;
-          WORKSPACES_DIR = workspacesDir;
-        };
-    };
+    # Generate opencode.jsonc from NixOS config so the store paths are
+    # interpolated at evaluation time:
+    #
+    #   environment.etc."opencode/opencode.json".text = builtins.toJSON {
+    #     plugin = [
+    #       "${kfactory.plugins.${system}.kfactory-adapter}"
+    #       "${kfactory.plugins.${system}.ntfy}"
+    #       "${kfactory.plugins.${system}.loop}"
+    #     ];
+    #     # ... other opencode config
+    #   };
+    #
+    # All plugins are added to checks automatically (see `checks` below),
+    # so adding a new plugin to `pluginSrcs` registers it as a CI gate.
+    plugins = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in
+      nixpkgs.lib.mapAttrs
+      (name: spec: mkPlugin pkgs ({inherit name;} // spec))
+      pluginSrcs);
 
     # Patch file paths for consumers to apply via overrideAttrs.
     #
     #   opencodePkg = inputs.opencode.packages.${system}.default.overrideAttrs (old: {
     #     patches = (old.patches or []) ++ [
     #       inputs.kfactory.patches.opencode-bearer-and-routing
-    #       inputs.kfactory.patches.opencode-kfactory-refresh  # optional
+    #       inputs.kfactory.patches.opencode-session-subscribers  # optional; needed for plugins/ntfy
+    #       inputs.kfactory.patches.opencode-kfactory-refresh     # optional; needed for `kfactory attach`
     #     ];
     #   });
     #
-    # @WARNING: DO NOT REORDER the two opencode patches. opencode-kfactory-refresh
-    #   is line-pinned against opencode-bearer-and-routing's post-apply hashes;
-    #   its hunks have context lines that include the first patch's additions.
-    #   Apply in the order shown above or `patch` will reject loudly (or worse,
-    #   fuzzy-apply at the wrong offset). Consumers who only want the
-    #   upstreamable subset may include just opencode-bearer-and-routing.
+    # @WARNING: DO NOT REORDER the three opencode patches. Apply in the order
+    #   shown above or `patch` will reject loudly (or worse, fuzzy-apply at
+    #   the wrong offset). Consumers who only want the upstreamable subset
+    #   may include just opencode-bearer-and-routing.
     patches = {
       opencode-bearer-and-routing = ./patches/opencode-bearer-and-routing.patch;
+      opencode-session-subscribers = ./patches/opencode-session-subscribers.patch;
       opencode-kfactory-refresh = ./patches/opencode-kfactory-refresh.patch;
       oauth2-proxy-pkce-no-secret = ./patches/oauth2-proxy-pkce-no-secret.patch;
     };
 
     # CI: `nix flake check` builds:
-    #   - every `packages.${system}.*` output (except `default`, which
-    #     is an alias for `kfactory`) -- so adding a new package to
-    #     `packages` automatically registers it as a CI gate, no
-    #     workflow editing needed;
-    #   - factory-plugin-typecheck -- `tsc --noEmit` against the
-    #     published @opencode-ai/plugin types. Catches WorkspaceAdapter
-    #     SHAPE drift on every opencode plugin SDK release;
-    #   - factory-opencode-patch-applies -- `patch -p1 --dry-run` of
-    #     the bearer-auth patch against the locked opencode source.
-    #     Redundant with `opencode-kfactory` building, but several
+    #   - every `packages.${system}.*` output (except `default`, an alias);
+    #   - every `plugins.${system}.*` output (each plugin builds via
+    #     buildNpmPackage, so this catches lockfile drift + missing deps);
+    #   - per-plugin typecheck (`<name>-typecheck`) running `tsc --noEmit`
+    #     against the published @opencode-ai/plugin types. Catches plugin
+    #     API SHAPE drift on every opencode plugin SDK release;
+    #   - factory-opencode-patch-applies -- `patch -p1` of all three
+    #     opencode patches in stack order against the locked opencode
+    #     source. Redundant with `opencode-kfactory` building, but several
     #     orders of magnitude faster -- gives fast-fail feedback when
-    #     the patch line-numbers drift after a `nix flake update opencode`.
-    #   - factory-oauth2-proxy-patch-applies -- same shape against
-    #     nixpkgs' oauth2-proxy src. Catches drift when nixpkgs bumps
-    #     oauth2-proxy past where PR #3168's patch geometry holds.
+    #     patch line-numbers drift after a `nix flake update opencode`;
+    #   - factory-oauth2-proxy-patch-applies -- same shape against nixpkgs'
+    #     oauth2-proxy src. Catches drift when nixpkgs bumps oauth2-proxy
+    #     past where PR #3168's patch geometry holds;
+    #   - factory-opencode-typecheck -- `tsc --noEmit` against the patched
+    #     opencode source; catches type-semantic drift inside the patches
+    #     that the bun bundler silently strips;
+    #   - per-plugin integration typecheck (`<name>-integration-typecheck`)
+    #     -- stages each plugin's src inside opencode-kfactory's workspace
+    #     tree, writes a tsconfig with `paths` mapping `@opencode-ai/plugin`
+    #     and `@opencode-ai/sdk` to opencode's WORKSPACE source packages
+    #     (not the published npm types), and runs `tsc --noEmit`. Catches
+    #     drift between what a plugin imports/calls (e.g.
+    #     `input.client.session.messages(...)`) and what the patched
+    #     opencode actually provides. The per-plugin standalone typecheck
+    #     uses the npm-published types and CAN'T see this.
+    #   - factory-completion-loads -- parse-time zsh completion sanity.
+    #
+    # Adding a new package, plugin, or patch automatically becomes a CI
+    # gate via the auto-register pattern below.
     checks = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
       packageChecks = nixpkgs.lib.filterAttrs (name: _: name != "default") self.packages.${system};
-    in
-      packageChecks
-      // {
-        factory-plugin-typecheck = pkgs.buildNpmPackage {
-          pname = "factory-plugin-typecheck";
-          version = "0";
-          src = ./plugin;
-          # To refresh: cd plugin && rm -rf node_modules package-lock.json
-          # && nix shell nixpkgs#nodejs_22 -c npm install --omit=dev --no-audit
-          # && nix shell nixpkgs#prefetch-npm-deps -c prefetch-npm-deps package-lock.json
-          # Paste the new sha256-... below.
-          npmDepsHash = "sha256-eHMridW/wDnCGiazw1vWt9vTfl57I4khxHLnGPREcq0=";
-          dontNpmBuild = true;
+      pluginChecks = self.plugins.${system};
+      pluginTypechecks =
+        nixpkgs.lib.mapAttrs'
+        (name: spec:
+          nixpkgs.lib.nameValuePair
+          "${name}-typecheck"
+          (mkPluginTypecheck pkgs ({inherit name;} // spec)))
+        pluginSrcs;
+
+      # Stage one plugin inside opencode-kfactory's workspace and run tsc
+      # with paths re-mapped to opencode's source packages (not the npm
+      # ones). The tsconfig is generated fresh per plugin so it matches
+      # whatever module-resolution opencode happens to use post-patches.
+      mkPluginIntegrationCheck = name: spec:
+        self.packages.${system}.opencode-kfactory.overrideAttrs (_: {
+          pname = "kfactory-plugin-${name}-integration-typecheck";
+          # Bring the plugin source in as a build input so Nix copies it
+          # to the store; the bash below pulls it via the env var.
+          pluginSrc = spec.src;
           buildPhase = ''
             runHook preBuild
-            npx tsc --noEmit
+            dest="packages/kfactory-${name}"
+            cp -r "$pluginSrc" "$dest"
+            chmod -R +w "$dest"
+            # Custom tsconfig: bundler resolution + explicit `paths` to
+            # opencode's workspace sources for @opencode-ai/plugin and
+            # @opencode-ai/sdk. baseUrl is the plugin dir so workspace
+            # walks find @types/node in the root node_modules / sibling
+            # workspaces hoisted by bun.
+            cat > "$dest/tsconfig.json" <<'EOF'
+            {
+              "compilerOptions": {
+                "target": "ES2022",
+                "module": "ESNext",
+                "moduleResolution": "bundler",
+                "strict": true,
+                "noEmit": true,
+                "skipLibCheck": true,
+                "esModuleInterop": true,
+                "lib": ["ES2022", "DOM", "DOM.Iterable"],
+                "types": ["node"],
+                "baseUrl": ".",
+                "typeRoots": ["../plugin/node_modules/@types"],
+                "paths": {
+                  "@opencode-ai/plugin": ["../plugin/src/index.ts"],
+                  "@opencode-ai/plugin/*": ["../plugin/src/*"],
+                  "@opencode-ai/sdk": ["../sdk/js/src/index.ts"],
+                  "@opencode-ai/sdk/*": ["../sdk/js/src/*"]
+                }
+              },
+              "include": ["src/**/*.ts"]
+            }
+            EOF
+            echo "--- integration typecheck: ${name} ---"
+            cd "$dest"
+            ../opencode/node_modules/.bin/tsc --noEmit -p .
+            cd ../..
             runHook postBuild
           '';
           installPhase = ''
@@ -199,26 +380,43 @@
             touch $out
             runHook postInstall
           '';
-        };
+          postInstall = "";
+          postFixup = "";
+          doInstallCheck = false;
+        });
 
+      pluginIntegrationChecks =
+        nixpkgs.lib.mapAttrs'
+        (name: spec:
+          nixpkgs.lib.nameValuePair
+          "${name}-integration-typecheck"
+          (mkPluginIntegrationCheck name spec))
+        pluginSrcs;
+    in
+      packageChecks
+      // pluginChecks
+      // pluginTypechecks
+      // pluginIntegrationChecks
+      // {
         factory-opencode-patch-applies =
           pkgs.runCommand "factory-opencode-patch-applies" {
             src = opencode.outPath;
             patch1 = ./patches/opencode-bearer-and-routing.patch;
-            patch2 = ./patches/opencode-kfactory-refresh.patch;
+            patch2 = ./patches/opencode-session-subscribers.patch;
+            patch3 = ./patches/opencode-kfactory-refresh.patch;
             nativeBuildInputs = [pkgs.patch];
           } ''
             cp -R "$src" ./opencode
             chmod -R +w ./opencode
             cd ./opencode
-            # Apply BOTH patches for real in sequence -- mirrors how
-            # opencode-kfactory's configurePhase applies them, and
-            # catches cases where patch2 dry-runs cleanly but real
-            # apply fails (e.g., overlapping hunks at the same offset).
-            # The resulting tree is discarded; only the success/failure
-            # of patch -p1 matters.
+            # Apply all three patches for real in sequence -- mirrors how
+            # opencode-kfactory's configurePhase applies them, and catches
+            # cases where a later patch dry-runs cleanly but real-apply
+            # fails (e.g., overlapping hunks at the same offset). The
+            # resulting tree is discarded; only success/failure matters.
             patch -p1 < "$patch1"
             patch -p1 < "$patch2"
+            patch -p1 < "$patch3"
             touch $out
           '';
 
@@ -232,29 +430,6 @@
             chmod -R +w ./oauth2-proxy
             cd ./oauth2-proxy
             patch -p1 --dry-run < "$patch"
-            touch $out
-          '';
-
-        # factory-plugin-token-discipline -- enforces the constants-block
-        # rule from `.claude/rules/010-plugin.md`: `pkgs.replaceVars`'s
-        # checkPhase fails on ANY leftover `@xxx@` pattern at build time,
-        # so placeholders may only appear in the dedicated constants block
-        # near the top of factory-adapter.ts. This check catches violations
-        # earlier (CI fails on the cheap grep instead of the more expensive
-        # build that would fail anyway).
-        factory-plugin-token-discipline =
-          pkgs.runCommand "factory-plugin-token-discipline" {
-            adapter = ./plugin/factory-adapter.ts;
-          } ''
-            # The constants block lives between the `// ---- Nix-substituted`
-            # marker comment and the next `// ----` section header. Anything
-            # `@[A-Z_]+@` outside that range is forbidden.
-            awk '
-              /^\/\/ ---- Nix-substituted/ { inblock=1; next }
-              inblock && /^\/\/ ----/      { inblock=0 }
-              !inblock && /@[A-Z_]+@/      { print FILENAME":"NR": forbidden placeholder: "$0; bad=1 }
-              END { exit bad }
-            ' "$adapter"
             touch $out
           '';
 
@@ -304,12 +479,11 @@
 
         # factory-opencode-typecheck -- runs tsc --noEmit against the
         # patched opencode source. Closes the spec.md §7 gap where
-        # type-semantic drift inside the bearer-auth + refresh patches
-        # was not caught by CI (bun's bundler strips types without
-        # checking).
+        # type-semantic drift inside the three opencode patches was not
+        # caught by CI (bun's bundler strips types without checking).
         #
         # Builds on top of `opencode-kfactory` -- its configurePhase
-        # already applies our patch and copies the upstream-prepared
+        # already applies our patches and copies the upstream-prepared
         # node_modules into the source tree. We override buildPhase to
         # run `tsc --noEmit` (NOT tsgo: opencode's `typecheck` script
         # uses tsgo, which needs a postinstall-downloaded native binary
@@ -317,12 +491,11 @@
         # tsc ships as a JS-only binary in node_modules/.bin/tsc and
         # produces equivalent diagnostics.
         #
-        # Scope: only `packages/opencode/` -- where 5 of the patch's 6
-        # touched files live. opencode's node_modules.nix filters out
-        # most other workspaces (no tsc available in core's .bin), and
-        # tsc-in-opencode transitively resolves @opencode-ai/core types
-        # via workspace references anyway, so the single hunk in
-        # packages/core/src/flag/flag.ts is still indirectly covered.
+        # Scope: only `packages/opencode/` -- where the patches' touched
+        # files live. opencode's node_modules.nix filters out most other
+        # workspaces (no tsc available in core's .bin), and tsc-in-
+        # opencode transitively resolves @opencode-ai/core types via
+        # workspace references anyway.
         factory-opencode-typecheck = self.packages.${system}.opencode-kfactory.overrideAttrs (_: {
           pname = "factory-opencode-typecheck";
           baseline = ./checks/factory-opencode-typecheck.baseline;

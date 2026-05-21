@@ -1,0 +1,114 @@
+Per-instance SSE-subscriber bus event (kfactory.subscribers.changed).
+
+Publishes `kfactory.subscribers.changed` with the absolute per-workspace
+subscriber count `{count: N}` on every attach / detach to the
+per-instance `/event` SSE endpoint. A WeakMap<Bus.Interface, number>
+tracks the live count; each publish carries the post-change total. The
+instance bus is workspace-scoped (one per InstanceStore context), so
+each publish only reaches plugins running in the same workspace.
+Plugins assign their local count from `props.count` to derive a
+per-workspace "is anyone watching" signal -- used by the kfactory ntfy
+plugin (plugins/ntfy in the kfactory repo) to skip / cancel
+notifications when an operator is attached.
+
+Absolute-count semantics rather than `{delta: ±1}`: delta accumulation
+can't recover from cold-start asymmetry. A plugin that loads after a
+subscriber attached would either miss the first +1 (and notify with an
+operator attached) or clamp negative on the first -1 (and stay stuck).
+With absolute counts the next publish brings any plugin into sync
+regardless of when it loaded.
+
+Why this lives in opencode (and not as a pure plugin trick):
+  - There is no plugin-API surface for SSE subscriber state today; the
+    HTTP connection lifecycle is invisible to the existing `Plugin.event`
+    hook (verified via spec.md decision-log entry on the API audit).
+  - The cleanest hook point is the response stream's lifecycle in
+    `event.ts` (`Stream.ensuring` for detach, the surrounding generator
+    for attach). Adding the publish there is local, ~30 LOC, and uses
+    only types already imported in adjacent files.
+
+Stacking: applied AFTER opencode-bearer-and-routing and BEFORE
+opencode-kfactory-refresh. The patch touches only event.ts, which
+neither neighbour modifies, so the stack is independent in practice.
+The flake check `factory-opencode-patch-applies` runs the full
+three-patch sequence and fails loudly if any drift is introduced.
+
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
+index c0bcbc8..568fecf 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
+@@ -1,6 +1,7 @@
+ import { Bus } from "@/bus"
++import { BusEvent } from "@/bus/bus-event"
+ import * as Log from "@opencode-ai/core/util/log"
+-import { Effect } from "effect"
++import { Effect, Schema } from "effect"
+ import * as Stream from "effect/Stream"
+ import { HttpServerResponse } from "effect/unstable/http"
+ import { HttpApiBuilder } from "effect/unstable/httpapi"
+@@ -9,6 +10,34 @@ import { EventApi } from "../groups/event"
+ 
+ const log = Log.create({ service: "server" })
+ 
++// kfactory: bus event published on every SSE subscriber attach / detach,
++// carrying the ABSOLUTE per-workspace count (not a delta). The instance
++// bus is workspace-scoped (one per InstanceStore context), so each
++// publish only reaches the plugin running in the same workspace.
++// Plugins that want to gate notifications on "is anyone watching" set
++// their local count to `props.count`. Absolute-count semantics removes
++// the cold-start asymmetry inherent to delta accumulation (a plugin
++// that loads after a subscriber attached can't reconstruct state from
++// deltas alone). See plugins/ntfy in the kfactory repo for the
++// canonical consumer.
++const SubscribersChanged = BusEvent.define(
++  "kfactory.subscribers.changed",
++  Schema.Struct({ count: Schema.Number }),
++)
++
++// Per-instance subscriber-count tracker. Keyed by Bus.Interface, which is
++// minted once per InstanceState.make per workspace -- so the WeakMap
++// entry's lifetime matches the bus's, and a disposed instance's count
++// is GC'd along with the bus reference. Module-scope `let count = 0`
++// would be process-global and wrong for multi-workspace hosts.
++const subscriberCounts = new WeakMap<Bus.Interface, number>()
++
++function adjustSubscriberCount(bus: Bus.Interface, delta: number): number {
++  const next = Math.max(0, (subscriberCounts.get(bus) ?? 0) + delta)
++  subscriberCounts.set(bus, next)
++  return next
++}
++
+ function eventData(data: unknown): Sse.Event {
+   return {
+     _tag: "Event",
+@@ -32,13 +61,29 @@ function eventResponse(bus: Bus.Interface) {
+     )
+ 
+     log.info("event connected")
++    // kfactory: notify in-instance subscribers (plugins) that a new SSE
++    // client just attached. Published BEFORE the response begins streaming
++    // so it lands on the wildcard PubSub while the plugin's subscribeAll
++    // stream is already wired up at instance-init time.
++    const connectCount = adjustSubscriberCount(bus, 1)
++    yield* bus.publish(SubscribersChanged, { count: connectCount })
+     return HttpServerResponse.stream(
+       Stream.make({ id: Bus.createID(), type: "server.connected", properties: {} }).pipe(
+         Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
+         Stream.map(eventData),
+         Stream.pipeThroughChannel(Sse.encode()),
+         Stream.encodeText,
+-        Stream.ensuring(Effect.sync(() => log.info("event disconnected"))),
++        Stream.ensuring(
++          Effect.gen(function* () {
++            log.info("event disconnected")
++            // kfactory: pair the +1 from above. Cleanup runs on stream
++            // termination -- client disconnect, instance disposal, or
++            // server shutdown. The clamp at 0 inside adjustSubscriberCount
++            // tolerates a stray -1 if the +1 publish was lost.
++            const disconnectCount = adjustSubscriberCount(bus, -1)
++            yield* bus.publish(SubscribersChanged, { count: disconnectCount })
++          }),
++        ),
+       ),
+       {
+         contentType: "text/event-stream",
