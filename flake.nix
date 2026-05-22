@@ -9,7 +9,7 @@
     # see if the patches still apply (factory-opencode-patch-applies
     # check). If hunks drift, re-diff against the new source -- the
     # workflow is documented in .claude/rules/020-patches.md.
-    opencode.url = "github:sst/opencode/v1.15.4";
+    opencode.url = "github:sst/opencode/v1.15.7";
   };
 
   outputs = {
@@ -331,6 +331,13 @@
           patches =
             (old.patches or [])
             ++ [
+              # Temporary: relax opencode v1.15.7's bun-version check so
+              # the build accepts the bun 1.3.13 nixpkgs currently ships.
+              # See the patch header for the full chain (nixpkgs#519796
+              # is in DRAFT because bun 1.3.14 segfaults downstream builds;
+              # opencode's bun bump was purely metadata/future-proofing,
+              # no API delta). Drop when nixpkgs ships bun 1.3.14+.
+              ./patches/opencode-bun-version-relax.patch
               ./patches/opencode-bearer-and-routing.patch
               ./patches/opencode-session-subscribers.patch
               ./patches/opencode-kfactory-refresh.patch
@@ -445,6 +452,7 @@
     #   the wrong offset). Consumers who only want the upstreamable subset
     #   may include just opencode-bearer-and-routing.
     patches = {
+      opencode-bun-version-relax = ./patches/opencode-bun-version-relax.patch;
       opencode-bearer-and-routing = ./patches/opencode-bearer-and-routing.patch;
       opencode-session-subscribers = ./patches/opencode-session-subscribers.patch;
       opencode-kfactory-refresh = ./patches/opencode-kfactory-refresh.patch;

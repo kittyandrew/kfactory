@@ -34,7 +34,7 @@ The flake check `factory-opencode-patch-applies` runs the full
 three-patch sequence and fails loudly if any drift is introduced.
 
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
-index c0bcbc8..568fecf 100644
+index e770a7c..ae1777b 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
 @@ -1,6 +1,7 @@
@@ -81,7 +81,7 @@ index c0bcbc8..568fecf 100644
  function eventData(data: unknown): Sse.Event {
    return {
      _tag: "Event",
-@@ -32,13 +61,29 @@ function eventResponse(bus: Bus.Interface) {
+@@ -33,13 +62,29 @@ function eventResponse(bus: Bus.Interface) {
      )
  
      log.info("event connected")

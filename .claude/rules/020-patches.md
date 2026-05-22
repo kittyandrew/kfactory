@@ -1,13 +1,23 @@
 # Editing the opencode patches
-<!-- patches -- three-patch stack, four-way re-diff, picking which patch -->
+<!-- patches -- four-patch stack, four-way re-diff, picking which patch -->
 
-Three opencode patches are line-number-pinned against the
+Four opencode patches are line-number-pinned against the
 `inputs.opencode` flake input (the exact tag pinned in `flake.nix`).
 Stack order is mandatory:
 
+0. `patches/opencode-bun-version-relax.patch` -- **TEMPORARY**.
+   Single-file (`packages/script/src/index.ts`) one-line change
+   relaxing the bun-version range from `^${packageManager}` to
+   `>=1.3.13` so nixpkgs's bun 1.3.13 can build opencode v1.15.5+.
+   Drop when nixpkgs#519796 (bun 1.3.13 -> 1.3.14) merges. Lives at
+   the top of the stack because it touches a file none of the other
+   patches do; ordering doesn't actually matter for this one but it
+   stays first by convention to keep the "drop me later" intent
+   visible.
 1. `patches/opencode-bearer-and-routing.patch` -- upstreamable subset:
    bearer flag, `--workspace` plumbing, workspace-routing header
-   fallback, post-`adapter.create` project re-resolve.
+   fallback (v1 + v2 path), `Session.list` + `Session.listGlobal`
+   workspaceID filter, plugin-adapter ProjectID.global registration.
 2. `patches/opencode-session-subscribers.patch` -- publishes
    `kfactory.subscribers.changed` bus events on every SSE attach /
    detach. Used by `plugins/ntfy` to skip / cancel notifications when

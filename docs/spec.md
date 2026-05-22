@@ -308,10 +308,20 @@ relevant to a consumer.
   0600). Operator runs kfactory in their own terminal -- the CLI stays
   out of window management.
 
-- **Three-patch opencode stack.** Upstream opencode v1.15.x's
+- **Four-patch opencode stack.** Upstream opencode v1.15.x's
   `opencode attach` only knows HTTP Basic auth and the plugin API has
-  no surface for SSE subscriber lifecycle. Three patches, applied
+  no surface for SSE subscriber lifecycle. Four patches, applied
   in order:
+  - `opencode-bun-version-relax.patch` -- **TEMPORARY**. opencode
+    v1.15.5+ pins `packageManager: "bun@1.3.14"` and the build script
+    enforces `^${version}`. nixpkgs currently ships bun 1.3.13 because
+    bun 1.3.14 produces segfaulting binaries when used to build
+    downstream packages (see nixpkgs PR #519796, in DRAFT). opencode's
+    bun bump (sst/opencode#27648) was metadata-only -- no new bun-API
+    calls in the runtime path, just a future-proofing pin against the
+    upcoming Rust-rewrite Bun 2.x line. This patch relaxes the range
+    to `>=1.3.13` so the build accepts the bun nixpkgs has. Drop the
+    patch when nixpkgs ships bun 1.3.14+.
   - `opencode-bearer-and-routing.patch` -- upstreamable subset:
     `--bearer` / `OPENCODE_SERVER_BEARER` for Bearer attach;
     `--workspace` flag plumbed through `tui()` into `SDKProvider`,

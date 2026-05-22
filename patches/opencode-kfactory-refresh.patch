@@ -31,10 +31,10 @@ kfactory must be on the operator's PATH for the subprocess refresh to
 work. Same-machine, same-UID, same-auth.json.
 
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
-index 59c1109..ae848d2 100644
+index 00b95fa..7738ea1 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
-@@ -29,6 +29,7 @@ export const Flag = {
+@@ -28,6 +28,7 @@ export const Flag = {
    OPENCODE_SERVER_PASSWORD: process.env["OPENCODE_SERVER_PASSWORD"],
    OPENCODE_SERVER_USERNAME: process.env["OPENCODE_SERVER_USERNAME"],
    OPENCODE_SERVER_BEARER: process.env["OPENCODE_SERVER_BEARER"],
@@ -43,7 +43,7 @@ index 59c1109..ae848d2 100644
    // Experimental
    OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
 diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index e9e5063..c00b5c7 100644
+index 6dc6cd7..2717bab 100644
 --- a/packages/opencode/src/cli/cmd/tui/app.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/app.tsx
 @@ -20,6 +20,7 @@ import {
@@ -54,7 +54,7 @@ index e9e5063..c00b5c7 100644
  import semver from "semver"
  import { DialogProvider, useDialog } from "@tui/ui/dialog"
  import { DialogProvider as DialogProviderList } from "@tui/component/dialog-provider"
-@@ -394,6 +395,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+@@ -398,6 +399,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
      })
    })
  
