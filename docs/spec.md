@@ -419,7 +419,7 @@ relevant to a consumer.
   belong to, independent of project_id. ~15 LOC TS in the bearer-auth
   patch. Upstream-PR-worthy.
 
-  Verified in the harness (2026-05): three workspaces dispatched
+  Verified in the e2e tests (2026-05): three workspaces dispatched
   against the same repo share project_id (the git-root OID, assigned
   by opencode at session-creation time, NOT at workspace creation) but
   carry distinct workspace_id. `GET /experimental/session?workspace=<id>`
@@ -562,6 +562,130 @@ relevant to a consumer.
   in another shell -- you'll miss notifications from concurrent
   sessions in the same workspace.
 
+- **`opencode-pty` packaged as a third-party Nix dependency, NOT
+  vendored.** Third-party opencode plugins that kfactory wants to
+  ship live under `plugins/<name>/` -- same parent directory as
+  kfactory-owned plugins, distinguished by the contents of the
+  directory (third-party carriers have only `package.json` +
+  `package-lock.json`; kfactory-owned plugins have `src/` +
+  `tsconfig.json` + typecheck deps). Each carrier is exposed as a
+  `packages.<name>` flake output via `mkThirdPartyPlugin`. For
+  shekohex/opencode-pty (MIT) the integration shape is:
+
+  - A thin carrier under `plugins/opencode-pty/` -- `package.json`
+    declaring `opencode-pty` as a dep + `package-lock.json` locking
+    the transitive resolution. The carrier exists purely so
+    `buildNpmPackage` has the manifest pair it needs for an offline
+    sandboxed install. NO opencode-pty source lives in our tree.
+
+  - `packages.opencode-pty` runs `buildNpmPackage` with
+    `npmInstallFlags = ["--ignore-scripts"]`. The flag is redundant
+    with `buildNpmPackage`'s `npmConfigHook`, which already
+    hardcodes `--ignore-scripts` into its internal `npm ci` call; we
+    keep the explicit flag so the suppression is greppable. What it
+    ACTUALLY suppresses (despite an earlier comment to the contrary):
+    `msgpackr-extract`'s `install: node-gyp-build-optional-packages`,
+    reached transitively through `@opencode-ai/sdk` -> effect ->
+    msgpackr -> msgpackr-extract. node-gyp-build-optional-packages is
+    a runtime resolver, not a compiler, so the resolver runs again the
+    first time the plugin require()s msgpackr -- skipping it is
+    benign. It does NOT suppress bun-pty's `prepare: bun run build`:
+    npm's `prepare` lifecycle does not fire for tarball installs from
+    the registry, only for git-URL installs and local in-tree
+    development. The bun-pty Rust build was never going to run here
+    regardless of the flag; bun-pty's npm tarball ships prebuilt
+    platform binaries for Linux x86_64 + arm64, macOS x86_64 + arm64,
+    and Windows.
+
+  - The install layout promotes opencode-pty itself to `$out/` and
+    hoists its runtime deps (bun-pty, open, open's transitive
+    closure) to `$out/node_modules/` -- so opencode's PluginLoader
+    can `await import($out)`, resolve via `package.json#exports."./server"`,
+    and the loaded plugin's `require("bun-pty")` etc resolve locally.
+
+  Why under `plugins/<name>/` alongside kfactory's own plugins:
+  `plugins/` is "where opencode plugins live for this deployment."
+  Both shapes belong there because both ARE opencode plugins; the
+  difference is how they're packaged, not what they are. The
+  distinction is visible on `ls plugins/<name>/`:
+
+  - kfactory-owned plugin -> `src/`, `tsconfig.json`, `package.json`
+    declaring typecheck deps, optional `commands/` for slash command
+    markdown.
+  - third-party carrier -> ONLY `package.json` + `package-lock.json`
+    (no `src/`, no `tsconfig.json`). The carrier declares the npm
+    package + version + locks the transitive resolution; the actual
+    source lands in `$out` of `packages.<name>` at build time.
+
+  Registry split keeps the build paths cleanly separated: kfactory
+  plugins live in `pluginSrcs` and go through `mkPlugin` +
+  `mkPluginTypecheck` + `mkPluginIntegrationCheck`. Third-party
+  carriers live in `thirdPartyPluginSrcs` and go through
+  `mkThirdPartyPlugin` (no typecheck or integration-typecheck --
+  upstream owns its own tsc story). The directory location is
+  decoupled from the registry: both registries point INTO
+  `plugins/<name>/`, but the helper applied to each entry is
+  decided by which registry holds it.
+
+  An earlier shape parked third-party carriers under a separate
+  top-level `nix/<name>/`. The argument was "grep-conflation" -- but
+  agents grep `plugins/` looking for opencode plugins, which is
+  exactly what's there in both cases. The shape distinction is
+  visible at directory listing level. Reverting that split: one
+  directory, one mental model.
+
+  Why this shape over vendoring source:
+  - opencode-pty is upstream-actively-maintained; bumping follows the
+    procedure in `.claude/rules/050-third-party-nix-plugins.md`
+    (carrier package.json version edit + regenerate lockfile + recompute
+    npm hash + rebuild smoke check). The lockfile-refresh step is
+    non-sandboxed (requires network egress) -- that's a hard
+    constraint, not a one-liner.
+  - Their npm tarball is self-contained for the entry point (dist/ +
+    bun-pty's prebuilt .so), so we don't take on their build chain
+    (vite, React, tsc, playwright, jsdom devDependencies). The
+    PRODUCTION transitive closure is still non-trivial: typescript,
+    fast-check, effect, and others land in $out/node_modules because
+    @opencode-ai/sdk declares them as runtime dependencies. The Nix
+    store path is ~85MB for that reason (verified via `du -sh $out`);
+    that's a cost we accept in exchange for not running upstream's
+    build chain.
+  - License is MIT; combining with our AGPLv3 is fine in this
+    direction. No notice obligation on a Nix-package wrapper that
+    doesn't re-distribute their source in our tree.
+
+  Why this shape over `Path 3` (manual fetchurl of the transitive
+  closure): the carrier lockfile is a single source of truth for
+  every transitive version, and bumping is mechanical. Manual
+  fetchurls would mean re-deriving the closure on every upstream
+  release.
+
+  Why this shape over `Path 4` (opencode auto-installs on first
+  run): non-reproducible (runtime network), non-idempotent across
+  container restarts in dev, and breaks the kfactory deploy contract
+  that opencode.json points at absolute Nix store paths so the OCI
+  image is pinned to its plugin set at build time.
+
+  Layout regressions are caught by the auto-registered
+  `factory-<name>-smoke` flake check (see `mkThirdPartyPluginSmoke`
+  in flake.nix). The smoke mirrors opencode's PluginLoader algorithm
+  faithfully: read package.json, resolve `exports["./server"]`
+  (handling object/string forms) with fallback to `main`, import that
+  exact file, assert it exposes at least one named export. This
+  catches `installPhase hoisted the wrong directory`, `upstream
+  removed exports["./server"] without setting main`, and `upstream
+  changed exports["./server"] to point at a non-existent file` --
+  exactly the classes of failure that would silently break opencode
+  load while looking healthy from a casual inspection. The check
+  does NOT assert a specific export name (e.g. `PTYPlugin`); that's
+  the explicit tradeoff for auto-registration. Per-plugin tightening
+  is opt-in via a future registry field. Tool-level behaviour
+  (pty_spawn, pty_read, pty_kill) is exercised end-to-end by
+  dispatching tasks through the Docker e2e tests when meaningful
+  changes land; this isn't currently a flake check because spinning
+  the e2e tests inside one would mean docker-in-nix-sandbox
+  gymnastics that aren't worth the gate they buy.
+
 - **Upstream-contract watch list.** opencode is EXPERIMENTAL (gated by
   `OPENCODE_EXPERIMENTAL_WORKSPACES`); re-verifying these on every
   opencode bump is mandatory. The plugin typecheck catches API SHAPE
@@ -666,13 +790,22 @@ plugins/loop/                       /loop auto-continuation plugin
   commands/{loop,loop-stop}.md        slash command markdown (consumer wires via NixOS module)
   package.json + package-lock.json    @kfactory/loop
   tsconfig.json
+plugins/opencode-pty/               third-party carrier (manifest-only) for
+                                    shekohex/opencode-pty; pinned through Nix as
+                                    packages.opencode-pty (see rule 050)
+  package.json + package-lock.json    declares opencode-pty + locks transitive resolution
+                                      (NO opencode-pty source in our tree; no src/)
 patches/                            opencode-bearer-and-routing.patch
                                     + opencode-session-subscribers.patch
                                     + opencode-kfactory-refresh.patch
                                     + oauth2-proxy-pkce-no-secret.patch
+tests/e2e/                          Docker-based E2E test environment
+  configs/                            opencode-base.json, notification-ntfy.json, auth.json
+  scripts/                            dev-up / dev-down / dev-clean / dev-test (nix run apps)
+  *-image.nix + test-repo.nix         OCI image builders + bundled test git repo
 default.nix                         kfactory CLI build (empty endpoint defaults; ldflags-injectable)
 flake.nix                           packages.kfactory / plugins.* / patches.* / checks.*
-.claude/rules/                      plugin editing + patch re-diff workflows
+.claude/rules/                      plugin editing + patch re-diff + third-party-plugin workflows
 ```
 
 Wiring (reverse proxy config, oauth2-proxy systemd unit, host/VM

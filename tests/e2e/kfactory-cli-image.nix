@@ -1,4 +1,4 @@
-# OCI image for the harness's kfactory-cli container.
+# OCI image for the e2e tests' kfactory-cli container.
 #
 # Contains:
 #   - kfactory binary (the CLI under test)
@@ -12,7 +12,7 @@
 #   - Pre-staged ~/.config/kfactory/auth.json with bogus tokens at
 #     far-future expiry, so `ensureFresh` short-circuits and the
 #     CLI sends a Bearer header without going through OIDC.
-#   - A local bare git repo at /srv/test-repo.git -- so the harness
+#   - A local bare git repo at /srv/test-repo.git -- so the e2e tests
 #     never needs the public internet to dispatch a workspace.
 #
 # The container's entrypoint sleeps forever; operator drives it via
@@ -50,7 +50,7 @@ in
     ];
     extraCommands = ''
       # Pre-stage auth.json so ensureFresh sees a non-expired token and
-      # skips the OIDC refresh entirely. The harness needs this because
+      # skips the OIDC refresh entirely. The e2e tests needs this because
       # there's no IdP to talk to.
       mkdir -p root/.config/kfactory
       cp ${./configs/auth.json} root/.config/kfactory/auth.json

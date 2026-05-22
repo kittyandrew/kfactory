@@ -1,0 +1,9 @@
+{
+  "name": "kfactory-opencode-pty-carrier",
+  "version": "0.0.0",
+  "description": "Thin carrier that pins opencode-pty for our flake. Not a kfactory plugin -- just a packaging vehicle.",
+  "private": true,
+  "dependencies": {
+    "opencode-pty": "0.3.4"
+  }
+}

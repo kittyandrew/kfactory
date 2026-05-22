@@ -5,7 +5,7 @@
 #     into a per-workspace dir under /var/lib/kfactory/workspaces/
 #
 # Built once, referenced from both kfactory-cli-image.nix and
-# opencode-image.nix so the harness never hits the public network.
+# opencode-image.nix so the e2e tests never hits the public network.
 {pkgs}:
 pkgs.runCommand "kfactory-test-repo" {
   nativeBuildInputs = [pkgs.git];
@@ -15,17 +15,17 @@ pkgs.runCommand "kfactory-test-repo" {
   export HOME="$workdir/h"
   mkdir -p "$HOME"
   git init -q --initial-branch=main .
-  git config user.email "harness@kfactory.local"
-  git config user.name "harness"
+  git config user.email "e2e@kfactory.local"
+  git config user.name "e2e"
   cat > README.md <<'EOF'
-  # kfactory harness test repo
+  # kfactory e2e test repo
 
   A trivial repo for end-to-end testing of `kfactory dispatch`. The
-  harness clones this into per-workspace dirs to exercise the factory
+  the e2e tests clone this into per-workspace dirs to exercise the factory
   adapter without needing public-internet access.
   EOF
   cat > task.txt <<'EOF'
-  Hello from the kfactory harness.
+  Hello from the kfactory e2e tests.
   EOF
   git add .
   git commit -q -m "init"

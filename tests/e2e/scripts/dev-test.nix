@@ -24,7 +24,7 @@ in
 
     echo
     echo "========================================================"
-    echo " kfactory harness E2E validation"
+    echo " kfactory e2e validation"
     echo "========================================================"
 
     echo

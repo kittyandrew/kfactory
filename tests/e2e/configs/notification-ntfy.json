@@ -1,9 +1,9 @@
 {
   "_comment": [
-    "ntfy plugin config for the test harness. The 'server' is the harness's",
+    "ntfy plugin config for the e2e tests. The 'server' is the e2e tests'",
     "ntfy container reachable on the Docker bridge by name; 'topic' matches",
     "what the operator opens in the host browser at http://localhost:8080/<topic>.",
-    "notifyAfter uses shorthand duration ('3s' = 3 seconds) so the harness",
+    "notifyAfter uses shorthand duration ('3s' = 3 seconds) so the e2e tests",
     "loop can validate the wait window quickly. fetchTimeout same shape."
   ],
   "enabled": true,
@@ -22,7 +22,7 @@
     }
   },
   "backend": {
-    "topic": "kfactory-harness",
+    "topic": "kfactory-e2e",
     "server": "http://kfactory-ntfy:80",
     "priority": "default",
     "fetchTimeout": "5s"

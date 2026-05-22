@@ -101,6 +101,146 @@
         npmDepsHash = "sha256-FuWKV8HBa6mKB5xUaxRZ8GHI2j7ZlxKW/1sOacSNDxs=";
       };
     };
+
+    # mkThirdPartyPlugin -- buildNpmPackage wrapper for third-party
+    # opencode plugins pinned through a `plugins/<name>/` carrier
+    # (manifest-only: package.json + package-lock.json, no src/).
+    # Unlike mkPlugin (which packages kfactory's own plugin source
+    # under plugins/<name>/src/), this builder installs from an npm
+    # registry tarball via the carrier's lockfile, promotes the
+    # third-party package itself to $out, and hoists its runtime
+    # deps into $out/node_modules so opencode's PluginLoader can
+    # resolve them. Both flavours of plugin live under plugins/;
+    # which helper builds them is decided by which registry
+    # (pluginSrcs vs. thirdPartyPluginSrcs) holds the entry.
+    #
+    # See .claude/rules/050-third-party-nix-plugins.md for the bump
+    # workflow and docs/spec.md's decisions-log entry for the
+    # structural rationale (carrier vs. fetchurl-closure vs.
+    # opencode-auto-install).
+    #
+    # `npmInstallFlags = ["--ignore-scripts"]` is redundant with
+    # buildNpmPackage's `npmConfigHook` (which already hardcodes
+    # --ignore-scripts into its internal `npm ci`) but kept explicit
+    # for greppability. The script it actually suppresses depends on
+    # the dep tree -- for opencode-pty it's msgpackr-extract's
+    # node-gyp-build-optional-packages resolver (benign; runs again
+    # at runtime). It does NOT suppress `prepare` hooks (those don't
+    # fire for tarball installs from the npm registry).
+    mkThirdPartyPlugin = pkgs: {
+      name,
+      version,
+      src,
+      npmDepsHash,
+    }:
+      pkgs.buildNpmPackage {
+        pname = name;
+        inherit version src npmDepsHash;
+        npmInstallFlags = ["--ignore-scripts"];
+        dontNpmBuild = true;
+        # Promote the third-party package's own files to $out, hoist
+        # its sibling deps to $out/node_modules. `shopt -s dotglob` so
+        # any dotfiles the upstream tarball ships move with the
+        # non-dotfiles -- a separate `.[!.]*` glob would exit 1 under
+        # `set -eu` if there are no dotfiles, breaking installs for
+        # packages that ship none.
+        installPhase = ''
+          runHook preInstall
+          mkdir -p $out
+          mv node_modules/${name} $out-tmp
+          mv node_modules $out/node_modules
+          shopt -s dotglob
+          mv $out-tmp/* $out/
+          shopt -u dotglob
+          rmdir $out-tmp
+          rm -f $out/node_modules/.package-lock.json
+          runHook postInstall
+        '';
+      };
+
+    # mkThirdPartyPluginSmoke -- generic smoke check for any
+    # third-party plugin produced by mkThirdPartyPlugin. Mirrors
+    # opencode's PluginLoader resolution algorithm (per
+    # packages/opencode/src/plugin/shared.ts:resolvePackageEntrypoint):
+    #
+    #   1. Read package.json
+    #   2. If `exports["./server"]` is present, use it (resolving the
+    #      `default` / `import` condition if it's an object).
+    #   3. Otherwise, fall back to `main`.
+    #   4. Import that exact file relative to the package root.
+    #   5. Assert the module exposes at least one named export.
+    #
+    # Catches the silent classes:
+    #   - installPhase hoisted the wrong directory (no package.json)
+    #   - upstream removed exports["./server"] AND main (no entrypoint)
+    #   - upstream changed exports["./server"] to point at a
+    #     non-existent or empty file
+    #
+    # The check does NOT assert a specific export NAME (e.g.
+    # "PTYPlugin"). A specific-export assertion would need per-plugin
+    # smoke checks; the generic shape auto-registers for every
+    # third-party plugin in the registry, which is the tradeoff that
+    # keeps the bump workflow short. Per-plugin tightening can be
+    # added later via an opt-in registry field if a specific plugin
+    # warrants it.
+    mkThirdPartyPluginSmoke = pkgs: {
+      name,
+      pkg,
+    }:
+      pkgs.runCommand "factory-${name}-smoke" {
+        nativeBuildInputs = [pkgs.bun];
+      } ''
+        cat > smoke.ts <<EOF
+        // Resolve the entry the same way opencode's PluginLoader does:
+        // exports["./server"] first, then main. Hardcoding a sub-path
+        // like /dist/index.js would silently miss exports-map
+        // regressions; bare-directory imports go through exports["."]
+        // which opencode never reads. Reading package.json + applying
+        // opencode's algorithm faithfully is what makes the gate
+        // meaningful.
+        const pkgJson = await Bun.file("${pkg}/package.json").json()
+        const serverExport = pkgJson?.exports?.["./server"]
+        let entry: string | undefined
+        if (typeof serverExport === "string") {
+          entry = serverExport
+        } else if (serverExport && typeof serverExport === "object") {
+          entry = serverExport.default ?? serverExport.import
+        }
+        if (!entry && typeof pkgJson?.main === "string") {
+          entry = pkgJson.main
+        }
+        if (!entry) {
+          console.error("smoke: ${name} has neither exports['./server'] nor main")
+          process.exit(1)
+        }
+        const fullPath = "${pkg}/" + entry.replace(/^\.\//, "")
+        const mod = await import(fullPath)
+        const exportNames = Object.keys(mod)
+        if (exportNames.length === 0) {
+          console.error("smoke: ${name} entry " + entry + " has no exports")
+          process.exit(1)
+        }
+        console.log("smoke: ${name} loaded via " + entry + ", exports:", exportNames.join(", "))
+        EOF
+        export HOME=$TMPDIR
+        bun run smoke.ts
+        touch $out
+      '';
+
+    # Per-third-party-plugin source + npm deps hash. Carriers live
+    # under plugins/<name>/ (manifest-only; no src/). Adding an entry
+    # here auto-registers:
+    #   - `packages.<name>` flake output (via mkThirdPartyPlugin)
+    #   - `factory-<name>-smoke` flake check (via mkThirdPartyPluginSmoke)
+    #   - opencode.json plugin-list entry inside the e2e tests image
+    # Bumping any of these follows .claude/rules/050-third-party-nix-plugins.md.
+    thirdPartyPluginSrcs = {
+      opencode-pty = {
+        version = "0.3.4";
+        src = ./plugins/opencode-pty;
+        npmDepsHash = "sha256-NyRu/yDS3+sDcG4UrbBLg9IBgiE5Qb73jKomZGyyO4Q=";
+      };
+    };
   in {
     formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.alejandra);
 
@@ -156,71 +296,97 @@
     # kfactory's pin. Both paths are supported.
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-    in {
-      kfactory = pkgs.callPackage ./. {};
-      default = self.packages.${system}.kfactory;
+      # Auto-generated packages from thirdPartyPluginSrcs. Adding a new
+      # entry to that registry exposes `packages.<name>` here without
+      # any explicit per-plugin block below. See rule 050.
+      thirdPartyPackages =
+        nixpkgs.lib.mapAttrs
+        (name: spec: mkThirdPartyPlugin pkgs ({inherit name;} // spec))
+        thirdPartyPluginSrcs;
+    in
+      thirdPartyPackages
+      // {
+        kfactory = pkgs.callPackage ./. {};
+        default = self.packages.${system}.kfactory;
 
-      # opencode-kfactory: opencode with all three patches applied + the
-      # experimental-workspaces env var baked into the wrapper, so the
-      # workspace-routing middleware (added by the patches) is actually
-      # exercised at runtime. Consumers using the raw `patches.*` exports
-      # are responsible for setting OPENCODE_EXPERIMENTAL_WORKSPACES
-      # themselves.
-      opencode-kfactory = opencode.packages.${system}.default.overrideAttrs (old: {
-        # @WARNING: DO NOT REORDER. The three patches must apply in this
-        #   exact order:
-        #     1. opencode-bearer-and-routing  (upstreamable surface)
-        #     2. opencode-session-subscribers (kfactory.subscribers.changed
-        #        bus event used by plugins/ntfy)
-        #     3. opencode-kfactory-refresh    (kfactory-specific deployment
-        #        glue; line-pinned against patches #1 + #2 above)
-        #   Reordering will make `patch` reject loudly or fuzzy-apply at
-        #   the wrong offset. See .claude/rules/020-patches.md.
-        patches =
-          (old.patches or [])
-          ++ [
-            ./patches/opencode-bearer-and-routing.patch
-            ./patches/opencode-session-subscribers.patch
-            ./patches/opencode-kfactory-refresh.patch
-          ];
-        postFixup =
-          (old.postFixup or "")
-          + ''
-            wrapProgram $out/bin/opencode \
-              --set OPENCODE_EXPERIMENTAL_WORKSPACES true
-          '';
+        # opencode-kfactory: opencode with all three patches applied + the
+        # experimental-workspaces env var baked into the wrapper, so the
+        # workspace-routing middleware (added by the patches) is actually
+        # exercised at runtime. Consumers using the raw `patches.*` exports
+        # are responsible for setting OPENCODE_EXPERIMENTAL_WORKSPACES
+        # themselves.
+        opencode-kfactory = opencode.packages.${system}.default.overrideAttrs (old: {
+          # @WARNING: DO NOT REORDER. The three patches must apply in this
+          #   exact order:
+          #     1. opencode-bearer-and-routing  (upstreamable surface)
+          #     2. opencode-session-subscribers (kfactory.subscribers.changed
+          #        bus event used by plugins/ntfy)
+          #     3. opencode-kfactory-refresh    (kfactory-specific deployment
+          #        glue; line-pinned against patches #1 + #2 above)
+          #   Reordering will make `patch` reject loudly or fuzzy-apply at
+          #   the wrong offset. See .claude/rules/020-patches.md.
+          patches =
+            (old.patches or [])
+            ++ [
+              ./patches/opencode-bearer-and-routing.patch
+              ./patches/opencode-session-subscribers.patch
+              ./patches/opencode-kfactory-refresh.patch
+            ];
+          postFixup =
+            (old.postFixup or "")
+            + ''
+              wrapProgram $out/bin/opencode \
+                --set OPENCODE_EXPERIMENTAL_WORKSPACES true
+            '';
+        });
+
+        oauth2-proxy-kfactory = pkgs.oauth2-proxy.overrideAttrs (old: {
+          patches = (old.patches or []) ++ [./patches/oauth2-proxy-pkce-no-secret.patch];
+        });
+
+        # ---- E2E test OCI images (see tests/e2e/README.md) ----
+        #
+        # These are dev-only images for the end-to-end Docker-based
+        # tests. They are NOT meant for production -- they bake in a
+        # fake OIDC bearer (kfactory-cli) and run opencode unauthenticated
+        # (opencode-image). The e2e tests exist so the `kfactory attach`
+        # path can be debugged against a known-good opencode + plugin
+        # config without bringing up the full OIDC stack.
+        opencode-image = pkgs.callPackage ./tests/e2e/opencode-image.nix {
+          opencode-kfactory = self.packages.${system}.opencode-kfactory;
+          plugins = self.plugins.${system};
+          # Third-party plugins are derived from the auto-generated
+          # packages by name-matching against thirdPartyPluginSrcs.
+          # Adding a new third-party plugin to thirdPartyPluginSrcs
+          # surfaces it here automatically; no edit required.
+          #
+          # `genAttrs` (not `intersectAttrs`) is deliberate: it reads
+          # ONLY names declared in thirdPartyPluginSrcs and fails
+          # loudly at evaluation if a name doesn't exist in
+          # self.packages. An earlier shape used intersectAttrs, which
+          # would silently pick up any kfactory-owned `packages.<x>`
+          # whose name happened to collide with a future third-party
+          # plugin entry -- misrouting it into the opencode.json
+          # plugin list without a build error.
+          thirdPartyPlugins =
+            nixpkgs.lib.genAttrs
+            (builtins.attrNames thirdPartyPluginSrcs)
+            (n: self.packages.${system}.${n});
+          testRepo = pkgs.callPackage ./tests/e2e/test-repo.nix {};
+        };
+        kfactory-cli-image = pkgs.callPackage ./tests/e2e/kfactory-cli-image.nix {
+          kfactory = self.packages.${system}.kfactory;
+          opencode-kfactory = self.packages.${system}.opencode-kfactory;
+          testRepo = pkgs.callPackage ./tests/e2e/test-repo.nix {};
+        };
       });
-
-      oauth2-proxy-kfactory = pkgs.oauth2-proxy.overrideAttrs (old: {
-        patches = (old.patches or []) ++ [./patches/oauth2-proxy-pkce-no-secret.patch];
-      });
-
-      # ---- Test harness OCI images (see harness/README.md) ----
-      #
-      # These are dev-only images for the end-to-end Docker-based test
-      # harness. They are NOT meant for production -- they bake in a
-      # fake OIDC bearer (kfactory-cli) and run opencode unauthenticated
-      # (opencode-image). The harness exists so the `kfactory attach`
-      # path can be debugged against a known-good opencode + plugin
-      # config without bringing up the full OIDC stack.
-      opencode-image = pkgs.callPackage ./harness/opencode-image.nix {
-        opencode-kfactory = self.packages.${system}.opencode-kfactory;
-        plugins = self.plugins.${system};
-        testRepo = pkgs.callPackage ./harness/test-repo.nix {};
-      };
-      kfactory-cli-image = pkgs.callPackage ./harness/kfactory-cli-image.nix {
-        kfactory = self.packages.${system}.kfactory;
-        opencode-kfactory = self.packages.${system}.opencode-kfactory;
-        testRepo = pkgs.callPackage ./harness/test-repo.nix {};
-      };
-    });
 
     # `nix run .#dev-up` / `.#dev-down` / `.#dev-clean` / `.#dev-test` --
-    # lifecycle scripts for the Docker-based E2E harness. See
-    # harness/README.md for the manual test workflow.
+    # lifecycle scripts for the Docker-based E2E test environment. See
+    # tests/e2e/README.md for the manual test workflow.
     apps = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-      scripts = import ./harness/scripts {inherit pkgs;};
+      scripts = import ./tests/e2e/scripts {inherit pkgs;};
       mkApp = drv: name: {
         type = "app";
         program = "${drv}/bin/${name}";
@@ -325,6 +491,22 @@
           (mkPluginTypecheck pkgs ({inherit name;} // spec)))
         pluginSrcs;
 
+      # Auto-generated smoke check per third-party plugin. Adding a
+      # new entry to thirdPartyPluginSrcs surfaces a corresponding
+      # `factory-<name>-smoke` flake check automatically. The check
+      # asserts the package store path imports cleanly and exposes
+      # at least one named export.
+      thirdPartySmokeChecks =
+        nixpkgs.lib.mapAttrs'
+        (name: _:
+          nixpkgs.lib.nameValuePair
+          "factory-${name}-smoke"
+          (mkThirdPartyPluginSmoke pkgs {
+            inherit name;
+            pkg = self.packages.${system}.${name};
+          }))
+        thirdPartyPluginSrcs;
+
       # Stage one plugin inside opencode-kfactory's workspace and run tsc
       # with paths re-mapped to opencode's source packages (not the npm
       # ones). The tsconfig is generated fresh per plugin so it matches
@@ -397,6 +579,7 @@
       // pluginChecks
       // pluginTypechecks
       // pluginIntegrationChecks
+      // thirdPartySmokeChecks
       // {
         factory-opencode-patch-applies =
           pkgs.runCommand "factory-opencode-patch-applies" {

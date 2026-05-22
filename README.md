@@ -177,6 +177,32 @@ Each plugin is a `flake.nix` output (`plugins.${system}.<name>`).
 Adding a new plugin under `plugins/<name>/` and a corresponding entry
 in `pluginSrcs` registers it automatically as a build + typecheck CI gate.
 
+### Third-party plugins packaged through Nix
+
+Plugins kfactory doesn't maintain source for also live under
+`plugins/<name>/` but with a different shape: only `package.json` +
+`package-lock.json` (no `src/`, no `tsconfig.json`). The carrier
+manifest declares the npm package + version + locks the transitive
+resolution; the actual source lands in `$out` of `packages.<name>` at
+build time via `mkThirdPartyPlugin`. Adding an entry to
+`thirdPartyPluginSrcs` in `flake.nix` auto-registers the
+`packages.<name>` output, a `factory-<name>-smoke` flake check, and
+the e2e tests opencode.json plugin-list entry -- same auto-reg model
+as kfactory-owned plugins, just one extra step (carrier + lockfile
+generation, which needs network and so happens out-of-sandbox).
+Workflow: `.claude/rules/050-third-party-nix-plugins.md`.
+
+- **`opencode-pty`** -- [shekohex/opencode-pty](https://github.com/shekohex/opencode-pty)
+  (MIT). PTY tools for the LLM (`pty_spawn`, `pty_write`, `pty_read`,
+  `pty_list`, `pty_kill`) so it can run background processes, dev
+  servers, watch modes, REPLs within a dispatched session. Auto-cleans
+  PTYs on session end. Carrier lives at `plugins/opencode-pty/`;
+  `bun-pty`'s prebuilt platform binaries ship in its npm tarball so
+  no Cargo toolchain is required at install time. Build via
+  `nix build .#opencode-pty`; consumed by opencode.json as an
+  absolute store path. The Web UI feature (`/pty-open-background-spy`)
+  is opt-in and inert in headless deployments.
+
 ## CI
 
 `nix flake check` builds every `packages.${system}.*` + every

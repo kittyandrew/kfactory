@@ -1,6 +1,20 @@
 # Plugin editing (plugins/<name>/)
 <!-- plugins -- editing, env vars, typecheck, lockfile bumps -->
 
+## Scope
+
+This rule covers **kfactory-owned plugins** -- plugins whose source we
+maintain (own code OR vendored carve-outs with per-file MIT notices).
+The shape: `plugins/<name>/` with `src/`, `tsconfig.json`,
+`package.json`, lockfile.
+
+**Third-party plugins** packaged through Nix (manifest-only carriers
+that pull in a registered npm package -- no `src/`, no `tsconfig.json`)
+live under the same `plugins/<name>/` parent but follow
+`.claude/rules/050-third-party-nix-plugins.md` instead. The shape
+distinction is visible on `ls plugins/<name>/`: presence of `src/`
+means this rule; absence means rule 050.
+
 ## Layout
 
 ```

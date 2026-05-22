@@ -14,7 +14,14 @@ completions/                 shell-completion scripts (zsh `_kfactory`)
 plugins/kfactory-adapter/    opencode WorkspaceAdapter plugin (TS, env-driven)
 plugins/ntfy/                ntfy.sh notification plugin (TS, vendored MIT subset)
 plugins/loop/                /loop auto-continuation plugin (TS, slash command + tools)
+plugins/opencode-pty/        third-party carrier (manifest-only): package.json +
+                             package-lock.json pinning shekohex/opencode-pty.
+                             Packaged through Nix via packages.opencode-pty; no
+                             upstream source in our tree. See rule 050.
 patches/                     opencode + oauth2-proxy source patches (line-pinned)
+tests/e2e/                   Docker-based E2E test environment + lifecycle scripts
+                             (dev-up / dev-down / dev-clean / dev-test) + plugin/auth
+                             configs the test images consume
 docs/spec.md                 architecture intent + decisions log (portable; no kittyos refs)
 flake.nix                    packages.kfactory + plugins.* + patches.* + checks.* + devShells.default
 .github/workflows/           ci.yml (two-job: quality + cached build on default branch)
@@ -71,11 +78,18 @@ Before claiming work done: run `nix flake check`, `golangci-lint`, and
 - Patches live under `patches/` (three opencode + one oauth2-proxy).
   Never hand-edit hunk headers. Always use the four-way re-diff
   workflow -- see `.claude/rules/020-patches.md`.
-- Plugins live under `plugins/<name>/`, each its own npm-package-shaped
-  directory with `src/`, `package.json`, lockfile, `tsconfig.json`.
-  Plugins read config from env vars with sensible defaults; no Nix
-  substitution at build time. Editing rules in
-  `.claude/rules/010-plugin.md`.
+- Plugins live under `plugins/<name>/`. Two shapes share the parent
+  directory:
+  - **kfactory-owned** -- `src/`, `tsconfig.json`, `package.json`,
+    lockfile. Source we maintain (own code or vendored MIT subsets).
+    Editing rules in `.claude/rules/010-plugin.md`.
+  - **third-party carriers** -- ONLY `package.json` + lockfile, no
+    `src/`. Manifest pointing at an upstream npm package; the actual
+    source comes from the registry at `buildNpmPackage` time.
+    Editing rules in `.claude/rules/050-third-party-nix-plugins.md`.
+
+  Both shapes read config from env vars with sensible defaults; no
+  Nix substitution at build time.
 
 ## Upstream pin
 

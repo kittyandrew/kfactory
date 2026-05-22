@@ -1,4 +1,4 @@
-# OCI image for the harness's opencode-kfactory container.
+# OCI image for the e2e tests' opencode-kfactory container.
 #
 # Bundles:
 #   - opencode-kfactory binary (the patched opencode from this flake)
@@ -9,22 +9,38 @@
 #     out to `git clone` over https / ssh
 #
 # Run via `dev-up`; serves on container port 4096, exposed to host as
-# configured in harness/dev-env.nix.
+# configured in tests/e2e/dev-env.nix.
 {
   pkgs,
   opencode-kfactory,
   plugins,
+  thirdPartyPlugins,
   testRepo,
 }: let
-  # Substitute the @PLUGIN_*@ placeholders in opencode.json with the
-  # actual /nix/store/... paths for each plugin's output directory.
-  # opencode's PluginLoader resolves directory paths via package.json's
-  # exports["./server"], so pointing at the package root is enough.
-  opencodeJson = pkgs.replaceVars ./configs/opencode.json {
-    PLUGIN_KFACTORY_ADAPTER = "${plugins.kfactory-adapter}";
-    PLUGIN_NTFY = "${plugins.ntfy}";
-    PLUGIN_LOOP = "${plugins.loop}";
-  };
+  # Build opencode.json inline from Nix values. opencode's
+  # PluginLoader resolves directory paths via package.json's
+  # exports["./server"], so each list entry is the package root's
+  # /nix/store/... path. Iterating over `plugins` + `thirdPartyPlugins`
+  # means adding a new plugin (kfactory-owned or third-party) flows
+  # through flake.nix wiring, not through a placeholder list in this
+  # file. Static knobs (permission policy) read from
+  # ./configs/opencode-base.json so operators can tweak them without
+  # touching Nix.
+  opencodeBase = builtins.fromJSON (builtins.readFile ./configs/opencode-base.json);
+  pluginStorePaths =
+    map (p: "${p}") (builtins.attrValues plugins)
+    ++ map (p: "${p}") (builtins.attrValues thirdPartyPlugins);
+  # `opencodeBase` MUST NOT declare a `plugin` field -- the merge below
+  # would silently overwrite it. The plugin list is the one structural
+  # output this file owns; the base JSON file is for orthogonal knobs
+  # (permission policy, etc.). Fail-loud on accidental drift instead
+  # of letting an operator wonder why their hand-pasted plugin entry
+  # vanished.
+  opencodeJson = assert !(opencodeBase ? plugin);
+    pkgs.writeText "opencode.json" (builtins.toJSON (opencodeBase
+      // {
+        plugin = pluginStorePaths;
+      }));
 
   # Entrypoint: small wrapper that exports the env the kfactory-adapter
   # plugin needs (otherwise it falls back to defaults that won't work in
@@ -45,7 +61,7 @@
     export OPENCODE_EXPERIMENTAL_WORKSPACES=true
     # Bind to 0.0.0.0 so docker port-publish + bridge-network peers
     # (kfactory-cli) can reach us. No password set => warning logged +
-    # server runs unsecured; that's exactly what the harness wants
+    # server runs unsecured; that's exactly what the e2e tests wants
     # (skipping the OIDC stack for E2E debugging).
     mkdir -p "$KFACTORY_ADAPTER_WORKSPACES_DIR"
     exec ${opencode-kfactory}/bin/opencode serve --hostname 0.0.0.0 --port 4096
@@ -78,7 +94,7 @@ in
       # Test repo bundled inside the image so kfactory-adapter can
       # `git clone file:///srv/test-repo.git` without network access.
       # Same repo lives at /srv/test-repo.git in the kfactory-cli image
-      # for symmetry; both are produced by harness/test-repo.nix.
+      # for symmetry; both are produced by tests/e2e/test-repo.nix.
       mkdir -p srv
       cp -r ${testRepo} srv/test-repo.git
       # opencode + bun need a /tmp dir; layered image is otherwise scratch.
@@ -103,7 +119,7 @@ in
           "${pkgs.curl}/bin/curl"
           "-sf"
           "-H"
-          "Authorization: Bearer harness-fake-bearer"
+          "Authorization: Bearer e2e-fake-bearer"
           "http://localhost:4096/experimental/workspace"
         ];
         Interval = 5000000000; # 5s in ns (Docker's unit)

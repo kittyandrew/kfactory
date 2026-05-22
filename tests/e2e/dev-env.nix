@@ -1,13 +1,12 @@
-# Central config for the kfactory dev test harness.
+# Central config for the kfactory dev e2e tests.
 #
-# Mirrors the mautrix-viber/nix/dev-matrix.nix pattern: container names,
-# pinned image versions, Docker volumes + network in one place so the
-# lifecycle scripts and the image-build files share a single source of
-# truth.
+# Container names, pinned image versions, Docker volumes + network in
+# one place so the lifecycle scripts and the image-build files share a
+# single source of truth.
 #
 # Everything here is dev-only. Hardcoded paths + "bogus" tokens are NOT
-# secrets; the harness runs on the operator's host, the containers don't
-# expose anything past localhost.
+# secrets; the e2e tests run on the operator's host, the containers
+# don't expose anything past localhost.
 {
   # Docker network -- a private bridge connecting all three containers.
   # ntfy + opencode + kfactory-cli reach each other by container name.
@@ -44,5 +43,5 @@
 
   # Topic the ntfy plugin publishes to. Operator opens this in a browser
   # to see the test notifications.
-  ntfyTopic = "kfactory-harness";
+  ntfyTopic = "kfactory-e2e";
 }
