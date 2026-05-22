@@ -293,7 +293,7 @@ restart shows "Workspace Unavailable."
 The heal targets BOTH opencode's v1 `message` table and the v2
 `session_message` table; whichever doesn't exist on a given DB is a
 silent no-op (the script probes `sqlite_master` first). opencode
-v1.15.7 routes assistant rows through v2; v1 is legacy. Row counts
+v1.15.9 routes assistant rows through v2; v1 is legacy. Row counts
 + affected-workspace count log to the journal.
 
 ## 6. Decisions log
@@ -334,7 +334,7 @@ relevant to a consumer.
     enforces `^${version}`. nixpkgs currently ships bun 1.3.13 because
     bun 1.3.14 produces segfaulting binaries when used to build
     downstream packages (see nixpkgs PR #519796, in DRAFT). opencode's
-    bun bump (sst/opencode#27648) was metadata-only -- no new bun-API
+    bun bump (anomalyco/opencode#27648) was metadata-only -- no new bun-API
     calls in the runtime path, just a future-proofing pin against the
     upcoming Rust-rewrite Bun 2.x line. This patch relaxes the range
     to `>=1.3.13` so the build accepts the bun nixpkgs has. Drop the

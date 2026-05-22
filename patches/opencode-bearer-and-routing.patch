@@ -75,7 +75,7 @@ index 54f2445..00b95fa 100644
    // Experimental
    OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
 diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index e326a39..6dc6cd7 100644
+index 530ba3f..5dd6579 100644
 --- a/packages/opencode/src/cli/cmd/tui/app.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/app.tsx
 @@ -168,6 +168,7 @@ export function tui(input: {
@@ -316,7 +316,7 @@ index 56a8de3..2d8a040 100644
            start: ctx.query.start,
            cursor: ctx.query.cursor,
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
-index 4d3f510..e1743e4 100644
+index 8bffe59..367b2a5 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
 @@ -66,19 +66,37 @@ function configuredWorkspaceID(): WorkspaceID | undefined {
@@ -375,10 +375,10 @@ index 4d3f510..e1743e4 100644
      const workspace = yield* resolveWorkspace(workspaceID, envWorkspaceID)
  
 diff --git a/packages/opencode/src/session/session.ts b/packages/opencode/src/session/session.ts
-index b6aa73a..f4e7356 100644
+index 0131d44..55c7e67 100644
 --- a/packages/opencode/src/session/session.ts
 +++ b/packages/opencode/src/session/session.ts
-@@ -577,8 +577,23 @@ export const layer: Layer.Layer<
+@@ -576,8 +576,23 @@ export const layer: Layer.Layer<
  
      const list = Effect.fn("Session.list")(function* (input?: ListInput) {
        const ctx = yield* InstanceState.context
@@ -403,7 +403,7 @@ index b6aa73a..f4e7356 100644
        )
      })
  
-@@ -895,11 +910,20 @@ function* listByProject(
+@@ -894,11 +909,20 @@ function* listByProject(
      experimentalWorkspaces: boolean
    },
  ) {
@@ -429,7 +429,7 @@ index b6aa73a..f4e7356 100644
    if (input.path !== undefined) {
      if (input.path) {
        const conds = [eq(SessionTable.path, input.path), like(SessionTable.path, `${input.path}/%`)]
-@@ -943,6 +967,7 @@ function* listByProject(
+@@ -942,6 +966,7 @@ function* listByProject(
  
  export function* listGlobal(input?: {
    directory?: string
@@ -437,7 +437,7 @@ index b6aa73a..f4e7356 100644
    roots?: boolean
    start?: number
    cursor?: number
-@@ -955,6 +980,15 @@ export function* listGlobal(input?: {
+@@ -954,6 +979,15 @@ export function* listGlobal(input?: {
    if (input?.directory) {
      conditions.push(eq(SessionTable.directory, input.directory))
    }

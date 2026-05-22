@@ -1,5 +1,5 @@
-# Editing the opencode patches
-<!-- patches -- five-patch stack, re-diff workflow, picking which patch -->
+# Opencode patch stack
+<!-- patches -- five-patch stack, picking which patch to edit -->
 
 Five opencode patches are line-number-pinned against the
 `inputs.opencode` flake input (the exact tag pinned in `flake.nix`).
@@ -71,132 +71,13 @@ When in doubt: edit the refresh patch. Keeping the upstreamable
 patches (bearer-and-routing, workspace-branch, session-subscribers)
 clean of kfactory specifics is what makes them upstreamable.
 
-## Re-diff workflow (HARD)
+## Related rules
 
-Never hand-edit hunk headers (`@@ -X,Y +A,B @@`). Always re-diff. The
-N-way variant below produces ALL kfactory opencode patches in one
-pass so the stack stays consistent. `bun-version-relax` is omitted
-because it touches a file (`packages/script/src/index.ts`) that no
-other patch references -- it can stay as-is during a re-diff.
+- **Re-diff workflow** (HARD; always re-diff, never hand-edit hunk
+  headers): `.claude/rules/021-patches-rediff.md`.
+- **Bumping the opencode pin** (incl. the hashes.json workaround):
+  `.claude/rules/022-patches-bump.md`.
 
-The trees are STAGES of the stack: each tree has all prior patches
-already applied. Diffing adjacent trees yields exactly the patch
-between them.
-
-```bash
-# 1. Resolve the locked opencode source path
-SRC=$(nix shell nixpkgs#jq -c jq -r '.inputs.opencode.path' \
-  <(nix flake archive --json))
-
-# 2. Stage one writable copy per stack level (N+1 trees for N
-#    re-diffable kfactory patches). The list below MUST match the
-#    stack documented at the top of this file -- add a new tree
-#    when adding a new patch.
-WORK=$(mktemp -d -t opencode-patch-XXXX)
-TREES=(orig bearer-only bearer-plus-branch bearer-plus-branch-plus-sub full)
-for d in "''${TREES[@]}"; do
-  cp -r "$SRC" "$WORK/$d"
-done
-chmod -R u+w "$WORK"
-
-# 3. Apply current patches progressively (each tree gets all
-#    upstream-of-it patches stacked).
-nix shell nixpkgs#patch -c bash -c "
-  set -e
-  cd $WORK/bearer-only                  && patch -p1 < $PWD/patches/opencode-bearer-and-routing.patch
-
-  cd $WORK/bearer-plus-branch           && patch -p1 < $PWD/patches/opencode-bearer-and-routing.patch
-  cd $WORK/bearer-plus-branch           && patch -p1 < $PWD/patches/opencode-workspace-branch.patch
-
-  cd $WORK/bearer-plus-branch-plus-sub  && patch -p1 < $PWD/patches/opencode-bearer-and-routing.patch
-  cd $WORK/bearer-plus-branch-plus-sub  && patch -p1 < $PWD/patches/opencode-workspace-branch.patch
-  cd $WORK/bearer-plus-branch-plus-sub  && patch -p1 < $PWD/patches/opencode-session-subscribers.patch
-
-  cd $WORK/full                         && patch -p1 < $PWD/patches/opencode-bearer-and-routing.patch
-  cd $WORK/full                         && patch -p1 < $PWD/patches/opencode-workspace-branch.patch
-  cd $WORK/full                         && patch -p1 < $PWD/patches/opencode-session-subscribers.patch
-  cd $WORK/full                         && patch -p1 < $PWD/patches/opencode-kfactory-refresh.patch
-"
-
-# 4. Make your edits to the appropriate tree (changes ALWAYS mirror
-#    into every tree downstream of the one you edit):
-#      $WORK/bearer-only/...                  -- bearer-and-routing changes
-#                                                also copy into bearer-plus-branch,
-#                                                bearer-plus-branch-plus-sub, full
-#      $WORK/bearer-plus-branch/...           -- workspace-branch changes
-#                                                also copy into bearer-plus-branch-plus-sub, full
-#      $WORK/bearer-plus-branch-plus-sub/...  -- session-subscribers changes
-#                                                also copy into full
-#      $WORK/full/...                         -- kfactory-refresh changes
-
-# 5. Re-diff one pass per adjacent-tree pair (N pairs for N patches).
-nix shell nixpkgs#git -c bash -c "
-  git diff --no-index $WORK/orig                       $WORK/bearer-only                  > /tmp/patch1.raw
-  git diff --no-index $WORK/bearer-only                $WORK/bearer-plus-branch           > /tmp/patch2.raw
-  git diff --no-index $WORK/bearer-plus-branch         $WORK/bearer-plus-branch-plus-sub  > /tmp/patch3.raw
-  git diff --no-index $WORK/bearer-plus-branch-plus-sub $WORK/full                        > /tmp/patch4.raw
-"
-# Strip the absolute-path prefixes that `git diff --no-index` writes.
-sed -i -e "s|a$WORK/orig/|a/|g"                       -e "s|b$WORK/bearer-only/|b/|g"                  /tmp/patch1.raw
-sed -i -e "s|a$WORK/bearer-only/|a/|g"                -e "s|b$WORK/bearer-plus-branch/|b/|g"           /tmp/patch2.raw
-sed -i -e "s|a$WORK/bearer-plus-branch/|a/|g"         -e "s|b$WORK/bearer-plus-branch-plus-sub/|b/|g"  /tmp/patch3.raw
-sed -i -e "s|a$WORK/bearer-plus-branch-plus-sub/|a/|g" -e "s|b$WORK/full/|b/|g"                        /tmp/patch4.raw
-
-# 6. Preserve the leading explanation headers (the prose before each
-#    patch's first `diff --git`) and concat with the new diff bodies.
-#    The patches list MUST be the same set + order as the diff pairs
-#    above.
-PATCHES=(opencode-bearer-and-routing opencode-workspace-branch opencode-session-subscribers opencode-kfactory-refresh)
-for name in "''${PATCHES[@]}"; do
-  patch=patches/$name.patch
-  diff_line=$(grep -n "^diff --git" "$patch" | head -1 | cut -d: -f1)
-  header_lines=$((diff_line - 1))
-  head -n $header_lines "$patch" > "/tmp/$name.header"
-done
-cat /tmp/opencode-bearer-and-routing.header  /tmp/patch1.raw > patches/opencode-bearer-and-routing.patch
-cat /tmp/opencode-workspace-branch.header    /tmp/patch2.raw > patches/opencode-workspace-branch.patch
-cat /tmp/opencode-session-subscribers.header /tmp/patch3.raw > patches/opencode-session-subscribers.patch
-cat /tmp/opencode-kfactory-refresh.header    /tmp/patch4.raw > patches/opencode-kfactory-refresh.patch
-
-# 7. Verify
-nix flake check
-rm -rf "$WORK"
-```
-
-When adding a NEW patch to the stack, three places update together:
-the `TREES=` array, the progressive-apply block in step 3, the
-diff-pairs in step 5, and the `PATCHES=` list + concat lines in step
-6. Skipping any of those four guarantees a broken regenerate.
-
-## Hunk math you must NEVER touch by hand
-
-The header `@@ -X,Y +A,B @@` encodes line offsets and counts. Adding
-lines to the `+` body without updating `B` (or `Y` after removals)
-silently desyncs the patch -- `patch -p1` will reject loudly or apply
-a wrong hunk silently. The re-diff workflow regenerates these headers
-from scratch every time. Do not hand-edit them.
-
-## Bumping the opencode pin
-
-1. Edit `flake.nix`'s `inputs.opencode.url` to the new tag.
-2. `nix flake update opencode` to refresh the lock.
-3. `nix flake check`. If `factory-opencode-patch-applies` fails, the
-   patches' line numbers drifted -- re-diff per the workflow above.
-4. The plugin typechecks use the published `@opencode-ai/plugin` types,
-   not the source, so they're independent of this bump.
-5. `factory-opencode-typecheck` catches type-semantic drift across any
-   of the kfactory opencode patches against the bumped source.
-
-## What to verify on every edit
-
-- `nix flake check` -- in particular the kfactory opencode patches
-  must all pass `factory-opencode-patch-applies` AND the resulting
-  tree must pass `factory-opencode-typecheck`.
-- For changes to the subprocess-refresh logic in `attach.ts`: verify
-  the spawned binary name still matches the binary you ship (today:
-  `spawn("kfactory", ["auth", "refresh"])`) and that the exit-code
-  constants stay in sync with `cmd/kfactory/exit.go`.
-- For changes to session-subscribers' event.ts: verify
-  `plugins/ntfy/src/index.ts` still references the `kfactory.subscribers.changed`
-  event name verbatim. The plugin treats unknown event names as no-ops
-  (fail-open), so a rename would silently disable skip-on-connect.
+When adding a NEW patch to the stack, update this file's stack
+description AND `021-patches-rediff.md`'s `TREES=`/`PATCHES=` arrays
+together -- the names match by convention.

@@ -43,7 +43,7 @@ index 00b95fa..7738ea1 100644
    // Experimental
    OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
 diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index 6dc6cd7..2717bab 100644
+index 5dd6579..bdc49d0 100644
 --- a/packages/opencode/src/cli/cmd/tui/app.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/app.tsx
 @@ -20,6 +20,7 @@ import {
@@ -54,7 +54,7 @@ index 6dc6cd7..2717bab 100644
  import semver from "semver"
  import { DialogProvider, useDialog } from "@tui/ui/dialog"
  import { DialogProvider as DialogProviderList } from "@tui/component/dialog-provider"
-@@ -398,6 +399,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+@@ -399,6 +400,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
      })
    })
  

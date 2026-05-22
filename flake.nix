@@ -8,8 +8,9 @@
     # opencode tag. To bump: change the tag, run `nix flake check` to
     # see if the patches still apply (factory-opencode-patch-applies
     # check). If hunks drift, re-diff against the new source -- the
-    # workflow is documented in .claude/rules/020-patches.md.
-    opencode.url = "github:sst/opencode/v1.15.7";
+    # bump playbook is documented in .claude/rules/022-patches-bump.md;
+    # the re-diff workflow itself is in .claude/rules/021-patches-rediff.md.
+    opencode.url = "github:anomalyco/opencode/v1.15.9";
   };
 
   outputs = {
@@ -82,7 +83,7 @@
           # TypeScript plugins (dep-bump workflow per .claude/rules/010-plugin.md)
           nodejs_22
           prefetch-npm-deps
-          # Patch re-diff workflow per .claude/rules/020-patches.md
+          # Patch re-diff workflow per .claude/rules/021-patches-rediff.md
           patch
           git
           # Secrets scan; same dev-shell + CI surface as the other
@@ -136,43 +137,66 @@
         # actually exercised at runtime. Consumers using the raw
         # `patches.*` exports are responsible for setting
         # OPENCODE_EXPERIMENTAL_WORKSPACES themselves.
-        opencode-kfactory = opencode.packages.${system}.default.overrideAttrs (old: {
-          # @WARNING: DO NOT REORDER. The four opencode patches must
-          #   apply in this exact order:
-          #     1. opencode-bearer-and-routing   (upstreamable surface:
-          #        bearer flag, --workspace plumbing, workspace routing
-          #        + listByProject workspace_id filter)
-          #     2. opencode-workspace-branch     (upstreamable surface:
-          #        per-row .git/HEAD branch enrichment in
-          #        /experimental/workspace response)
-          #     3. opencode-session-subscribers  (kfactory.subscribers.changed
-          #        bus event used by plugins/ntfy)
-          #     4. opencode-kfactory-refresh     (kfactory-specific
-          #        deployment glue; line-pinned against patches 1-3)
-          #   Reordering will make `patch` reject loudly or fuzzy-apply
-          #   at the wrong offset. See .claude/rules/020-patches.md.
-          patches =
-            (old.patches or [])
-            ++ [
-              # Temporary: relax opencode v1.15.7's bun-version check so
-              # the build accepts the bun 1.3.13 nixpkgs currently ships.
-              # See the patch header for the full chain (nixpkgs#519796
-              # is in DRAFT because bun 1.3.14 segfaults downstream builds;
-              # opencode's bun bump was purely metadata/future-proofing,
-              # no API delta). Drop when nixpkgs ships bun 1.3.14+.
-              ./patches/opencode-bun-version-relax.patch
-              ./patches/opencode-bearer-and-routing.patch
-              ./patches/opencode-workspace-branch.patch
-              ./patches/opencode-session-subscribers.patch
-              ./patches/opencode-kfactory-refresh.patch
-            ];
-          postFixup =
-            (old.postFixup or "")
-            + ''
-              wrapProgram $out/bin/opencode \
-                --set OPENCODE_EXPERIMENTAL_WORKSPACES true
-            '';
-        });
+        #
+        # @WARNING (hashes.json): opencode v1.15.9 ships an incorrect `nix/hashes.json`:
+        # the committed x86_64-linux nodeModules hash does not match the
+        # hash nix actually computes from v1.15.9's bun.lock. A recurring
+        # upstream CI race -- anomalyco/opencode#18227 has been fixed and
+        # re-broken across multiple releases. We sidestep by building our
+        # own `node_modules` via .override on
+        # `opencode.packages.${system}.node_modules_updater` (which is
+        # `node_modules.override { hash = fakeHash; }` -- a hook for
+        # exactly this re-override). Re-derive the correct hash on every
+        # opencode bump:
+        #   nix build .#opencode-kfactory 2>&1 | awk '/got:/ {print $2}'
+        # The override is x86_64-linux only -- expand to a platform-keyed
+        # attrset matching hashes.json's shape if kfactory grows
+        # aarch64-linux / darwin support. Drop the entire .override block
+        # when upstream publishes a release with correct hashes.json;
+        # verify by deleting the override locally and re-running
+        # `nix build .#opencode-kfactory` to confirm it succeeds.
+        opencode-kfactory =
+          (opencode.packages.${system}.default.override {
+            node_modules = opencode.packages.${system}.node_modules_updater.override {
+              hash = "sha256-pbVW7cOLT76Q7f++xaYYrwuN7eS6FRen80xoaVog3M4=";
+            };
+          }).overrideAttrs (old: {
+            # @WARNING (patch order): DO NOT REORDER. The four opencode patches must
+            #   apply in this exact order:
+            #     1. opencode-bearer-and-routing   (upstreamable surface:
+            #        bearer flag, --workspace plumbing, workspace routing
+            #        + listByProject workspace_id filter)
+            #     2. opencode-workspace-branch     (upstreamable surface:
+            #        per-row .git/HEAD branch enrichment in
+            #        /experimental/workspace response)
+            #     3. opencode-session-subscribers  (kfactory.subscribers.changed
+            #        bus event used by plugins/ntfy)
+            #     4. opencode-kfactory-refresh     (kfactory-specific
+            #        deployment glue; line-pinned against patches 1-3)
+            #   Reordering will make `patch` reject loudly or fuzzy-apply
+            #   at the wrong offset. See .claude/rules/021-patches-rediff.md.
+            patches =
+              (old.patches or [])
+              ++ [
+                # Temporary: relax opencode v1.15.9's bun-version check so
+                # the build accepts the bun 1.3.13 nixpkgs currently ships.
+                # See the patch header for the full chain (nixpkgs#519796
+                # is in DRAFT because bun 1.3.14 segfaults downstream builds;
+                # opencode's bun bump was purely metadata/future-proofing,
+                # no API delta). Drop when nixpkgs ships bun 1.3.14+.
+                ./patches/opencode-bun-version-relax.patch
+                ./patches/opencode-bearer-and-routing.patch
+                ./patches/opencode-workspace-branch.patch
+                ./patches/opencode-session-subscribers.patch
+                ./patches/opencode-kfactory-refresh.patch
+              ];
+            postFixup =
+              (old.postFixup or "")
+              + ''
+                wrapProgram $out/bin/opencode \
+                  --set OPENCODE_EXPERIMENTAL_WORKSPACES true
+              '';
+          });
 
         oauth2-proxy-kfactory = pkgs.oauth2-proxy.overrideAttrs (old: {
           patches = (old.patches or []) ++ [./patches/oauth2-proxy-pkce-no-secret.patch];
@@ -308,7 +332,37 @@
     #     ];
     #   });
     #
-    # @WARNING: DO NOT REORDER the opencode patches. Apply in the order
+    # @WARNING (hashes.json): opencode v1.15.9 (and possibly later) ships
+    #   an incorrect `nix/hashes.json` -- a recurring upstream CI race
+    #   (anomalyco/opencode#18227, fixed and re-broken several times).
+    #   The snippet above will fail with `hash mismatch in fixed-output
+    #   derivation 'opencode-node_modules-<version>'`. Until upstream
+    #   stabilises, wrap with `.override { node_modules = ...; }` BEFORE
+    #   the `.overrideAttrs`:
+    #
+    #     opencodePkg = (inputs.opencode.packages.${system}.default.override {
+    #       node_modules = inputs.opencode.packages.${system}.node_modules_updater.override {
+    #         hash = "sha256-pbVW7cOLT76Q7f++xaYYrwuN7eS6FRen80xoaVog3M4=";  # x86_64-linux only
+    #       };
+    #     }).overrideAttrs (old: { patches = ...; });
+    #
+    #   The hash literal above is specific to opencode v1.15.9's bun.lock.
+    #   Consumers pinning a different opencode tag MUST re-derive their own
+    #   via `nix build .#<their-opencode-package> 2>&1 | awk '/got:/ {print $2}'`
+    #   -- copying our hash will simply move the mismatch error inside the
+    #   workaround. The recipe also assumes the consumer's `inputs.opencode`
+    #   exposes `packages.<system>.node_modules_updater`; this is a public
+    #   export of anomalyco/opencode's flake (and forks that preserve it),
+    #   not a general nix idiom -- pinning an unrelated opencode flake
+    #   will surface as an "attribute not found" evaluation error rather
+    #   than a hash mismatch.
+    #
+    #   See the `opencode-kfactory` block above for the canonical
+    #   pattern + the hash-refresh recipe + per-platform caveat. Drop
+    #   the `.override` wrapper when upstream publishes a release with
+    #   correct hashes.json.
+    #
+    # @WARNING (patch order): DO NOT REORDER the opencode patches. Apply in the order
     #   shown above or `patch` will reject loudly (or worse, fuzzy-apply
     #   at the wrong offset). Consumers who only want the upstreamable
     #   subset may include the bearer-and-routing + workspace-branch +

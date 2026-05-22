@@ -1,17 +1,20 @@
 name: ci
 
-# Two jobs:
-#   - `quality` runs all linters + `nix flake check` (which builds every
-#     `packages.${system}.*` output, registered as checks in flake.nix).
-#     No secrets are exposed in this job, so it's safe to run on fork PRs.
-#   - `build` runs only on push to the default branch. It re-runs
-#     `nix flake check` with the Attic cache configured first, and the
-#     attic-action post-hook pushes everything built in the job to the
-#     `general` cache.
+# Single job: lint + flake check + (conditionally) attic push.
 #
-# Magic-nix-cache shares the `/nix/store` between jobs via GitHub Actions
-# cache, so the `build` job's `nix flake check` is mostly cache hits --
-# the only fresh work in `build` is the Attic upload.
+# The attic setup step is gated by an `if:` so PR-from-fork runs never
+# see ATTIC_GENERAL_PUSH_TOKEN in their environment. attic-action's
+# post-hook only fires when its setup step actually ran (GHA semantics:
+# post is skipped iff main is skipped via `if:`), so the push happens
+# iff the gate passed. This avoids the older two-job shape (quality +
+# build) that re-ran `nix flake check` twice (once per job) to keep
+# secrets out of fork-PR runs.
+#
+# Step ordering: linters + tests run BEFORE the attic setup so that
+# (1) on PR/fork runs the entire job is secret-free, and (2) on
+# push-to-default the attic config only lands on disk after all
+# lint/test gates have passed -- preserving the old "linters pass
+# before secrets" property of the two-job shape.
 #
 # Adding a new package to `packages.${system}` in flake.nix automatically
 # becomes a CI gate: `nix flake check` builds it; nothing to edit here.
@@ -28,8 +31,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality:
-    name: lint + flake check
+  ci:
+    name: lint + flake check + attic push
     runs-on: ubuntu-latest
 
     steps:
@@ -78,29 +81,18 @@ jobs:
       - name: Secrets scan (betterleaks)
         run: nix develop -c betterleaks dir . --no-banner --redact
 
-      - name: Flake check (builds all packages + checks)
-        run: nix flake check --print-build-logs
-
-  build:
-    name: attic cache push
-    runs-on: ubuntu-latest
-    needs: quality
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-
-      - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3
-
-      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39
-
+      # Attic setup runs LAST (just before the flake check that produces
+      # the artifacts to push) so credentials only enter the environment
+      # after all lint/test gates have passed. PR/fork runs skip this
+      # step entirely via the `if:` gate, leaving the rest of the job
+      # secret-free.
       - name: Setup Attic cache
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: ryanccn/attic-action@5635a15ef0c5462194ffbd05d1daeddc74625c3a
         with:
           endpoint: ${{ vars.ATTIC_ENDPOINT }}
           cache: general
           token: ${{ secrets.ATTIC_GENERAL_PUSH_TOKEN }}
 
-      - name: Flake check (cache hits from quality job)
+      - name: Flake check (builds all packages + checks)
         run: nix flake check --print-build-logs

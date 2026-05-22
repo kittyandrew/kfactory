@@ -22,16 +22,17 @@ which neither neighbour modifies, so the stack is order-independent
 in practice.
 
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
-index c22b82d..084d09d 100644
+index 2699c86..66dee88 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
-@@ -4,10 +4,30 @@ import * as InstanceState from "@/effect/instance-state"
+@@ -4,11 +4,31 @@ import * as InstanceState from "@/effect/instance-state"
  import { Vcs } from "@/project/vcs"
  import { Effect } from "effect"
  import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 +import * as fs from "node:fs"
 +import * as path from "node:path"
  import { InstanceHttpApi } from "../api"
+ import { notFound } from "../errors"
  import { ApiVcsApplyError } from "../groups/instance"
  import { ApiWorkspaceWarpError, CreatePayload, WarpPayload } from "../groups/workspace"
  
@@ -56,7 +57,7 @@ index c22b82d..084d09d 100644
  export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspace", (handlers) =>
    Effect.gen(function* () {
      const workspace = yield* Workspace.Service
-@@ -18,7 +38,27 @@ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspac
+@@ -19,7 +39,27 @@ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspac
      })
  
      const list = Effect.fn("WorkspaceHttpApi.list")(function* () {

@@ -29,7 +29,7 @@ tests/e2e/                   Docker-based E2E test environment + lifecycle scrip
                              configs the test images consume
 docs/spec.md                 architecture intent + decisions log (portable; no kittyos refs)
 flake.nix                    packages.kfactory + plugins.* + patches.* + checks.* + devShells.default
-.github/workflows/           ci.yml (two-job: quality + cached build on default branch)
+.github/workflows/           check.yml (single job: lint + flake check + attic push on default-branch push)
 .claude/rules/                rules auto-loaded by Claude Code on every session
 ```
 
@@ -95,8 +95,10 @@ of the above on every PR.
   cross-process refresh coordinated via POSIX `flock(2)` on
   `auth.json.lock`.
 - Patches live under `patches/` (a stack of opencode + one oauth2-proxy).
-  Never hand-edit hunk headers. Always use the four-way re-diff
-  workflow -- see `.claude/rules/020-patches.md`.
+  Stack identity is in `.claude/rules/020-patches.md`. Never hand-edit
+  hunk headers; always use the re-diff workflow in
+  `.claude/rules/021-patches-rediff.md`. Bumping the opencode pin:
+  `.claude/rules/022-patches-bump.md`.
 - Plugins live under `plugins/<name>/`. Two shapes share the parent
   directory:
   - **kfactory-owned** -- `src/`, `tsconfig.json`, `package.json`,
@@ -114,4 +116,4 @@ of the above on every PR.
 
 `flake.nix` pins `inputs.opencode` to a specific tag because patches are
 line-number-pinned to that source. Bumping is documented in
-`.claude/rules/020-patches.md`.
+`.claude/rules/022-patches-bump.md`.
