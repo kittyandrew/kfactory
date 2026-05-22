@@ -402,29 +402,45 @@ relevant to a consumer.
   flip to v2 happens without a regression; row counts log so the flip
   is observable.
 
-- **Patch opencode `Session.listGlobal` to filter by workspace_id.**
-  Upstream opencode copies the requesting instance's `project.id` into
-  the new workspace row at insert time. For an unscoped `POST
-  /experimental/workspace` that resolves to the front-opencode's
-  cwd-based project (`global`, non-git), and every workspace ends up
-  sharing `project_id = global`. Upstream's session list filtered by
-  `project_id`, so `--continue` and root-session listing collapsed
-  across workspaces -- attaching to workspace A would resume the
-  globally-most-recently-touched session regardless of where it lived.
-  The patch adds an optional `workspaceID` filter to `listGlobal`
-  applying `where SessionTable.workspace_id = workspaceID`, plumbed
-  through `/experimental/session` from the request's `?workspace=`
-  query param (with the routing middleware's InstanceState.workspaceID
-  as a fallback). Sessions get scoped by the workspace they actually
-  belong to, independent of project_id. ~15 LOC TS in the bearer-auth
-  patch. Upstream-PR-worthy.
+- **Patch opencode `Session.listGlobal` AND `Session.list` to filter
+  by workspace_id.** Upstream opencode copies the requesting
+  instance's `project.id` into the new workspace row at insert time.
+  For an unscoped `POST /experimental/workspace` that resolves to the
+  front-opencode's cwd-based project (`global`, non-git), every
+  workspace ends up sharing `project_id = global`. Upstream's
+  session-list paths filtered by `project_id`, so `--continue` and
+  root-session listing collapsed across workspaces -- attaching to
+  workspace A would resume the globally-most-recently-touched session
+  regardless of where it lived.
 
-  Verified in the e2e tests (2026-05): three workspaces dispatched
-  against the same repo share project_id (the git-root OID, assigned
-  by opencode at session-creation time, NOT at workspace creation) but
-  carry distinct workspace_id. `GET /experimental/session?workspace=<id>`
-  returns exactly the matching workspace's session for each of the
-  three.
+  The patch:
+  1. Adds an optional `workspaceID` filter to `listGlobal` applying
+     `where SessionTable.workspace_id = workspaceID`, plumbed
+     through the `/experimental/session` handler from the request's
+     `?workspace=` query param.
+  2. Makes the `Session.list` Service method read
+     `InstanceState.workspaceID` (set by the workspace-routing
+     middleware via `WorkspaceRef`) and pass it into `listByProject`
+     -- which already supported the filter parameter upstream but
+     never had it populated. This is the path the TUI takes on
+     `--continue`: `GET /session?directory=<wsDir>` with the
+     `x-opencode-workspace` header.
+
+  Sessions get scoped by the workspace they actually belong to,
+  independent of project_id. ~30 LOC TS in the bearer-auth patch.
+  Upstream-PR-worthy.
+
+  Verification trail:
+  - `/experimental/session?workspace=<id>` verified workspace-scoped
+    in the e2e tests since 2026-05.
+  - `/session` (the TUI's actual endpoint) was NOT verified initially
+    -- the earlier harness test asserted only on `/experimental/session`,
+    which goes through `listGlobal`. The TUI goes through `listByProject`.
+    The first deployment hit this gap (same session on every
+    `kfactory attach`) and the harness regression now covers both
+    paths in step `[4b/6]` of `dev-test.nix`. The adversarial probe
+    (mismatched x-opencode-workspace header + directory) confirms the
+    workspace header wins.
 
   An earlier draft of the patch took a different approach:
   post-`adapter.create` re-resolve via `Project.fromDirectory(info.directory)`
