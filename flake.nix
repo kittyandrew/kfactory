@@ -267,6 +267,9 @@
           # Patch re-diff workflow per .claude/rules/020-patches.md
           patch
           git
+          # Secrets scan; same dev-shell + CI surface as the other
+          # code-quality linters. Allowlist in .betterleaks.toml.
+          betterleaks
         ];
       };
     });

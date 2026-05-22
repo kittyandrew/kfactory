@@ -40,6 +40,9 @@ via `nix develop -c <cmd>`. To match CI locally, prefix with `nix develop -c`.
 - `nix develop -c gofmt -l cmd/` -- Go format (empty output = clean).
 - `nix develop -c actionlint && nix develop -c zizmor .github/workflows`
   -- workflow lint + security audit.
+- `nix develop -c betterleaks dir . --no-banner --redact` -- secrets
+  scan. Allowlist for e2e fake-token fixtures in `.betterleaks.toml`
+  (prefilter on `tests/e2e/configs/` + `e2e-fake-*` pattern filter).
 - `nix flake check` -- builds every `packages.${system}.*` (registered
   as checks via `flake.nix`) plus the bespoke `factory-*` checks defined
   in the `checks` attrset. The authoritative list lives in `flake.nix`;
@@ -54,8 +57,9 @@ via `nix develop -c <cmd>`. To match CI locally, prefix with `nix develop -c`.
   to stack their own patches).
 - `go build ./cmd/kfactory` -- direct Go build outside Nix.
 
-Before claiming work done: run `nix flake check`, `golangci-lint`, and
-`alejandra -c .` at minimum. CI runs all of the above on every PR.
+Before claiming work done: run `nix flake check`, `golangci-lint`,
+`alejandra -c .`, and `betterleaks dir .` at minimum. CI runs all
+of the above on every PR.
 
 ## Conventions
 

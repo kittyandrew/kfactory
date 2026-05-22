@@ -1,0 +1,34 @@
+# kfactory secrets scan config -- runs alongside the other code-quality
+# linters (golangci-lint, gofmt, alejandra, actionlint, zizmor). The
+# scan is invoked via `nix develop -c betterleaks ...` from the dev
+# shell + the quality job in .github/workflows/check.yml.
+#
+# Local pre-commit invocation + CI invocation are identical:
+#   nix develop -c betterleaks dir . --no-banner --redact
+# `dir .` scans the merge-state tree (what CI is about to ship), same
+# scope as a diff-against-base on the kfactory size, but simpler --
+# no fetch-depth: 0 in checkout, no branching for push vs PR events.
+
+title = "kfactory secrets scan"
+
+[extend]
+useDefault = true
+
+# `prefilter` skips entire files before any regex runs. tests/e2e/configs/
+# is the E2E test environment's bogus-credentials dir -- everything in
+# there exists to bypass OIDC for E2E testing. The opencode server in
+# the e2e tests has no JWT validator, so the fake bearer + fake idp +
+# fake client_id strings are deliberate. Never use this shape in
+# production; see tests/e2e/configs/auth.json for the runtime contract.
+prefilter = '''
+attributes[?"path"].orValue("").startsWith("tests/e2e/configs/")
+'''
+
+# `filter` runs per-finding (after regex match). Defense in depth in
+# case a future test placeholder lands outside tests/e2e/configs/.
+# Anything matching the `e2e-fake-<word>` shape is a known test
+# fixture (we mint these intentionally so the e2e tests can wire
+# through plugin code paths that expect a non-empty bearer/issuer/etc).
+filter = '''
+matchesAny(finding["secret"], [r"""^e2e-fake-[a-z]+$"""])
+'''

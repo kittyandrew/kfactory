@@ -69,6 +69,15 @@ jobs:
       - name: Go test
         run: nix develop -c go test ./...
 
+      # Secrets scan. `dir .` scans the current tree (cheap, ~400 KB
+      # / 200 ms for this repo today). On push to a default-branch
+      # ref, `dir` is the same scope you'd get from a diff-against-base
+      # anyway; on PR events we re-scan the merge state which is what
+      # we ship if merged. Allowlist (e2e fake bearer tokens, etc.)
+      # in `.betterleaks.toml`.
+      - name: Secrets scan (betterleaks)
+        run: nix develop -c betterleaks dir . --no-banner --redact
+
       - name: Flake check (builds all packages + checks)
         run: nix flake check --print-build-logs
 
