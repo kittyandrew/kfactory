@@ -84,6 +84,8 @@ func main() {
 		runAttach(rest)
 	case "dispatch":
 		runDispatch(rest)
+	case "tick":
+		runTick(rest)
 	case "delete":
 		runDelete(rest)
 	case "-h", "--help", "help":
@@ -126,6 +128,9 @@ func usage() {
 		"  kfactory list                       # show workspaces\n"+
 		"  kfactory attach <id|slug|#>         # attach opencode TUI to a workspace\n"+
 		"  kfactory dispatch <repo-url> <prompt...>  # create workspace + session + async prompt\n"+
+		"  kfactory tick <task-id|ref> [--prompt TEXT]   # idempotent dispatch:\n"+
+		"                                                # - scheduled (task-id matches /etc/kfactory/scheduled/<id>.json)\n"+
+		"                                                # - ad-hoc nudge (ref + --prompt; for recovery/manual)\n"+
 		"  kfactory delete [-y] <id|slug|#>    # delete workspace + wipe clone\n\n"+
 		"Tokens persist at $XDG_CONFIG_HOME/kfactory/auth.json (mode 0600).\n")
 }

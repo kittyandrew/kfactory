@@ -29,10 +29,16 @@ func serverFor(t *tokenFile) string {
 // Workspace mirrors the WorkspaceInfo shape returned by opencode's
 // /experimental/workspace endpoint. Only the fields kfactory consumes;
 // unknown fields are dropped by the json decoder.
+//
+// `Branch` is enriched server-side by the opencode-bearer-and-routing
+// patch: the workspace.list handler reads .git/HEAD for each row's
+// directory and fills the field fresh per call. Empty string means
+// "no .git in the workspace dir" (broken clone -- waybap-style).
 type Workspace struct {
 	ID        string `json:"id"`
 	Type      string `json:"type"`
 	Name      string `json:"name"`
+	Branch    string `json:"branch"`
 	Directory string `json:"directory"`
 	ProjectID string `json:"projectID"`
 	TimeUsed  int64  `json:"timeUsed"`
@@ -113,11 +119,25 @@ func listWorkspaces(ctx context.Context, t *tokenFile, server string) ([]Workspa
 // the kfactory-adapter plugin (plugins/kfactory-adapter/src/index.ts);
 // opencode dispatches creation through whichever adapter registered that key.
 func createWorkspace(ctx context.Context, t *tokenFile, server, repoURL string) (*Workspace, error) {
+	return createWorkspaceWithSuffix(ctx, t, server, repoURL, "")
+}
+
+// createWorkspaceWithSuffix is the same as createWorkspace but plumbs an
+// optional `slugSuffix` through `extra` so the kfactory-adapter mints a
+// deterministic slug instead of the default random 4hex. Used by
+// `kfactory tick` so scheduled-task workspaces have predictable names
+// across opencode restarts. Empty `slugSuffix` falls back to the random
+// suffix path (identical behavior to the legacy createWorkspace).
+func createWorkspaceWithSuffix(ctx context.Context, t *tokenFile, server, repoURL, slugSuffix string) (*Workspace, error) {
+	extra := map[string]any{
+		"repoUrl": repoURL,
+	}
+	if slugSuffix != "" {
+		extra["slugSuffix"] = slugSuffix
+	}
 	payload := map[string]any{
-		"type": "kfactory",
-		"extra": map[string]any{
-			"repoUrl": repoURL,
-		},
+		"type":  "kfactory",
+		"extra": extra,
 	}
 	req, err := newRequest(ctx, t, server, http.MethodPost, "/experimental/workspace", payload)
 	if err != nil {
@@ -161,6 +181,47 @@ func createSession(ctx context.Context, t *tokenFile, server, workspaceID string
 		return nil, err
 	}
 	return &s, nil
+}
+
+// SessionInfo is the subset of /experimental/session response fields
+// kfactory consumes for the tick path. Most-recent-session resolution
+// uses `time.updated`; root-vs-subagent uses `parentID`.
+type SessionInfo struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspaceID"`
+	ParentID    string `json:"parentID,omitempty"`
+	Time        struct {
+		Updated int64 `json:"updated"`
+	} `json:"time"`
+}
+
+// findMostRecentSession returns the most-recently-updated ROOT session
+// (no parentID) in the given workspace, or nil if there are none. Used
+// by `kfactory tick`'s continue path: an existing scheduled-task
+// workspace gets its prior conversation resumed, just like opencode's
+// `--continue` would land. Subagent sessions are filtered because we
+// never want to post the continuation prompt into a child agent's
+// context window; the operator-facing session is always a root.
+func findMostRecentSession(ctx context.Context, t *tokenFile, server, workspaceID string) (*SessionInfo, error) {
+	path := "/experimental/session?workspace=" + url.QueryEscape(workspaceID)
+	req, err := newRequest(ctx, t, server, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var sessions []SessionInfo
+	if err := doJSON(req, &sessions); err != nil {
+		return nil, err
+	}
+	var best *SessionInfo
+	for i := range sessions {
+		if sessions[i].ParentID != "" {
+			continue
+		}
+		if best == nil || sessions[i].Time.Updated > best.Time.Updated {
+			best = &sessions[i]
+		}
+	}
+	return best, nil
 }
 
 // sendPromptAsync fires a prompt at a session and returns immediately

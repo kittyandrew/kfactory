@@ -19,6 +19,11 @@ plugins/opencode-pty/        third-party carrier (manifest-only): package.json +
                              Packaged through Nix via packages.opencode-pty; no
                              upstream source in our tree. See rule 050.
 patches/                     opencode + oauth2-proxy source patches (line-pinned)
+modules/                     NixOS modules: scheduled-tasks.nix (timer-driven
+                             `kfactory tick`) + recovery.nix (opencode-serve
+                             lifecycle: heal ExecStartPre + sync-kick & recovery-
+                             sweep ExecStartPost). Exposed via flake.nix
+                             `nixosModules = { scheduledTasks; recovery; };`
 tests/e2e/                   Docker-based E2E test environment + lifecycle scripts
                              (dev-up / dev-down / dev-clean / dev-test) + plugin/auth
                              configs the test images consume
@@ -67,6 +72,16 @@ of the above on every PR.
   hostnames / personal paths anywhere in code, docs, or comments.
 - No external arg parser; CLI is hand-rolled in `cmd/kfactory/main.go`.
   Switch over subcommands -- no top-level aliases like `ls` / `rm`.
+- `kfactory tick <task-id|ref>` is the idempotent-dispatch verb. Two
+  shapes: scheduled (config file at `/etc/kfactory/scheduled/<id>.json`
+  drives behavior; ref IS the task id which becomes the workspace slug
+  suffix) and ad-hoc (`--prompt TEXT` required; ref resolves a
+  workspace and the prompt is appended as a new user message in the
+  most-recent root session). The same verb services scheduled task
+  fires (via `modules/scheduled-tasks.nix`) and VM-reboot recovery
+  (via `modules/recovery.nix` -> recovery-sweep). The JSON config
+  schema is owned by `cmd/kfactory/tick.go`; the NixOS module emits
+  JSON the CLI accepts.
 - CLI endpoint defaults are EMPTY in source (`defaultServer`, `defaultIssuer`,
   `defaultClientID`, `defaultAudience` in `main.go`). Consumers bake values
   via `overrideAttrs` + `-ldflags -X main.<name>=...`; operators can also
@@ -79,7 +94,7 @@ of the above on every PR.
 - Token state: `$XDG_CONFIG_HOME/kfactory/auth.json` (mode 0600),
   cross-process refresh coordinated via POSIX `flock(2)` on
   `auth.json.lock`.
-- Patches live under `patches/` (three opencode + one oauth2-proxy).
+- Patches live under `patches/` (a stack of opencode + one oauth2-proxy).
   Never hand-edit hunk headers. Always use the four-way re-diff
   workflow -- see `.claude/rules/020-patches.md`.
 - Plugins live under `plugins/<name>/`. Two shapes share the parent

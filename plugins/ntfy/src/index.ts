@@ -46,6 +46,7 @@
 // Plugin entry point. The npm-package shape is honored via package.json's
 // `exports["./server"]` field; opencode's PluginLoader follows that.
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
+import { spawnSync } from "node:child_process"
 import { basename } from "node:path"
 
 // `PluginInput["client"]` is the full opencode SDK client (returned by
@@ -100,8 +101,45 @@ function nowISO(): string {
   return new Date().toISOString()
 }
 
-function extractIdle(props: { sessionID: string }, projectName: string): EventMetadata {
-  return { sessionId: props.sessionID, projectName, timestamp: nowISO() }
+// `KFACTORY_ADAPTER_GIT` is the same env var the kfactory-adapter
+// plugin uses for its git path (see plugins/kfactory-adapter/src/
+// index.ts -- "PATH-resolved defaults work in interactive shells
+// but FAIL under systemd User= units, which sanitize PATH down to a
+// minimal coreutils/findutils/grep set"). Reusing the SAME var here
+// rather than minting a separate `KFACTORY_NTFY_GIT` because
+// operators wire one absolute git path per deployment; an asymmetric
+// wiring (adapter resolves git, ntfy doesn't) is exactly the silent
+// systemd-PATH degradation that turns notification bodies into
+// `<slug> · no-git` on healthy workspaces.
+const GIT = process.env.KFACTORY_ADAPTER_GIT ?? "git"
+
+// Resolve the workspace's current git branch at NOTIFICATION time.
+// Run `git rev-parse --abbrev-ref HEAD` inside the workspace dir; on
+// detached HEAD this prints "HEAD" which we re-label to "detached" for
+// readability. If the dir isn't a repo at all (e.g. clone failed
+// mid-create -- waybap incident) we return "no-git" so the body still
+// renders a meaningful "<slug> · no-git" rather than an empty trailer.
+function resolveBranch(directory: string): string {
+  try {
+    const r = spawnSync(GIT, ["-C", directory, "rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf8",
+      timeout: 1500,
+    })
+    if (r.status !== 0) return "no-git"
+    const out = (r.stdout ?? "").trim()
+    if (out === "" || out === "HEAD") return "detached"
+    return out
+  } catch {
+    return "no-git"
+  }
+}
+
+function extractIdle(
+  props: { sessionID: string },
+  projectName: string,
+  branch: string,
+): EventMetadata {
+  return { sessionId: props.sessionID, projectName, branch, timestamp: nowISO() }
 }
 
 // The session.error event's `error` is a discriminated union of opencode's
@@ -118,10 +156,12 @@ function errorMessage(v: unknown): string | undefined {
 function extractError(
   props: { sessionID?: string; error?: unknown },
   projectName: string,
+  branch: string,
 ): EventMetadata {
   const meta: EventMetadata = {
     sessionId: props.sessionID ?? "",
     projectName,
+    branch,
     timestamp: nowISO(),
   }
   const msg = errorMessage(props.error)
@@ -132,10 +172,12 @@ function extractError(
 function extractPermission(
   props: { sessionID: string; permission: string; patterns?: string[] },
   projectName: string,
+  branch: string,
 ): EventMetadata {
   const meta: EventMetadata = {
     sessionId: props.sessionID,
     projectName,
+    branch,
     timestamp: nowISO(),
     permissionType: props.permission,
   }
@@ -328,13 +370,18 @@ const Ntfy: Plugin = async (input) => {
           const meta = extractPermission(
             { sessionID, permission, patterns },
             projectName,
+            resolveBranch(input.directory),
           )
           await dispatchNotification("permission.asked", sessionID, meta)
           return
         }
         case "session.idle": {
           if (!isRecord(props) || typeof props.sessionID !== "string") return
-          const meta = extractIdle({ sessionID: props.sessionID }, projectName)
+          const meta = extractIdle(
+            { sessionID: props.sessionID },
+            projectName,
+            resolveBranch(input.directory),
+          )
           await dispatchNotification("session.idle", props.sessionID, meta)
           return
         }
@@ -345,7 +392,7 @@ const Ntfy: Plugin = async (input) => {
             sessionID,
             error: "error" in props ? props.error : undefined,
           }
-          const meta = extractError(errorVal, projectName)
+          const meta = extractError(errorVal, projectName, resolveBranch(input.directory))
           await dispatchNotification("session.error", sessionID, meta)
           return
         }

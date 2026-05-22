@@ -42,6 +42,7 @@ import type {
 export interface EventMetadata {
   sessionId: string
   projectName: string
+  branch: string
   timestamp: string
   error?: string
   permissionType?: string
@@ -61,14 +62,26 @@ const DEFAULT_TITLES: Record<NotificationEvent, string> = {
   "permission.asked": "Permission Asked",
 }
 
+// All three event bodies share one shape: `<workspace-slug> · <branch>`.
+// The earlier shape carried a static "The agent has finished and is
+// waiting for input." sentence -- redundant noise per the operator
+// review, since the title + tag already carry the event type. The
+// load-bearing per-notification signal is WHICH workspace, on WHICH
+// branch -- everything else is constant across notifications.
 const DEFAULT_MESSAGES: Record<NotificationEvent, string> = {
-  "session.idle": "The agent has finished and is waiting for input.",
-  "session.error": "An error occurred. Check the session for details.",
-  "permission.asked": "The agent needs permission to continue. Review and respond.",
+  "session.idle": "{project} · {branch}",
+  "session.error": "{project} · {branch}",
+  "permission.asked": "{project} · {branch}",
 }
 
+// Tag names MUST match ntfy's emoji shortcode list
+// (https://docs.ntfy.sh/emojis/) -- unrecognised names render as
+// literal text in the notification card. `hourglass_done` was a typo
+// of nothing real; ntfy doesn't have that shortcode and used to ship
+// the bare string. `hourglass` is the canonical "agent idle, waiting"
+// emoji (⌛). `warning` (⚠️) + `lock` (🔒) are standard.
 const DEFAULT_TAGS: Record<NotificationEvent, string> = {
-  "session.idle": "hourglass_done",
+  "session.idle": "hourglass",
   "session.error": "warning",
   "permission.asked": "lock",
 }
@@ -84,6 +97,7 @@ function buildTemplateVariables(
     event,
     time: metadata.timestamp,
     project: metadata.projectName,
+    branch: metadata.branch,
     session_id: metadata.sessionId,
     error: metadata.error ?? "",
     permission_type: metadata.permissionType ?? "",

@@ -24,6 +24,9 @@ kfactory: dispatched. attach with: kfactory attach wrk_e3d1150e2001YHvzDNcrSNPSx
 $ kfactory list                    # workspaces, most recent first
 $ kfactory attach 1                # drops into opencode TUI for that workspace
 $ kfactory delete <id|slug|index>
+$ kfactory tick 7a3f               # idempotent dispatch:
+$ kfactory tick wrk_e3d... \       #   - scheduled task (4-hex id; config at /etc/kfactory/scheduled/<id>.json)
+    --prompt "resume your work"    #   - ad-hoc nudge against an existing workspace (recovery / cron)
 ```
 
 Agent loops run server-side and survive client disconnect; close the
@@ -60,8 +63,14 @@ You bring:
 - OIDC endpoint defaults at build time via ldflags or operator-typed on
   first `kfactory auth login`.
 
-kfactory does NOT ship a Caddyfile / NixOS module / docker-compose,
-agent prompts, model selection, or secrets management.
+kfactory does NOT ship a Caddyfile, docker-compose, agent prompts,
+model selection, or secrets management. kfactory DOES ship two narrow
+NixOS modules -- `scheduledTasks` (timer-driven `kfactory tick`) and
+`recovery` (opencode-serve restart lifecycle: opencode-heal +
+opencode-sync-kick + recovery-sweep) -- because the systemd unit
+generation those describe is intrinsically NixOS-shaped and the
+operator-facing schema is the natural fit. Everything else stays
+module-free.
 
 ## Consuming
 
@@ -202,6 +211,71 @@ Workflow: `.claude/rules/050-third-party-nix-plugins.md`.
   `nix build .#opencode-pty`; consumed by opencode.json as an
   absolute store path. The Web UI feature (`/pty-open-background-spy`)
   is opt-in and inert in headless deployments.
+
+## Scheduled tasks + recovery (NixOS modules)
+
+Two opt-in modules at `kfactory.nixosModules.{scheduledTasks,recovery}`.
+Both ride on the operator's existing opencode-serve systemd unit;
+neither ships its own.
+
+```nix
+imports = [
+  inputs.kfactory.nixosModules.scheduledTasks
+  inputs.kfactory.nixosModules.recovery
+];
+
+services.kfactory.scheduledTasks = {
+  enable = true;
+  package = pkgs.kfactory;           # operator's overridden CLI
+  user    = "kittyandrew";           # owns ~/.config/kfactory/auth.json
+  # 7a3f = "weekly dep upgrades" (document the mapping in your config)
+  tasks."7a3f" = {
+    schedule           = "Mon *-*-* 09:00:00";
+    repo               = "git@github.com:acme/widget.git";
+    mode               = "continue";  # continue | skip-if-exists | fresh
+    initialPrompt      = "Check for dep upgrades and open a PR.";
+    continuationPrompt = "Resume the dep-bump work.";
+  };
+};
+
+services.kfactory.recovery = {
+  enable   = true;
+  # Single attrset binding: heal queue + sweep reader couple, so all three
+  # must come from the same kfactory flake. The module pulls `kfactory`,
+  # `opencode-heal`, and `opencode-sync-kick` from this attrset by name.
+  packages = inputs.kfactory.packages.${pkgs.system};
+  user     = "kittyandrew";
+  opencodeServiceName = "opencode";              # operator's unit name
+  opencodeDB          = "/var/lib/factory/kittyandrew/.local/share/opencode/opencode.db";
+  opencodeBaseURL     = "http://10.0.0.2:4096";  # internal, NOT proxy-fronted
+};
+```
+
+`scheduledTasks` generates one `systemd.timer` + `systemd.service`
+per task; the service runs `kfactory tick <id>` as the operator's
+user. Each task's id (`7a3f` above) becomes the workspace
+slug suffix, so re-firing the same task finds the same workspace
+across reboots.
+
+`recovery` attaches three hooks to the opencode-serve unit via a
+drop-in:
+
+- **ExecStartPre** runs `opencode-heal <DB>` -- sweeps zombie
+  assistant turns (`time.completed IS NULL`), marks them
+  `finish=interrupted-by-restart`, AND writes the affected
+  workspace IDs to `/run/kfactory/recovery-queue.json` so the
+  recovery sweep only touches workspaces that actually had a
+  mid-flight turn.
+- **ExecStartPost** runs `opencode-sync-kick --base <URL>` --
+  pokes the per-workspace status sync that opencode otherwise
+  only triggers on SPA init.
+- **ExecStartPost** runs `kfactory-recovery-sweep` -- reads the
+  queue file, runs `kfactory tick <ref> --prompt <recovery
+  prompt>` per workspace. The agent decides how to resume.
+
+`kfactory tick` is the unified verb both paths share: scheduled
+fires (workspace slug suffix == task id, mode-driven branching) and
+ad-hoc nudges (workspace ref + `--prompt`).
 
 ## CI
 

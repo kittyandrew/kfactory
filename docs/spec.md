@@ -259,25 +259,42 @@ WorkspaceTable row when `remove()` returns; the on-disk clone stays.
 The operator manually `rm -rf`s the directory when they're done with
 the workspace.
 
-### Heal on boot
+### Heal on boot (heal + recovery)
 
 When the opencode process is killed mid-stream (host restart, OOM,
 force-kill), any assistant message in-flight stays in the DB with
 `time.completed = null`. The TUI then paints those rows as "still
 streaming" forever on the next attach (the sync layer renders a spinner
-until a finish marker shows up). A SQLite heal script (consumer-side --
-typically wired as a systemd `ExecStartPre`) marks all such orphans as
-`finish: "interrupted-by-restart"` before opencode starts, so the TUI
-shows a clean "stopped" badge and the operator can re-prompt to
-continue.
+until a finish marker shows up). The `opencode-heal` SQLite script
+(shipped as `packages.opencode-heal`, wired via
+`services.kfactory.recovery` as ExecStartPre) marks all such orphans
+as `finish: "interrupted-by-restart"` before opencode starts, so the
+TUI shows a clean "stopped" badge.
+
+Heal is also the FIRST step of the broader recovery flow: it doesn't
+just mark rows, it also EMITS the workspace IDs whose sessions had
+stuck turns to a JSON queue at `/run/kfactory/recovery-queue.json`.
+The `recovery-sweep` step (ExecStartPost) reads that queue and runs
+`kfactory tick <wid> --prompt <recovery-prompt>` per workspace --
+injecting the operator-supplied recovery prompt as a new user message
+in each affected session's most-recent root session. Without the
+queue file, recovery would either ping ALL workspaces (noisy +
+spurious user prompts in sessions that DID finish) or skip the prompt
+injection entirely (the previous shape was suspected of doing this,
+leaving stuck-but-cleaned rows without any nudge for the operator).
+Heal + recovery are tightly coupled by design: empty queue (no stuck
+rows) = recovery-sweep no-op.
+
+Between heal and recovery-sweep, an `opencode-sync-kick` ExecStartPost
+HTTP-pokes the per-workspace status sync that opencode otherwise only
+triggers on SPA init. Without this, the first session interact after
+restart shows "Workspace Unavailable."
 
 The heal targets BOTH opencode's v1 `message` table and the v2
-`session_message` table. opencode 1.15.4 still routes assistant rows
-through v1; v2 is partially implemented (sub-events only today). When
-upstream flips assistant storage to v2, the v1 UPDATE becomes a no-op
-and the v2 UPDATE takes over -- no gap, no infinite-spinner
-regression. Row counts log to the journal so the silent flip is
-observable.
+`session_message` table; whichever doesn't exist on a given DB is a
+silent no-op (the script probes `sqlite_master` first). opencode
+v1.15.7 routes assistant rows through v2; v1 is legacy. Row counts
++ affected-workspace count log to the journal.
 
 ## 6. Decisions log
 
@@ -743,6 +760,53 @@ relevant to a consumer.
   destructive ops, and the operator's approval IS the supervision
   pause point. No separate yield primitive needed.
 
+- **`kfactory tick` as the unified idempotent-dispatch verb.** Two
+  shapes share the same subcommand: scheduled fire (when
+  `/etc/kfactory/scheduled/<id>.json` exists, ref is a task id, mode
+  drives behavior) and ad-hoc nudge (ref is a workspace id/slug/#,
+  `--prompt` required). One verb, one auth path, one resolver -- the
+  alternative would be two subcommands (`kfactory schedule-fire` +
+  `kfactory nudge`) that share 95% of their plumbing.
+
+- **Deterministic workspace slug suffix for scheduled tasks.** The
+  kfactory-adapter accepts an optional `extra.slugSuffix` (validated
+  against `[a-f0-9]{4}` -- the EXACT shape of a random-mint suffix),
+  which the CLI passes as the task id. Net: a task's workspace name
+  is `<owner>--<repo>--<task-id>`, stable across opencode restarts,
+  and indistinguishable from a randomly-minted workspace at the slug
+  level (one structural invariant everywhere -- random and scheduled
+  paths produce the same slug shape). The existing-workspace check
+  on subsequent ticks is a slug-suffix scan instead of a separate
+  "task -> workspace id" mapping (which would have needed its own
+  persistence file + invalidation). Operators document the
+  taskID -> human-name mapping in their NixOS module; the 4-hex
+  format buys symmetry at the cost of opacity (4-hex task IDs aren't
+  self-documenting), and operators accepted that trade in exchange
+  for keeping boundary defenses tight.
+
+- **Heal + recovery coupled via heal-emitted queue.** Heal does two
+  things: marks stuck rows AND writes the affected-workspace IDs to
+  a queue file at `/run/kfactory/recovery-queue.json`. Recovery
+  reads that queue and ticks ONLY those workspaces. Without the
+  queue, recovery would have to either iterate ALL workspaces (noisy
+  prompts injected into finished sessions) or skip prompt injection
+  entirely (the previously-broken kittyos shape: rows got cleaned
+  but no nudge surfaced). Empty queue (heal found nothing) -> empty
+  recovery sweep. The tight coupling is the design: heal answers
+  "what's stuck", recovery answers "what to do about it", neither
+  half is useful alone.
+
+- **`scheduledTasks` + `recovery` as the only NixOS modules.** Two
+  pieces of the deployment surface are intrinsically NixOS-shaped:
+  per-task systemd timer generation, and ExecStartPre/ExecStartPost
+  drop-ins on the opencode-serve unit. Both surface
+  attribute-schemas that read naturally as NixOS options. The CLI
+  defines the JSON config schema; the module emits JSON the CLI
+  accepts. Everything else stays module-free -- operators wire
+  opencode-kfactory + oauth2-proxy-kfactory + plugins + patches into
+  their own configs (per the "no Caddyfile / no docker-compose"
+  stance in the README).
+
 - **`factory-opencode-typecheck` Nix check.** Reuses the
   `opencode-kfactory` build (patched source + opencode's own
   `node_modules.nix`-built deps) and runs `tsc --noEmit` against
@@ -788,14 +852,9 @@ repo's runbook, not in this spec):
   llm-trace + permission-trace JSONL per workspace for later
   analysis. Implementation belongs in the consumer.
 
-- **VM-restart auto-continue for in-flight sessions.** Today the
-  heal-on-boot SQLite pass marks interrupted sessions as
-  `finish: "interrupted-by-restart"`. The operator must reattach and
-  send a fresh prompt to resume the loop. A frontier `kfactory resume`
-  subcommand would scan interrupted sessions and POST a continuation
-  prompt automatically. Requires design work: which sessions to
-  resume, what message to send, idempotency if heal+resume races a
-  half-started reply.
+- ~~**VM-restart auto-continue for in-flight sessions.**~~ Shipped.
+  See the "heal + recovery via heal-emitted queue" decision below
+  for the design + the `services.kfactory.recovery` module wiring.
 
 ## 8. What's in this repo
 

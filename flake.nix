@@ -19,69 +19,12 @@
   }: let
     forAllSystems = nixpkgs.lib.genAttrs ["x86_64-linux" "aarch64-linux"];
 
-    # mkPlugin -- buildNpmPackage wrapper for kfactory plugins. Plugins
-    # under plugins/<name>/ each have:
-    #   - package.json + package-lock.json (typecheck deps; no runtime deps
-    #     today since opencode supplies @opencode-ai/plugin at load time)
-    #   - tsconfig.json (typecheck config)
-    #   - src/*.ts (loaded directly by opencode via Bun's TS runtime)
-    #   - optional LICENSE-MIT for vendored upstream code
-    #
-    # The result store path contains the full package tree (src/, node_modules/,
-    # package.json) so consumers can either point opencode at the directory
-    # (Bun resolves `exports["./server"]`) or at a specific file inside.
-    mkPlugin = pkgs: {
-      name,
-      src,
-      npmDepsHash,
-    }:
-      pkgs.buildNpmPackage {
-        pname = "kfactory-plugin-${name}";
-        version = "0.0.1";
-        inherit src npmDepsHash;
-        # No compile step: plugins ship as .ts and Bun loads them directly.
-        # See research note in docs/spec.md decisions log re: opencode's
-        # PluginLoader -- it `await import()`s the entrypoint, and Bun's
-        # runtime transpiles TS on the fly.
-        dontNpmBuild = true;
-        # `npm ci` (which buildNpmPackage runs in install) populates
-        # node_modules/. We copy the whole package tree to $out so consumers
-        # can either reference $out/src/<entrypoint>.ts directly or point
-        # opencode at $out (which resolves via package.json's exports).
-        installPhase = ''
-          runHook preInstall
-          mkdir -p $out
-          cp -r . $out/
-          # Drop nix-specific files that the operator doesn't need at runtime
-          rm -rf $out/node_modules/.package-lock.json
-          runHook postInstall
-        '';
-      };
-
-    # mkPluginTypecheck -- same wrapper, but runs `tsc --noEmit` and emits
-    # only a marker file. Separate from mkPlugin so the plugin build itself
-    # is fast (no tsc compile time) and the typecheck is its own gated check.
-    mkPluginTypecheck = pkgs: {
-      name,
-      src,
-      npmDepsHash,
-    }:
-      pkgs.buildNpmPackage {
-        pname = "kfactory-plugin-${name}-typecheck";
-        version = "0";
-        inherit src npmDepsHash;
-        dontNpmBuild = true;
-        buildPhase = ''
-          runHook preBuild
-          npx tsc --noEmit
-          runHook postBuild
-        '';
-        installPhase = ''
-          runHook preInstall
-          touch $out
-          runHook postInstall
-        '';
-      };
+    # Pure-function plugin builders extracted to keep flake.nix under
+    # the 1k-line rule. mkPlugin / mkPluginTypecheck /
+    # mkThirdPartyPlugin / mkThirdPartyPluginSmoke -- see comments in
+    # nix/builders.nix for what each does.
+    builders = import ./nix/builders.nix;
+    inherit (builders) mkPlugin mkPluginTypecheck mkThirdPartyPlugin mkThirdPartyPluginSmoke;
 
     # Per-plugin source + npm deps hash. To refresh the hash after a
     # package-lock.json change:
@@ -101,131 +44,6 @@
         npmDepsHash = "sha256-FuWKV8HBa6mKB5xUaxRZ8GHI2j7ZlxKW/1sOacSNDxs=";
       };
     };
-
-    # mkThirdPartyPlugin -- buildNpmPackage wrapper for third-party
-    # opencode plugins pinned through a `plugins/<name>/` carrier
-    # (manifest-only: package.json + package-lock.json, no src/).
-    # Unlike mkPlugin (which packages kfactory's own plugin source
-    # under plugins/<name>/src/), this builder installs from an npm
-    # registry tarball via the carrier's lockfile, promotes the
-    # third-party package itself to $out, and hoists its runtime
-    # deps into $out/node_modules so opencode's PluginLoader can
-    # resolve them. Both flavours of plugin live under plugins/;
-    # which helper builds them is decided by which registry
-    # (pluginSrcs vs. thirdPartyPluginSrcs) holds the entry.
-    #
-    # See .claude/rules/050-third-party-nix-plugins.md for the bump
-    # workflow and docs/spec.md's decisions-log entry for the
-    # structural rationale (carrier vs. fetchurl-closure vs.
-    # opencode-auto-install).
-    #
-    # `npmInstallFlags = ["--ignore-scripts"]` is redundant with
-    # buildNpmPackage's `npmConfigHook` (which already hardcodes
-    # --ignore-scripts into its internal `npm ci`) but kept explicit
-    # for greppability. The script it actually suppresses depends on
-    # the dep tree -- for opencode-pty it's msgpackr-extract's
-    # node-gyp-build-optional-packages resolver (benign; runs again
-    # at runtime). It does NOT suppress `prepare` hooks (those don't
-    # fire for tarball installs from the npm registry).
-    mkThirdPartyPlugin = pkgs: {
-      name,
-      version,
-      src,
-      npmDepsHash,
-    }:
-      pkgs.buildNpmPackage {
-        pname = name;
-        inherit version src npmDepsHash;
-        npmInstallFlags = ["--ignore-scripts"];
-        dontNpmBuild = true;
-        # Promote the third-party package's own files to $out, hoist
-        # its sibling deps to $out/node_modules. `shopt -s dotglob` so
-        # any dotfiles the upstream tarball ships move with the
-        # non-dotfiles -- a separate `.[!.]*` glob would exit 1 under
-        # `set -eu` if there are no dotfiles, breaking installs for
-        # packages that ship none.
-        installPhase = ''
-          runHook preInstall
-          mkdir -p $out
-          mv node_modules/${name} $out-tmp
-          mv node_modules $out/node_modules
-          shopt -s dotglob
-          mv $out-tmp/* $out/
-          shopt -u dotglob
-          rmdir $out-tmp
-          rm -f $out/node_modules/.package-lock.json
-          runHook postInstall
-        '';
-      };
-
-    # mkThirdPartyPluginSmoke -- generic smoke check for any
-    # third-party plugin produced by mkThirdPartyPlugin. Mirrors
-    # opencode's PluginLoader resolution algorithm (per
-    # packages/opencode/src/plugin/shared.ts:resolvePackageEntrypoint):
-    #
-    #   1. Read package.json
-    #   2. If `exports["./server"]` is present, use it (resolving the
-    #      `default` / `import` condition if it's an object).
-    #   3. Otherwise, fall back to `main`.
-    #   4. Import that exact file relative to the package root.
-    #   5. Assert the module exposes at least one named export.
-    #
-    # Catches the silent classes:
-    #   - installPhase hoisted the wrong directory (no package.json)
-    #   - upstream removed exports["./server"] AND main (no entrypoint)
-    #   - upstream changed exports["./server"] to point at a
-    #     non-existent or empty file
-    #
-    # The check does NOT assert a specific export NAME (e.g.
-    # "PTYPlugin"). A specific-export assertion would need per-plugin
-    # smoke checks; the generic shape auto-registers for every
-    # third-party plugin in the registry, which is the tradeoff that
-    # keeps the bump workflow short. Per-plugin tightening can be
-    # added later via an opt-in registry field if a specific plugin
-    # warrants it.
-    mkThirdPartyPluginSmoke = pkgs: {
-      name,
-      pkg,
-    }:
-      pkgs.runCommand "factory-${name}-smoke" {
-        nativeBuildInputs = [pkgs.bun];
-      } ''
-        cat > smoke.ts <<EOF
-        // Resolve the entry the same way opencode's PluginLoader does:
-        // exports["./server"] first, then main. Hardcoding a sub-path
-        // like /dist/index.js would silently miss exports-map
-        // regressions; bare-directory imports go through exports["."]
-        // which opencode never reads. Reading package.json + applying
-        // opencode's algorithm faithfully is what makes the gate
-        // meaningful.
-        const pkgJson = await Bun.file("${pkg}/package.json").json()
-        const serverExport = pkgJson?.exports?.["./server"]
-        let entry: string | undefined
-        if (typeof serverExport === "string") {
-          entry = serverExport
-        } else if (serverExport && typeof serverExport === "object") {
-          entry = serverExport.default ?? serverExport.import
-        }
-        if (!entry && typeof pkgJson?.main === "string") {
-          entry = pkgJson.main
-        }
-        if (!entry) {
-          console.error("smoke: ${name} has neither exports['./server'] nor main")
-          process.exit(1)
-        }
-        const fullPath = "${pkg}/" + entry.replace(/^\.\//, "")
-        const mod = await import(fullPath)
-        const exportNames = Object.keys(mod)
-        if (exportNames.length === 0) {
-          console.error("smoke: ${name} entry " + entry + " has no exports")
-          process.exit(1)
-        }
-        console.log("smoke: ${name} loaded via " + entry + ", exports:", exportNames.join(", "))
-        EOF
-        export HOME=$TMPDIR
-        bun run smoke.ts
-        touch $out
-      '';
 
     # Per-third-party-plugin source + npm deps hash. Carriers live
     # under plugins/<name>/ (manifest-only; no src/). Adding an entry
@@ -312,22 +130,27 @@
         kfactory = pkgs.callPackage ./. {};
         default = self.packages.${system}.kfactory;
 
-        # opencode-kfactory: opencode with all three patches applied + the
-        # experimental-workspaces env var baked into the wrapper, so the
-        # workspace-routing middleware (added by the patches) is actually
-        # exercised at runtime. Consumers using the raw `patches.*` exports
-        # are responsible for setting OPENCODE_EXPERIMENTAL_WORKSPACES
-        # themselves.
+        # opencode-kfactory: opencode with the full patch stack applied +
+        # the experimental-workspaces env var baked into the wrapper, so
+        # the workspace-routing middleware (added by the patches) is
+        # actually exercised at runtime. Consumers using the raw
+        # `patches.*` exports are responsible for setting
+        # OPENCODE_EXPERIMENTAL_WORKSPACES themselves.
         opencode-kfactory = opencode.packages.${system}.default.overrideAttrs (old: {
-          # @WARNING: DO NOT REORDER. The three patches must apply in this
-          #   exact order:
-          #     1. opencode-bearer-and-routing  (upstreamable surface)
-          #     2. opencode-session-subscribers (kfactory.subscribers.changed
+          # @WARNING: DO NOT REORDER. The four opencode patches must
+          #   apply in this exact order:
+          #     1. opencode-bearer-and-routing   (upstreamable surface:
+          #        bearer flag, --workspace plumbing, workspace routing
+          #        + listByProject workspace_id filter)
+          #     2. opencode-workspace-branch     (upstreamable surface:
+          #        per-row .git/HEAD branch enrichment in
+          #        /experimental/workspace response)
+          #     3. opencode-session-subscribers  (kfactory.subscribers.changed
           #        bus event used by plugins/ntfy)
-          #     3. opencode-kfactory-refresh    (kfactory-specific deployment
-          #        glue; line-pinned against patches #1 + #2 above)
-          #   Reordering will make `patch` reject loudly or fuzzy-apply at
-          #   the wrong offset. See .claude/rules/020-patches.md.
+          #     4. opencode-kfactory-refresh     (kfactory-specific
+          #        deployment glue; line-pinned against patches 1-3)
+          #   Reordering will make `patch` reject loudly or fuzzy-apply
+          #   at the wrong offset. See .claude/rules/020-patches.md.
           patches =
             (old.patches or [])
             ++ [
@@ -339,6 +162,7 @@
               # no API delta). Drop when nixpkgs ships bun 1.3.14+.
               ./patches/opencode-bun-version-relax.patch
               ./patches/opencode-bearer-and-routing.patch
+              ./patches/opencode-workspace-branch.patch
               ./patches/opencode-session-subscribers.patch
               ./patches/opencode-kfactory-refresh.patch
             ];
@@ -354,6 +178,39 @@
           patches = (old.patches or []) ++ [./patches/oauth2-proxy-pkce-no-secret.patch];
         });
 
+        # ---- Opencode lifecycle glue ----
+        #
+        # Two small shell apps consumers wire into their opencode
+        # systemd unit (or equivalent). Both are opencode-internal-API-
+        # coupled (DB schema for heal, HTTP routes for sync-kick),
+        # which is exactly why they live in kfactory: kfactory's
+        # patches already own this surface. See `services.kfactory.recovery`
+        # NixOS module for the canonical wiring that pairs them.
+
+        # opencode-heal + opencode-sync-kick: script source lives at
+        # modules/scripts/*.sh next to the recovery module that's their
+        # only consumer. Keeping the script bodies out of flake.nix
+        # means SQL and jq syntax don't need Nix string-escaping, the
+        # files are individually grep-able, and shellcheck still gates
+        # them via writeShellApplication's build-time check.
+        opencode-heal = pkgs.writeShellApplication {
+          name = "opencode-heal";
+          # gnugrep + coreutils (printf, wc, sort, mkdir, dirname) +
+          # sqlite + jq cover every external the script calls.
+          # writeShellApplication's PATH is locked to runtimeInputs;
+          # missing `grep` was silently masking heal in earlier test
+          # runs (queue ended up empty because `grep -v '^$' | sort -u`
+          # in a `|| true` chain swallowed the error).
+          runtimeInputs = [pkgs.sqlite pkgs.jq pkgs.coreutils pkgs.gnugrep];
+          text = builtins.readFile ./modules/scripts/opencode-heal.sh;
+        };
+
+        opencode-sync-kick = pkgs.writeShellApplication {
+          name = "opencode-sync-kick";
+          runtimeInputs = [pkgs.curl pkgs.jq pkgs.coreutils];
+          text = builtins.readFile ./modules/scripts/opencode-sync-kick.sh;
+        };
+
         # ---- E2E test OCI images (see tests/e2e/README.md) ----
         #
         # These are dev-only images for the end-to-end Docker-based
@@ -364,6 +221,8 @@
         # config without bringing up the full OIDC stack.
         opencode-image = pkgs.callPackage ./tests/e2e/opencode-image.nix {
           opencode-kfactory = self.packages.${system}.opencode-kfactory;
+          opencode-heal = self.packages.${system}.opencode-heal;
+          opencode-sync-kick = self.packages.${system}.opencode-sync-kick;
           plugins = self.plugins.${system};
           # Third-party plugins are derived from the auto-generated
           # packages by name-matching against thirdPartyPluginSrcs.
@@ -441,22 +300,59 @@
     #
     #   opencodePkg = inputs.opencode.packages.${system}.default.overrideAttrs (old: {
     #     patches = (old.patches or []) ++ [
-    #       inputs.kfactory.patches.opencode-bearer-and-routing
+    #       inputs.kfactory.patches.opencode-bun-version-relax    # temporary; drop when nixpkgs ships bun >=1.3.14
+    #       inputs.kfactory.patches.opencode-bearer-and-routing   # upstreamable: bearer + routing + listByProject filter
+    #       inputs.kfactory.patches.opencode-workspace-branch     # upstreamable: live .git/HEAD branch in workspace list
     #       inputs.kfactory.patches.opencode-session-subscribers  # optional; needed for plugins/ntfy
     #       inputs.kfactory.patches.opencode-kfactory-refresh     # optional; needed for `kfactory attach`
     #     ];
     #   });
     #
-    # @WARNING: DO NOT REORDER the three opencode patches. Apply in the order
-    #   shown above or `patch` will reject loudly (or worse, fuzzy-apply at
-    #   the wrong offset). Consumers who only want the upstreamable subset
-    #   may include just opencode-bearer-and-routing.
+    # @WARNING: DO NOT REORDER the opencode patches. Apply in the order
+    #   shown above or `patch` will reject loudly (or worse, fuzzy-apply
+    #   at the wrong offset). Consumers who only want the upstreamable
+    #   subset may include the bearer-and-routing + workspace-branch +
+    #   session-subscribers patches and skip kfactory-refresh.
+    #   Authoritative stack documentation lives in
+    #   .claude/rules/020-patches.md; this block must match.
     patches = {
       opencode-bun-version-relax = ./patches/opencode-bun-version-relax.patch;
       opencode-bearer-and-routing = ./patches/opencode-bearer-and-routing.patch;
+      opencode-workspace-branch = ./patches/opencode-workspace-branch.patch;
       opencode-session-subscribers = ./patches/opencode-session-subscribers.patch;
       opencode-kfactory-refresh = ./patches/opencode-kfactory-refresh.patch;
       oauth2-proxy-pkce-no-secret = ./patches/oauth2-proxy-pkce-no-secret.patch;
+    };
+
+    # NixOS modules. kfactory ships these for the parts of the
+    # deployment surface that are intrinsically NixOS-shaped --
+    # per-task systemd timer generation, opencode-serve lifecycle
+    # hooks. The rest of kfactory stays module-free (operators wire
+    # opencode-kfactory + oauth2-proxy-kfactory + the patches into
+    # their own configs).
+    #
+    # Both modules default their `package` / `packages` option to
+    # kfactory's own `packages.${system}` so a consumer that just
+    # wants the in-tree CLI gets zero-config behavior:
+    #
+    #   imports = [ inputs.kfactory.nixosModules.scheduledTasks ];
+    #   services.kfactory.scheduledTasks = { enable = true; user = "..."; tasks = { ... }; };
+    #
+    # Overriding (e.g. for endpoint-ldflag-baked CLIs) is still one
+    # line: set `services.kfactory.scheduledTasks.package =
+    # pkgs.kfactory.overrideAttrs ...;` and NixOS's mkDefault is
+    # superseded.
+    nixosModules = {
+      scheduledTasks = {pkgs, ...}: {
+        imports = [./modules/scheduled-tasks.nix];
+        services.kfactory.scheduledTasks.package =
+          nixpkgs.lib.mkDefault self.packages.${pkgs.system}.kfactory;
+      };
+      recovery = {pkgs, ...}: {
+        imports = [./modules/recovery.nix];
+        services.kfactory.recovery.packages =
+          nixpkgs.lib.mkDefault self.packages.${pkgs.system};
+      };
     };
 
     # CI: `nix flake check` builds:
@@ -585,32 +481,48 @@
           "${name}-integration-typecheck"
           (mkPluginIntegrationCheck name spec))
         pluginSrcs;
+
+      # E2E lifecycle scripts are writeShellApplication-based, which
+      # bakes shellcheck into the build. Adding them as checks
+      # promotes the shellcheck gate into `nix flake check` (so CI
+      # catches shell regressions on every PR, not only when an
+      # operator runs `nix run .#dev-*`).
+      devScripts = import ./tests/e2e/scripts {inherit pkgs;};
+      devScriptChecks =
+        nixpkgs.lib.mapAttrs'
+        (name: drv:
+          nixpkgs.lib.nameValuePair "factory-${name}-shellcheck" drv)
+        devScripts;
     in
       packageChecks
       // pluginChecks
       // pluginTypechecks
       // pluginIntegrationChecks
       // thirdPartySmokeChecks
+      // devScriptChecks
       // {
         factory-opencode-patch-applies =
           pkgs.runCommand "factory-opencode-patch-applies" {
             src = opencode.outPath;
             patch1 = ./patches/opencode-bearer-and-routing.patch;
-            patch2 = ./patches/opencode-session-subscribers.patch;
-            patch3 = ./patches/opencode-kfactory-refresh.patch;
+            patch2 = ./patches/opencode-workspace-branch.patch;
+            patch3 = ./patches/opencode-session-subscribers.patch;
+            patch4 = ./patches/opencode-kfactory-refresh.patch;
             nativeBuildInputs = [pkgs.patch];
           } ''
             cp -R "$src" ./opencode
             chmod -R +w ./opencode
             cd ./opencode
-            # Apply all three patches for real in sequence -- mirrors how
-            # opencode-kfactory's configurePhase applies them, and catches
-            # cases where a later patch dry-runs cleanly but real-apply
-            # fails (e.g., overlapping hunks at the same offset). The
-            # resulting tree is discarded; only success/failure matters.
+            # Apply all four patches for real in sequence -- mirrors
+            # how opencode-kfactory's configurePhase applies them, and
+            # catches cases where a later patch dry-runs cleanly but
+            # real-apply fails (e.g., overlapping hunks at the same
+            # offset). The resulting tree is discarded; only success/
+            # failure matters.
             patch -p1 < "$patch1"
             patch -p1 < "$patch2"
             patch -p1 < "$patch3"
+            patch -p1 < "$patch4"
             touch $out
           '';
 
@@ -673,8 +585,9 @@
 
         # factory-opencode-typecheck -- runs tsc --noEmit against the
         # patched opencode source. Closes the spec.md §7 gap where
-        # type-semantic drift inside the three opencode patches was not
-        # caught by CI (bun's bundler strips types without checking).
+        # type-semantic drift inside the kfactory opencode patches was
+        # not caught by CI (bun's bundler strips types without
+        # checking).
         #
         # Builds on top of `opencode-kfactory` -- its configurePhase
         # already applies our patches and copies the upstream-prepared

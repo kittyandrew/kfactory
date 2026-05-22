@@ -13,6 +13,8 @@
 {
   pkgs,
   opencode-kfactory,
+  opencode-heal,
+  opencode-sync-kick,
   plugins,
   thirdPartyPlugins,
   testRepo,
@@ -75,13 +77,26 @@ in
     #   - git + openssh: kfactory-adapter clones via `git clone`.
     #   - cacert: TLS verification for `git clone https://...`.
     #   - coreutils + bash: entrypoint shell + small env setup.
+    #   - opencode-heal + opencode-sync-kick: lifecycle scripts the
+    #     `services.kfactory.recovery` module wires as ExecStartPre /
+    #     ExecStartPost on the opencode-serve unit. The e2e tests exec
+    #     them directly via `docker exec` to validate the round-trip
+    #     end-to-end (no systemd in the test environment).
+    #   - sqlite: lets the e2e harness simulate a "stuck assistant turn"
+    #     by UPDATE-ing the DB to clear `time.completed` -- the stuck
+    #     state heal is supposed to catch. Bundling here (vs in the
+    #     kfactory-cli image) keeps the DB-manipulation co-located with
+    #     the DB volume; the cli container can't reach it.
     contents = [
       opencode-kfactory
+      opencode-heal
+      opencode-sync-kick
       pkgs.git
       pkgs.openssh
       pkgs.cacert
       pkgs.coreutils
       pkgs.bash
+      pkgs.sqlite
     ];
     # `/root/.config/opencode/{opencode,notification-ntfy}.json` is where
     # opencode and the ntfy plugin look (per opencode's config.ts

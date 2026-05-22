@@ -375,7 +375,7 @@ index 4d3f510..e1743e4 100644
      const workspace = yield* resolveWorkspace(workspaceID, envWorkspaceID)
  
 diff --git a/packages/opencode/src/session/session.ts b/packages/opencode/src/session/session.ts
-index b6aa73a..1647ed7 100644
+index b6aa73a..f4e7356 100644
 --- a/packages/opencode/src/session/session.ts
 +++ b/packages/opencode/src/session/session.ts
 @@ -577,8 +577,23 @@ export const layer: Layer.Layer<
@@ -403,7 +403,33 @@ index b6aa73a..1647ed7 100644
        )
      })
  
-@@ -943,6 +958,7 @@ function* listByProject(
+@@ -895,11 +910,20 @@ function* listByProject(
+     experimentalWorkspaces: boolean
+   },
+ ) {
+-  const conditions = [eq(SessionTable.project_id, input.projectID)]
+-
+-  if (input.workspaceID) {
+-    conditions.push(eq(SessionTable.workspace_id, input.workspaceID))
+-  }
++  // kfactory: when workspaceID is set (request carried an
++  // x-opencode-workspace header / ?workspace= query that the
++  // workspace-routing middleware resolved), filter ONLY by workspace_id.
++  // Sessions are inserted via POST /session which routes to the workspace
++  // instance and stamps `project_id` with the workspace's worktree-hashed
++  // value; but GET /session stays in the front-opencode (per
++  // server/shared/workspace-routing.ts), where ctx.project.id is the
++  // FRONT project (typically "global"). The AND of those two diverges
++  // and returns 0. Workspace_id is itself a unique scope, so dropping
++  // the project_id condition is safe -- mirrors what 40b4ef5 did for
++  // listGlobal below.
++  const conditions = input.workspaceID
++    ? [eq(SessionTable.workspace_id, input.workspaceID)]
++    : [eq(SessionTable.project_id, input.projectID)]
+   if (input.path !== undefined) {
+     if (input.path) {
+       const conds = [eq(SessionTable.path, input.path), like(SessionTable.path, `${input.path}/%`)]
+@@ -943,6 +967,7 @@ function* listByProject(
  
  export function* listGlobal(input?: {
    directory?: string
@@ -411,7 +437,7 @@ index b6aa73a..1647ed7 100644
    roots?: boolean
    start?: number
    cursor?: number
-@@ -955,6 +971,15 @@ export function* listGlobal(input?: {
+@@ -955,6 +980,15 @@ export function* listGlobal(input?: {
    if (input?.directory) {
      conditions.push(eq(SessionTable.directory, input.directory))
    }

@@ -23,6 +23,14 @@
 //   - KFACTORY_ADAPTER_WORKSPACES_DIR  workspaces root
 //                                      (default: "/var/lib/factory/workspaces")
 //
+// @WARNING: the PATH-resolved defaults work in interactive shells but
+//    FAIL under systemd User= units, which sanitize PATH down to a
+//    minimal coreutils/findutils/grep set. If you're running opencode
+//    under systemd, ALWAYS set KFACTORY_ADAPTER_GIT and
+//    KFACTORY_ADAPTER_OPENSSH_SSH to absolute Nix store paths -- the
+//    OPENCODE_SERVE wrapper in flake.nix's `opencode-kfactory` does
+//    this automatically; bare consumers must do it themselves.
+//
 // Consumers using Nix typically wrap opencode with these env vars set to
 // absolute store paths (`${pkgs.git}/bin/git`, `${pkgs.openssh}/bin/ssh`,
 // etc.) so the adapter never relies on the runtime PATH.
@@ -53,12 +61,23 @@ const WORKSPACES_DIR =
 // git credential helper. SSH, https, and any git-supported scheme are
 // fine; the plugin does not canonicalize or filter by hosting service.
 
-// Slug shape: `<owner>--<repo>--<4hex>`. Asserted at every boundary that
-// concatenates the slug into a filesystem path (configure mints, create
-// uses, target dispatches, remove deletes) so a malformed `info.name` --
-// DB corruption, a future migration bug, a path-injection in
-// extra.repoUrl that slipped through parseOwnerRepo -- can't escape
-// workspaces dir.
+// Slug shape: `<owner>--<repo>--<4hex>`. Asserted at every boundary
+// that concatenates the slug into a filesystem path (configure mints,
+// create uses, target dispatches, remove deletes) so a malformed
+// `info.name` -- DB corruption, a future migration bug, a path-
+// injection in extra.repoUrl that slipped through parseOwnerRepo --
+// can't escape workspaces dir.
+//
+// The 4-hex suffix is either:
+//   - random via `randomBytes(2).toString("hex")` for ad-hoc dispatches
+//     (16-bit collision space, plenty at ~10 workspaces);
+//   - or a deterministic task-id from `extra.slugSuffix`, used by
+//     `kfactory tick <task-id>` so scheduled-task workspaces have a
+//     predictable slug that survives across opencode restarts. The CLI
+//     constrains task-ids to `[a-f0-9]{4}` (cmd/kfactory/tick.go +
+//     modules/scheduled-tasks.nix) so the tight invariant holds end-
+//     to-end -- the regex below is the load-bearing assertion that
+//     catches any drift.
 //
 // Segments use only [A-Za-z0-9._] -- no hyphens within a segment, so
 // the `--` delimiter is unambiguous. Hyphens were previously permitted
@@ -130,9 +149,27 @@ function sanitizeSlugSegment(s: string): string {
   return s.replace(/[^a-zA-Z0-9._]/g, "_")
 }
 
-function parseExtra(info: Pick<WorkspaceInfo, "extra">): {repoUrl: string} {
-  const extra = (info.extra ?? {}) as { repoUrl?: unknown }
-  return {repoUrl: typeof extra.repoUrl === "string" ? extra.repoUrl : ""}
+function parseExtra(
+  info: Pick<WorkspaceInfo, "extra">,
+): {repoUrl: string; slugSuffix?: string} {
+  const extra = (info.extra ?? {}) as {
+    repoUrl?: unknown
+    slugSuffix?: unknown
+  }
+  const out: {repoUrl: string; slugSuffix?: string} = {
+    repoUrl: typeof extra.repoUrl === "string" ? extra.repoUrl : "",
+  }
+  // Optional caller-supplied slug suffix (used by `kfactory tick` to
+  // mint deterministic slugs that survive across opencode restarts).
+  // Must match the EXACT shape of the random-mint suffix: 4 hex chars.
+  // Anything else is silently dropped -- the random-suffix fallback
+  // in buildWorkspaceSlug kicks in. The CLI rejects malformed task-
+  // ids loudly before we ever see them; this regex is the boundary
+  // defense for direct API callers / future migrations.
+  if (typeof extra.slugSuffix === "string" && /^[a-f0-9]{4}$/.test(extra.slugSuffix)) {
+    out.slugSuffix = extra.slugSuffix
+  }
+  return out
 }
 
 // Slug shape: `<owner>--<repo>--<4hex>`. Random suffix lets the operator
@@ -159,9 +196,19 @@ function buildWorkspaceSlug(info: Pick<WorkspaceInfo, "name" | "extra">): string
   if (info.name && isValidSlug(info.name)) {
     return info.name
   }
-  const {repoUrl} = parseExtra(info)
+  const {repoUrl, slugSuffix} = parseExtra(info)
   const {owner, repo} = parseOwnerRepo(repoUrl)
-  return `${owner}--${repo}--${randomBytes(2).toString("hex")}`
+  // `slugSuffix` lets the caller (typically `kfactory tick` for a
+  // scheduled task) mint a deterministic slug so the workspace is
+  // discoverable by suffix across opencode restarts. Without it,
+  // randomBytes(2).toString("hex") gives a 4-hex random suffix (16-bit
+  // collision space; plenty at <=10 workspaces per repo). When
+  // supplied, the SLUG_RE assert at every downstream boundary (the
+  // top-of-file invariant) catches a malformed suffix here -- but
+  // parseExtra already gates on the regex character class, so this
+  // path is the suffix-shape-correct branch by construction.
+  const suffix = slugSuffix ?? randomBytes(2).toString("hex")
+  return `${owner}--${repo}--${suffix}`
 }
 
 function workspaceDir(slug: string): string {
@@ -284,6 +331,14 @@ async function cloneRepoInto(slug: string, repoUrl: string): Promise<void> {
         },
       })
       let stderr = ""
+      // `error` fires when spawn itself fails BEFORE the child runs --
+      // e.g. ENOENT because GIT isn't on PATH. Without this listener,
+      // Node emits the error event into the void, `close` never fires,
+      // and the awaiting CLI hangs forever. The systemd-service-PATH
+      // sanitization case (typical NixOS deployment: User= service
+      // strips PATH down to a minimal set without git) makes this the
+      // realistic failure mode.
+      p.on("error", reject)
       p.stderr.on("data", (c) => (stderr += c))
       p.on("close", (code) => {
         if (code === 0) resolve()

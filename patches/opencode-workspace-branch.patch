@@ -1,0 +1,87 @@
+Fresh-branch enrichment for `GET /experimental/workspace`.
+
+Reads `.git/HEAD` per row at list time and overrides
+WorkspaceTable.branch in the response so `kfactory list` can show a
+live branch column. The kfactory-adapter never populates the stored
+branch column (it doesn't track checkout state), so without this
+patch the workspace.list response always returns branch=null.
+
+Implementation:
+  - `readBranchFromGitHead(directory)` parses `ref: refs/heads/<X>`
+    from `.git/HEAD`. Detached HEAD or missing .git -> undefined.
+  - `WorkspaceHttpApi.list` resolves branches via Effect.forEach
+    with concurrency: "unbounded", each row's read wrapped in
+    Effect.sync. fs.readFileSync is fine here -- the file is at most
+    one disk seek per row.
+  - Response shape unchanged: `branch` field was already in
+    Workspace.Info (just always null for kfactory-adapter dispatches).
+
+Stacking: applies AFTER `opencode-bearer-and-routing` and BEFORE
+`opencode-session-subscribers`. Touches only handlers/workspace.ts,
+which neither neighbour modifies, so the stack is order-independent
+in practice.
+
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
+index c22b82d..084d09d 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
+@@ -4,10 +4,30 @@ import * as InstanceState from "@/effect/instance-state"
+ import { Vcs } from "@/project/vcs"
+ import { Effect } from "effect"
+ import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
++import * as fs from "node:fs"
++import * as path from "node:path"
+ import { InstanceHttpApi } from "../api"
+ import { ApiVcsApplyError } from "../groups/instance"
+ import { ApiWorkspaceWarpError, CreatePayload, WarpPayload } from "../groups/workspace"
+ 
++// kfactory: parse a workspace's current branch directly from .git/HEAD.
++// Avoids depending on Git.Service from this route's effect context
++// (which would widen RouteRequirements and break server.ts).
++//
++// .git/HEAD content shape:
++//   - "ref: refs/heads/main\n" -> branch "main"
++//   - "<40-char sha>\n"        -> detached HEAD -> undefined
++//   - no .git dir              -> broken / non-git workspace -> undefined
++function readBranchFromGitHead(directory: string): string | undefined {
++  try {
++    const head = fs.readFileSync(path.join(directory, ".git", "HEAD"), "utf8").trim()
++    const m = head.match(/^ref: refs\/heads\/(.+)$/)
++    return m ? m[1] : undefined
++  } catch {
++    return undefined
++  }
++}
++
+ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspace", (handlers) =>
+   Effect.gen(function* () {
+     const workspace = yield* Workspace.Service
+@@ -18,7 +38,27 @@ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspac
+     })
+ 
+     const list = Effect.fn("WorkspaceHttpApi.list")(function* () {
+-      return yield* workspace.list((yield* InstanceState.context).project)
++      // kfactory: enrich each row with a FRESH branch read instead of
++      // returning the cached `WorkspaceTable.branch` column (which the
++      // kfactory-adapter never populates -- so the column stays NULL
++      // and operator tooling like `kfactory list` couldn't show a
++      // branch). Bulk-resolve concurrently via Effect.forEach so the
++      // list endpoint stays a single round-trip from the CLI's POV
++      // (the earlier shape was N+1: list + /vcs per row). Each read
++      // is `Effect.sync` wrapping a cheap `fs.readFileSync(.git/HEAD)`
++      // -- no Git.Service dependency (would widen RouteRequirements
++      // and break server.ts). Failures degrade to undefined branch
++      // (broken-clone case, e.g. empty workspace dir with no .git).
++      const rows = yield* workspace.list((yield* InstanceState.context).project)
++      const branches = yield* Effect.forEach(
++        rows,
++        (row) =>
++          Effect.sync(() =>
++            row.directory ? readBranchFromGitHead(row.directory) : undefined,
++          ),
++        { concurrency: "unbounded" },
++      )
++      return rows.map((row, i) => ({ ...row, branch: branches[i] ?? row.branch }))
+     })
+ 
+     const create = Effect.fn("WorkspaceHttpApi.create")(function* (ctx: { payload: typeof CreatePayload.Type }) {

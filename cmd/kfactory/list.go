@@ -38,10 +38,14 @@ func runList(args []string) {
 	sortWorkspaces(ws)
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "#\tID\tNAME\tLAST USED")
+	_, _ = fmt.Fprintln(tw, "#\tID\tNAME\tBRANCH\tLAST USED")
 	for i, w := range ws {
 		when := time.UnixMilli(w.TimeUsed).Format(time.RFC3339)
-		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", i+1, w.ID, w.Name, when)
+		branch := w.Branch
+		if branch == "" {
+			branch = "-"
+		}
+		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", i+1, w.ID, w.Name, branch, when)
 	}
 	if err := tw.Flush(); err != nil {
 		fail("list: write output: %v", err)
