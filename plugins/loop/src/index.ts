@@ -272,22 +272,29 @@ const LoopPlugin: Plugin = async (input) => {
       return
     }
 
-    // throwOnError: SDK defaults to {data, error} without throwing,
-    // which would leave us thinking the prompt succeeded when it didn't.
+    // Bump iteration on disk BEFORE awaiting the prompt call. The
+    // event handler single-flights handleIdle per sessionID via
+    // `inFlight` (a second idle arriving mid-await only sets
+    // `tracker.pending = true` and returns), so there's no concurrent
+    // second handleIdle. But the SEQUENTIAL re-entry via tracker.pending
+    // (the re-run inside the try block at the end of the outer event
+    // handler) reads state again after the first handler returns. If
+    // the first handler writes iteration AFTER the prompt await, the
+    // re-run reads stale state.iteration -- both injections compute
+    // `next = state.iter + 1 = same value` and stall at the same
+    // iteration label. User-visible as "loop showed 2/20 then stopped
+    // advancing." Persisting `next` BEFORE the await ensures the
+    // re-run sees the bumped value and either injects N+1 or hits the
+    // cap.
+    //
+    // Trade-off: if the prompt call later fails, iteration counts a
+    // turn that never produced an assistant response. onFailure
+    // bumps consecutiveFailures and writes that back, but iteration
+    // stays advanced. Operator sees iter=K with K-1 actual model
+    // turns. Better than the alternative (silent iteration stall).
     const next = state.iteration + 1
-    try {
-      await client.session.prompt({
-        path: { id: sessionID },
-        body: { parts: [{ type: "text", text: buildContinuation(state, next) }] },
-        throwOnError: true,
-      })
-    } catch (err) {
-      onFailure(state, err, "prompt")
-      return
-    }
-
     if (!stateStillOurs(sessionID)) {
-      console.info(`loop: state cleared during handler, skipping write-back`)
+      console.info(`loop: state cleared during handler, skipping pre-inject bump`)
       return
     }
     writeStateTo(directory, {
@@ -295,6 +302,19 @@ const LoopPlugin: Plugin = async (input) => {
       iteration: next,
       consecutiveFailures: 0,
     })
+
+    // throwOnError: SDK defaults to {data, error} without throwing,
+    // which would leave us thinking the prompt succeeded when it didn't.
+    try {
+      await client.session.prompt({
+        path: { id: sessionID },
+        body: { parts: [{ type: "text", text: buildContinuation(state, next) }] },
+        throwOnError: true,
+      })
+    } catch (err) {
+      onFailure({ ...state, iteration: next }, err, "prompt")
+      return
+    }
   }
 
   function onFailure(state: LoopState, err: unknown, op: string): void {

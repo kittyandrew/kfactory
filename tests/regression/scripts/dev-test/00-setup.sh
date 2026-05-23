@@ -27,6 +27,10 @@ cli() { docker exec -i "$CLI_CONTAINER" "$@"; }
 # an ntfy listener) and pick the output back up later from /tmp.
 cli_d() { docker exec -d "$CLI_CONTAINER" "$@"; }
 ocexec() { docker exec "$OPENCODE_CONTAINER" "$@"; }
+# Stdin-attached variant -- needed when piping JSON / heredocs into a
+# command running in the opencode container (e.g. writing a loop state
+# file with `ocexec_i sh -c 'cat > /path' <<EOF`).
+ocexec_i() { docker exec -i "$OPENCODE_CONTAINER" "$@"; }
 
 REPO="file:///srv/test-repo.git"
 # Two ntfy URLs. NTFY_URL is host-side (operator opens the topic in a

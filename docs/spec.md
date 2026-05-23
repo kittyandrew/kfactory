@@ -896,6 +896,31 @@ relevant to a consumer.
   self-documenting), and operators accepted that trade in exchange
   for keeping boundary defenses tight.
 
+- **`skip-if-dirty` shells `git status` per workspace on every list
+  call.** The `opencode-workspace-branch` patch enriches each row of
+  `GET /experimental/workspace` with a server-side `dirty: boolean`
+  via `git -C <dir> status --porcelain` (5-second per-call timeout,
+  `execFileSync` to stay out of shell parsing). Cost is N git
+  subprocesses per workspace list -- a previously free endpoint
+  becomes linearly more expensive in subprocesses. Acceptable
+  because:
+  - The endpoint is cold-path -- operator-driven (`kfactory list`,
+    `kfactory attach <TAB>`, `kfactory tick`), never per-event.
+  - The alternative (caching the bit on `WorkspaceTable.dirty` and
+    invalidating on session.idle / explicit refresh) trades
+    freshness for cost, which is the wrong direction for the
+    skip-if-dirty safety semantic (the whole point is to NOT
+    dispatch over uncommitted work; a stale "clean" bit defeats
+    that). A null `dirty` (probe failure, missing .git, git binary
+    absent) is fail-CLOSED -- consumers treat it as dirty.
+  - The branch enrichment paid for in the same patch is the
+    structural precedent: row-enrichment via per-row syscalls,
+    concurrency-unbounded, no cache. The dirty bit follows the
+    same shape.
+  If list latency ever shows up as an operational problem, the
+  natural follow-up is `?dirty=true` query-param gating so only the
+  CLI's `tick` path pays the cost, not `list` / completion paths.
+
 - **Heal + recovery coupled via heal-emitted queue.** Heal does two
   things: marks stuck rows AND writes the affected-workspace IDs to
   a queue file at `/run/kfactory/recovery-queue.json`. Recovery

@@ -1,4 +1,4 @@
-#compdef kfactory
+#compdef kfactory kf
 # zsh completion for kfactory. Installed by default.nix into
 # $out/share/zsh/site-functions/_kfactory; nixpkgs adds that path to zsh's
 # fpath automatically via pkgs.zsh's setup-hook (environment.pathsToLink

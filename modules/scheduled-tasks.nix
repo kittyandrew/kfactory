@@ -53,13 +53,23 @@
         example = "git@github.com:acme/widget.git";
       };
       mode = lib.mkOption {
-        type = lib.types.enum ["continue" "skip-if-exists" "fresh"];
-        default = "continue";
+        type = lib.types.enum ["skip-if-exists" "skip-if-dirty" "continue"];
+        default = "skip-if-dirty";
         description = ''
-          Behavior when a workspace for this task already exists:
-            continue       - post continuationPrompt to the most-recent root session
-            skip-if-exists - log + exit 0 (block until workspace is deleted)
-            fresh          - mint a new workspace each tick (operator must clean up the old one)
+          All three modes CREATE the workspace + fire initialPrompt
+          when no workspace with this task-id exists. The mode only
+          decides what happens when one already does -- in every
+          dispatching mode the continuation lands in the EXISTING
+          root session (no new sessions, no orphan workspaces):
+
+            skip-if-exists - no-op. Useful for "set up once, leave
+                             alone" tasks.
+            skip-if-dirty  - dispatch ONLY if the workspace's git
+                             working tree is clean. Dirty = uncommitted
+                             or untracked files; the prompt is skipped
+                             so the agent's in-flight work isn't
+                             clobbered. Default + safest.
+            continue       - unconditional dispatch. No safety net.
         '';
       };
       initialPrompt = lib.mkOption {
@@ -70,8 +80,9 @@
         type = lib.types.str;
         default = "";
         description = ''
-          Prompt fired into the existing session on subsequent ticks
-          (when mode = "continue"). Empty string defaults to initialPrompt.
+          Prompt fired into the existing session when the mode
+          dispatches (skip-if-dirty + clean, OR continue). Empty
+          string defaults to initialPrompt.
         '';
       };
       randomizedDelay = lib.mkOption {

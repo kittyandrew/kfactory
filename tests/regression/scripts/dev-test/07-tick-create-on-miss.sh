@@ -1,10 +1,17 @@
-# [7] tick (scheduled) -- fresh-workspace mint. Task-id is the
-# deterministic slug suffix so a second tick finds the workspace by
-# slug-ends-with-id. 4-hex constraint enforced at scheduled-tasks.nix,
-# cmd/kfactory/tick.go, and plugins/kfactory-adapter SLUG_RE.
+# [7] kfactory tick (scheduled) -- workspace creation when none
+# exists for the task. All three modes (skip-if-exists, skip-if-dirty,
+# continue) share this codepath: missing workspace -> mint + fire
+# initial_prompt. The mode only matters when a workspace ALREADY
+# exists (covered by phase 8). This phase asserts the mint path
+# directly under the default mode (skip-if-dirty).
+#
+# Task-id is the deterministic slug suffix so the matcher in phase 8
+# can find this workspace by slug-ends-with-id. 4-hex constraint
+# enforced at scheduled-tasks.nix, cmd/kfactory/tick.go, and
+# plugins/kfactory-adapter SLUG_RE.
 
 echo
-echo "[7] kfactory tick (scheduled) -- fresh-workspace path..."
+echo "[7] kfactory tick (scheduled) -- create-on-miss path..."
 TASK_ID="aaaa"
 
 # Sweep stale workspaces so we observe a real mint, not an idempotent no-op.
@@ -15,12 +22,12 @@ for wid in $EXISTING_IDS; do
   cli kfactory delete -y "$wid" >/dev/null 2>&1 || true
 done
 
-# KFACTORY_SCHEDULED_DIR overrides the /etc/kfactory/scheduled prod path.
+# KFACTORY_SCHEDULED_DIR overrides the /etc/kfactory/scheduled prod
+# path. No `mode` field -> defaults to skip-if-dirty.
 cli mkdir -p /tmp/kfactory-scheduled
 cli sh -c "cat > /tmp/kfactory-scheduled/${TASK_ID}.json" <<'JSON'
 {
   "repo": "file:///srv/test-repo.git",
-  "mode": "continue",
   "initial_prompt": "say hi and immediately stop",
   "continuation_prompt": "say bye and immediately stop"
 }
@@ -28,7 +35,7 @@ JSON
 
 TICK_WS=$(cli env KFACTORY_SCHEDULED_DIR=/tmp/kfactory-scheduled \
   kfactory tick "$TASK_ID")
-echo "      → fresh tick returned workspace $TICK_WS"
+echo "      → create-on-miss tick returned workspace $TICK_WS"
 
 # Confirm the slug is deterministic (ends in --<task-id>).
 TICK_SLUG=$(cli kfactory list 2>/dev/null | tail -n +2 |

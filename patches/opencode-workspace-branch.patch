@@ -21,14 +21,32 @@ Stacking: applies AFTER `opencode-bearer-and-routing` and BEFORE
 which neither neighbour modifies, so the stack is order-independent
 in practice.
 
+diff --git a/packages/opencode/src/control-plane/types.ts b/packages/opencode/src/control-plane/types.ts
+index daa8374..cddc601 100644
+--- a/packages/opencode/src/control-plane/types.ts
++++ b/packages/opencode/src/control-plane/types.ts
+@@ -10,6 +10,12 @@ export const WorkspaceInfo = Schema.Struct({
+   name: Schema.String,
+   branch: Schema.optional(Schema.NullOr(Schema.String)),
+   directory: Schema.optional(Schema.NullOr(Schema.String)),
++  // kfactory: enriched server-side per list call (handlers/workspace.ts)
++  // via `git status --porcelain` against the workspace directory.
++  // null = couldn't determine (no .git, broken clone, git binary
++  // missing); consumers fail-CLOSED on null to avoid clobbering
++  // unknown-state work.
++  dirty: Schema.optional(Schema.NullOr(Schema.Boolean)),
+   extra: Schema.optional(Schema.NullOr(Schema.Unknown)),
+   projectID: ProjectID,
+ }).annotate({ identifier: "Workspace" })
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
-index 2699c86..66dee88 100644
+index 2699c86..8952e22 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/workspace.ts
-@@ -4,11 +4,31 @@ import * as InstanceState from "@/effect/instance-state"
+@@ -4,11 +4,62 @@ import * as InstanceState from "@/effect/instance-state"
  import { Vcs } from "@/project/vcs"
  import { Effect } from "effect"
  import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
++import * as child_process from "node:child_process"
 +import * as fs from "node:fs"
 +import * as path from "node:path"
  import { InstanceHttpApi } from "../api"
@@ -54,10 +72,40 @@ index 2699c86..66dee88 100644
 +  }
 +}
 +
++// kfactory: shell `git status --porcelain` against the workspace and
++// return whether the working tree is dirty (untracked or modified
++// files present). Used by `kfactory tick` in skip-if-dirty mode to
++// gate dispatches over uncommitted work.
++//
++// Heavier than readBranchFromGitHead (child process vs file read)
++// but still single-digit ms per row for typical repos. Acceptable
++// because /experimental/workspace is a cold-path endpoint
++// (operator-driven, not per-event). 5s timeout caps the worst case
++// (huge index, NFS-backed worktree, etc.) so a slow check can't
++// stall the list response indefinitely.
++//
++// `execFileSync` (not exec/spawnSync-shell) -- the directory is a
++// schema-validated value but staying out of shell parsing entirely
++// is the right baseline. Returns undefined on any failure (missing
++// .git, git binary absent, timeout); consumers fail-CLOSED on
++// undefined.
++function gitStatusDirty(directory: string): boolean | undefined {
++  try {
++    const out = child_process.execFileSync(
++      "git",
++      ["-C", directory, "status", "--porcelain"],
++      { stdio: ["ignore", "pipe", "ignore"], timeout: 5000 },
++    )
++    return out.toString().trim().length > 0
++  } catch {
++    return undefined
++  }
++}
++
  export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspace", (handlers) =>
    Effect.gen(function* () {
      const workspace = yield* Workspace.Service
-@@ -19,7 +39,27 @@ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspac
+@@ -19,7 +70,46 @@ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspac
      })
  
      const list = Effect.fn("WorkspaceHttpApi.list")(function* () {
@@ -73,6 +121,13 @@ index 2699c86..66dee88 100644
 +      // -- no Git.Service dependency (would widen RouteRequirements
 +      // and break server.ts). Failures degrade to undefined branch
 +      // (broken-clone case, e.g. empty workspace dir with no .git).
++      //
++      // `dirty` is enriched alongside `branch` from the same row's
++      // directory, shelling `git status --porcelain` per row. Cost
++      // is one git subprocess per workspace; acceptable because the
++      // list endpoint is cold-path (operator-driven). Used by
++      // `kfactory tick` in skip-if-dirty mode to gate dispatches
++      // over uncommitted work.
 +      const rows = yield* workspace.list((yield* InstanceState.context).project)
 +      const branches = yield* Effect.forEach(
 +        rows,
@@ -82,7 +137,19 @@ index 2699c86..66dee88 100644
 +          ),
 +        { concurrency: "unbounded" },
 +      )
-+      return rows.map((row, i) => ({ ...row, branch: branches[i] ?? row.branch }))
++      const dirties = yield* Effect.forEach(
++        rows,
++        (row) =>
++          Effect.sync(() =>
++            row.directory ? gitStatusDirty(row.directory) : undefined,
++          ),
++        { concurrency: "unbounded" },
++      )
++      return rows.map((row, i) => ({
++        ...row,
++        branch: branches[i] ?? row.branch,
++        dirty: dirties[i] ?? null,
++      }))
      })
  
      const create = Effect.fn("WorkspaceHttpApi.create")(function* (ctx: { payload: typeof CreatePayload.Type }) {

@@ -3,18 +3,29 @@
 //   - Scheduled: `/etc/kfactory/scheduled/<ref>.json` exists. The
 //     config (repo, mode, initial_prompt, continuation_prompt) drives
 //     find-or-create of the workspace (slug suffix = task-id, so
-//     create is idempotent), then dispatches initial (new ws),
-//     continues into the most-recent session (existing + mode!=skip),
-//     or no-ops (existing + skip-if-exists).
+//     create is idempotent), then ALWAYS picks up the existing root
+//     session when the workspace exists; mode decides WHETHER to
+//     dispatch the continuation prompt.
 //
 //   - Ad-hoc: ref doesn't match a scheduled config; operator passes
 //     `--prompt TEXT` to inject into an existing workspace's session.
 //     Recovery path -- opencode-serve restarted, ping a mid-flight
 //     workspace to resume.
 //
+// Scheduled mode semantics (all three CREATE when the workspace
+// doesn't exist; the mode only matters when one already does):
+//   - skip-if-exists: workspace exists -> no-op (stdout = id, no
+//     prompt dispatched). Useful for "set up once, leave it alone."
+//   - skip-if-dirty (DEFAULT): workspace exists + git working tree
+//     clean -> dispatch continuation. Dirty -> no-op. Protects
+//     uncommitted work from being clobbered by the next prompt.
+//   - continue: workspace exists -> always dispatch the continuation.
+//     Equivalent to the previous behavior; no safety net.
+//
 // JSON schema is owned by THIS file. Required: repo, initial_prompt.
-// Optional: mode ("continue" | "skip-if-exists" | "fresh"; default
-// "continue"), continuation_prompt (defaults to initial_prompt).
+// Optional: mode ("skip-if-exists" | "skip-if-dirty" | "continue";
+// default "skip-if-dirty"), continuation_prompt (defaults to
+// initial_prompt).
 package main
 
 import (
@@ -164,13 +175,13 @@ func loadScheduledConfig(taskID string) (*scheduledTaskConfig, error) {
 		return nil, fmt.Errorf("%s: missing required field `initial_prompt`", path)
 	}
 	if cfg.Mode == "" {
-		cfg.Mode = "continue"
+		cfg.Mode = "skip-if-dirty"
 	}
 	switch cfg.Mode {
-	case "continue", "skip-if-exists", "fresh":
+	case "skip-if-exists", "skip-if-dirty", "continue":
 		// ok
 	default:
-		return nil, fmt.Errorf("%s: invalid mode %q (continue|skip-if-exists|fresh)", path, cfg.Mode)
+		return nil, fmt.Errorf("%s: invalid mode %q (skip-if-exists|skip-if-dirty|continue)", path, cfg.Mode)
 	}
 	if cfg.ContinuationPrompt == "" {
 		cfg.ContinuationPrompt = cfg.InitialPrompt
@@ -180,9 +191,7 @@ func loadScheduledConfig(taskID string) (*scheduledTaskConfig, error) {
 
 // kfactory-adapter mints scheduled-task workspaces with task-id as the
 // slug suffix via extra.slugSuffix; this is the canonical existence
-// check. `workspaces` MUST be pre-sorted (sortWorkspaces, id asc) -- in
-// `fresh` mode multiple workspaces with the same suffix can accumulate
-// and the sort makes "first match = oldest" deterministic.
+// check.
 func findWorkspaceBySuffix(workspaces []Workspace, taskID string) *Workspace {
 	suffix := "--" + taskID
 	for i := range workspaces {
@@ -198,32 +207,64 @@ func tickScheduled(ctx context.Context, tok *tokenFile, server, taskID string, c
 	if err != nil {
 		fail("tick: list workspaces: %v", err)
 	}
-	sortWorkspaces(all) // oldest with the suffix wins on duplicates (fresh-mode accumulation)
+	// Two concurrent ticks of the same task-id (timer vs operator,
+	// recovery-sweep vs scheduled fire) can each see existing==nil and
+	// both call createWorkspaceWithSuffix -- the kfactory-adapter
+	// allows duplicate slug-suffix workspaces. Sort by id ascending so
+	// findWorkspaceBySuffix consistently returns the OLDEST match, and
+	// every subsequent tick targets the same workspace.
+	sortWorkspaces(all)
 	existing := findWorkspaceBySuffix(all, taskID)
 
-	if cfg.Mode == "fresh" {
-		// Always mint; previous workspace orphaned (operator deletes
-		// manually). Slug suffix still pinned to taskID -- next tick
-		// finds the new one.
-		dispatchFresh(ctx, tok, server, taskID, cfg)
-		return
-	}
-
+	// All three modes mint the workspace when missing + fire
+	// initial_prompt. Mode only matters when a workspace already
+	// exists for this task-id.
 	if existing == nil {
-		dispatchFresh(ctx, tok, server, taskID, cfg)
+		fmt.Fprintf(os.Stderr, "kfactory: tick %s creating workspace for %s\n", taskID, cfg.Repo)
+		ws, err := createWorkspaceWithSuffix(ctx, tok, server, cfg.Repo, taskID)
+		if err != nil {
+			fail("tick: create workspace: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "kfactory: tick %s workspace %s (%s)\n", taskID, ws.ID, ws.Name)
+		dispatchSessionAndPrompt(ctx, tok, server, ws.ID, cfg.InitialPrompt)
 		return
 	}
 
-	if cfg.Mode == "skip-if-exists" {
+	switch cfg.Mode {
+	case "skip-if-exists":
 		fmt.Fprintf(os.Stderr,
 			"kfactory: tick %s skipped (workspace %s exists, mode=skip-if-exists)\n",
 			taskID, existing.ID)
 		// stdout stays uniform for machine consumers (`$(kfactory tick X)`).
 		fmt.Println(existing.ID)
 		return
+	case "skip-if-dirty":
+		// `dirty` is enriched server-side per request via the
+		// opencode-workspace-branch patch (same pattern as branch):
+		// the opencode-serve host shells `git status --porcelain`
+		// against the workspace directory at list time. A nil/null
+		// Dirty (broken probe, missing .git, non-git workspace) is
+		// fail-CLOSED -- treat as dirty so we don't dispatch over
+		// work whose state we can't confirm.
+		if existing.Dirty == nil {
+			fmt.Fprintf(os.Stderr,
+				"kfactory: tick %s skipped (workspace %s dirty-check returned no signal; treating as dirty)\n",
+				taskID, existing.ID)
+			fmt.Println(existing.ID)
+			return
+		}
+		if *existing.Dirty {
+			fmt.Fprintf(os.Stderr,
+				"kfactory: tick %s skipped (workspace %s dirty, mode=skip-if-dirty)\n",
+				taskID, existing.ID)
+			fmt.Println(existing.ID)
+			return
+		}
+		// Clean -> fall through to dispatch.
+	case "continue":
+		// Unconditional dispatch into the existing workspace.
 	}
 
-	// mode == "continue".
 	postContinuation(ctx, tok, server,
 		existing.ID,
 		cfg.ContinuationPrompt,
@@ -237,16 +278,6 @@ func tickScheduled(ctx context.Context, tok *tokenFile, server, taskID string, c
 			dispatchSessionAndPrompt(ctx, tok, server, existing.ID, cfg.InitialPrompt)
 		},
 	)
-}
-
-func dispatchFresh(ctx context.Context, tok *tokenFile, server, taskID string, cfg *scheduledTaskConfig) {
-	fmt.Fprintf(os.Stderr, "kfactory: tick %s creating workspace for %s\n", taskID, cfg.Repo)
-	ws, err := createWorkspaceWithSuffix(ctx, tok, server, cfg.Repo, taskID)
-	if err != nil {
-		fail("tick: create workspace: %v", err)
-	}
-	fmt.Fprintf(os.Stderr, "kfactory: tick %s workspace %s (%s)\n", taskID, ws.ID, ws.Name)
-	dispatchSessionAndPrompt(ctx, tok, server, ws.ID, cfg.InitialPrompt)
 }
 
 func dispatchSessionAndPrompt(ctx context.Context, tok *tokenFile, server, workspaceID, prompt string) {

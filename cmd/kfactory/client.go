@@ -25,15 +25,18 @@ func serverFor(t *tokenFile) string {
 	return defaultServer
 }
 
-// `Branch` enriched server-side per opencode-workspace-branch patch:
-// fresh .git/HEAD read per call. Empty = no .git in the workspace dir
-// (broken clone).
+// `Branch` + `Dirty` enriched server-side per
+// opencode-workspace-branch patch: fresh `.git/HEAD` read for Branch
+// (empty = no .git, broken clone) and `git status --porcelain` for
+// Dirty (nil = couldn't determine, treat as dirty per fail-closed
+// convention; *true / *false otherwise).
 type Workspace struct {
 	ID        string `json:"id"`
 	Type      string `json:"type"`
 	Name      string `json:"name"`
 	Branch    string `json:"branch"`
 	Directory string `json:"directory"`
+	Dirty     *bool  `json:"dirty,omitempty"`
 	ProjectID string `json:"projectID"`
 	TimeUsed  int64  `json:"timeUsed"`
 }
