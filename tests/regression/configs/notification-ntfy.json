@@ -1,9 +1,9 @@
 {
   "_comment": [
-    "ntfy plugin config for the e2e tests. The 'server' is the e2e tests'",
+    "ntfy plugin config for the regression tests. The 'server' is the regression tests'",
     "ntfy container reachable on the Docker bridge by name; 'topic' matches",
     "what the operator opens in the host browser at http://localhost:8080/<topic>.",
-    "notifyAfter uses shorthand duration ('3s' = 3 seconds) so the e2e tests",
+    "notifyAfter uses shorthand duration ('3s' = 3 seconds) so the regression tests",
     "loop can validate the wait window quickly. fetchTimeout same shape."
   ],
   "enabled": true,
@@ -22,7 +22,7 @@
     }
   },
   "backend": {
-    "topic": "kfactory-e2e",
+    "topic": "kfactory-regression",
     "server": "http://kfactory-ntfy:80",
     "priority": "default",
     "fetchTimeout": "5s"

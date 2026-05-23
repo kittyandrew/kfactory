@@ -56,13 +56,9 @@ export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number]
 
 // ---- Duration parsing ----
 //
-// Durations are shorthand strings: one or more `<number><unit>` segments
-// where unit is `h` / `m` / `s` (case-insensitive). Examples: `"3s"`,
-// `"5m"`, `"1h"`, `"1h30m"`, `"1h30m15s"`, `"0.5s"`. Whitespace
-// between segments is tolerated. `"0s"` means "no wait".
-//
-// Returns MILLISECONDS so callers can pass to setTimeout /
-// AbortSignal.timeout directly.
+// Shorthand strings: `<number><unit>` segments where unit ∈ h|m|s
+// (case-insensitive), e.g. `"3s"`, `"1h30m"`, `"0.5s"`, `"0s"`.
+// Returns MILLISECONDS (setTimeout/AbortSignal.timeout-compatible).
 
 const DURATION_RE = /^(?:\s*(\d+(?:\.\d+)?)\s*([hms])\s*)+$/i
 const DURATION_SEGMENT_RE = /(\d+(?:\.\d+)?)\s*([hms])/gi
@@ -84,9 +80,7 @@ export function parseDuration(s: string): number {
   return Math.round(totalSec * 1000)
 }
 
-// Resolve a duration config value to milliseconds. Returns undefined for
-// any non-string value so the caller can fall back to its own default;
-// throws on a string that doesn't parse as shorthand.
+// undefined for non-string (caller picks default); throws on bad string.
 function parseDurationMs(value: unknown): number | undefined {
   if (typeof value !== "string" || value.length === 0) return undefined
   return parseDuration(value)
@@ -97,13 +91,10 @@ function parseDurationMs(value: unknown): number | undefined {
 export interface ValueTemplate {
   readonly value: string
 }
-// Only value templates are supported. An earlier shape accepted a
-// {command: "..."} variant that ran the operator's shell with substituted
-// (LLM-controlled) values -- a footgun the operator can't reliably make
-// safe even with shell-quoting. Dynamic content for titles/messages is
-// still expressible via {env:VAR} / {file:path} substitution inside a
-// value template at config-load time; that's safe + sufficient for the
-// expected operator workflows.
+// Only {value: "..."} templates supported. The previously-accepted
+// {command: "..."} variant ran the operator's shell with LLM-controlled
+// substitutions -- unsafe-by-design. Dynamic content uses {env:VAR} /
+// {file:path} substitution at config-load time instead.
 export type ContentTemplate = ValueTemplate
 export type ContentTemplateMap = Partial<Record<NotificationEvent, ContentTemplate>>
 
@@ -132,10 +123,9 @@ export interface EventConfig {
 const VALID_PRIORITIES = ["min", "low", "default", "high", "max"] as const
 export type NtfyPriority = (typeof VALID_PRIORITIES)[number]
 
-// fetchTimeout defaults to 10s. A hung ntfy server otherwise stalls the
-// plugin's event hook indefinitely (the dispatcher awaits each Hook.event
-// call), which can starve other plugin work. Operators override via
-// `fetchTimeout: "30s"` etc. in the config file.
+// Default 10s: a hung ntfy server otherwise stalls Hook.event
+// indefinitely (dispatcher awaits) and starves other plugin work.
+// Override via `fetchTimeout: "30s"` in the config file.
 export const DEFAULT_FETCH_TIMEOUT_MS = 10_000
 
 export interface NtfyBackendConfig {
@@ -185,9 +175,7 @@ function substituteString(value: string, configDir: string): string {
     try {
       return readFileSync(resolved, "utf-8").trim()
     } catch (err) {
-      // Surface the failure: silent empty here is how an operator
-      // ends up with unauthenticated 401s downstream and no clue why.
-      // Log the resolved path so a typo is obvious.
+      // Log loudly: silent empty here causes 401s downstream with no clue why.
       const msg = err instanceof Error ? err.message : String(err)
       console.warn(`ntfy: config {file:${filePath}} -- read failed at ${resolved}: ${msg}; substituting empty`)
       return ""
@@ -305,13 +293,9 @@ export function parsePluginConfig(content: string, configDir: string): NtfyPlugi
     }
   }
 
-  // When the operator has set enabled:false they're saying "don't send
-  // notifications". Skip backend validation entirely so a config without
-  // a topic isn't a hard error -- the plugin runs disabled (no events
-  // ever schedule a send) and parseBackendConfig's "topic required"
-  // throw doesn't bubble out as a confusing "config invalid" message.
-  // Return an inert backend so downstream code keeps its non-null
-  // contract; nothing in the plugin actually reads it when !enabled.
+  // Skip backend validation when disabled -- a topic-less config
+  // shouldn't error. Inert backend keeps the non-null contract;
+  // nothing reads it when !enabled.
   if (!enabled) {
     const backend: NtfyBackendConfig = {
       topic: "",

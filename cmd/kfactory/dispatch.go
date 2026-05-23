@@ -1,15 +1,6 @@
-// `kfactory dispatch <repo-url> <prompt...>` is the autonomous-launch shape:
-// create a workspace for the github repo, open a fresh session, fire the
-// prompt at it asynchronously. kfactory returns as soon as the prompt is
-// accepted (the model loop runs server-side; close kfactory, walk away).
-//
-// To watch the agent: `kfactory attach <id>` (always adds --continue, so it
-// drops into the just-dispatched session).
-//
-// Both args are required. Empty prompts are rejected: dispatch without a
-// prompt has no use case in this CLI's UX -- if you want a bare workspace
-// to poke at via the SPA, hit opencode's /experimental/workspace
-// endpoint directly.
+// `kfactory dispatch <repo-url> <prompt...>`: create workspace, open
+// session, queue prompt; returns once accepted. Operator can `attach
+// <id>` to watch (always --continue, lands on the dispatched session).
 package main
 
 import (
@@ -30,9 +21,7 @@ func runDispatch(args []string) {
 		fail("dispatch: prompt is required (got empty after trim)")
 	}
 
-	// Clone is the slow step (~5-10s for a fresh repo). prompt_async
-	// returns immediately after the message is queued; the model loop
-	// runs server-side in the background.
+	// 3min budget mostly for the clone step (~5-10s for a fresh repo).
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
@@ -68,6 +57,5 @@ func runDispatch(args []string) {
 	}
 
 	fmt.Fprintf(os.Stderr, "kfactory: dispatched. attach with: kfactory attach %s\n", ws.ID)
-	// stdout = workspace id so callers can pipe it.
-	fmt.Println(ws.ID)
+	fmt.Println(ws.ID) // stdout = workspace id (pipeable)
 }

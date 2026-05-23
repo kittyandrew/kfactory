@@ -1,22 +1,13 @@
-# [7/9] kfactory tick (scheduled) -- fresh-workspace mint.
-#
-# Task-id is the deterministic slug suffix, so the second tick finds
-# the existing workspace by slug-ends-with-id. Format: exactly four
-# lowercase hex chars -- same shape as a random workspace slug
-# suffix, so scheduled-task workspaces are indistinguishable from
-# random ones at the slug level. The constraint is enforced
-# end-to-end:
-#   - modules/scheduled-tasks.nix:validTaskID (eval-time)
-#   - cmd/kfactory/tick.go:taskIDPattern (CLI-side)
-#   - plugins/kfactory-adapter/src/index.ts:SLUG_RE (workspace-create
-#     boundary)
+# [7/9] tick (scheduled) -- fresh-workspace mint. Task-id is the
+# deterministic slug suffix so a second tick finds the workspace by
+# slug-ends-with-id. 4-hex constraint enforced at scheduled-tasks.nix,
+# cmd/kfactory/tick.go, and plugins/kfactory-adapter SLUG_RE.
 
 echo
 echo "[7/9] kfactory tick (scheduled) -- fresh-workspace path..."
 TASK_ID="aaaa"
 
-# Sweep any leftover workspace from a previous dev-test run; we want
-# to observe a real mint, not an idempotent no-op on a stale slug.
+# Sweep stale workspaces so we observe a real mint, not an idempotent no-op.
 EXISTING_IDS=$(cli kfactory list 2>/dev/null | tail -n +2 |
   awk -v t="$TASK_ID" '$3 ~ ("--" t "$") { print $2 }')
 for wid in $EXISTING_IDS; do
@@ -24,12 +15,7 @@ for wid in $EXISTING_IDS; do
   cli kfactory delete -y "$wid" >/dev/null 2>&1 || true
 done
 
-# Write the scheduled config. KFACTORY_SCHEDULED_DIR overrides the
-# production /etc/kfactory/scheduled path so the test never needs
-# root or an /etc mount. The cli container is rootless-ish; /tmp is
-# writable. The JSON body lives at the outer script's column 0 so
-# it lands on disk unindented (per ThermoNuclear F3 -- earlier shape
-# wrote whitespace-prefixed JSON that worked but looked sloppy).
+# KFACTORY_SCHEDULED_DIR overrides the /etc/kfactory/scheduled prod path.
 cli mkdir -p /tmp/kfactory-scheduled
 cli sh -c "cat > /tmp/kfactory-scheduled/${TASK_ID}.json" <<'JSON'
 {

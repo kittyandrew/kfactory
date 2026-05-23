@@ -3,9 +3,6 @@
 in
   pkgs.writeShellApplication {
     name = "dev-down";
-    # `docker` is bin-only here -- the script talks to whatever daemon
-    # is on the host (typically /var/run/docker.sock). docker-client
-    # is the slim CLI-only derivation and is fine for that.
     runtimeInputs = [pkgs.docker-client];
     text = ''
       if ! command -v docker &>/dev/null; then

@@ -168,8 +168,6 @@ in {
       })
       cfg.tasks;
 
-    # Write one JSON config file per task. /etc/kfactory/scheduled/<id>.json
-    # is the path `kfactory tick <id>` reads at fire time.
     environment.etc = lib.mapAttrs' (id: task:
       lib.nameValuePair "kfactory/scheduled/${id}.json" {
         text = taskJSON task;
@@ -177,28 +175,22 @@ in {
       })
     cfg.tasks;
 
-    # Generate one .service + .timer per task. The service is one-shot;
-    # the timer fires on the configured schedule. The unit's User= is
-    # the configured operator; XDG_CONFIG_HOME points at their config
-    # so ensureFresh can locate auth.json.
+    # One .service + .timer per task.
     systemd.services = lib.mapAttrs' (id: _task:
       lib.nameValuePair "kfactory-tick-${id}" {
         description = "kfactory scheduled task: ${id}";
         serviceConfig = {
           Type = "oneshot";
           User = cfg.user;
-          # XDG_CONFIG_HOME locates kfactory/auth.json; same path the
-          # operator's interactive `kfactory auth login` writes to.
-          Environment = "XDG_CONFIG_HOME=/home/${cfg.user}/.config";
-          # The default systemd hardening profile is fine here -- this
-          # is a network-bound CLI invocation, no privileged ops.
-          # Restart=no: failed ticks are reported (journalctl), not
-          # retried within the unit. The next scheduled fire will
-          # re-attempt; transient failures self-heal at cron tempo.
+          # XDG_CONFIG_HOME locates kfactory/auth.json. Resolve via
+          # `users.users.<name>.home` -- non-/home deployments (e.g.
+          # `/var/lib/factory/<user>`) place auth.json outside `/home/`.
+          Environment = "XDG_CONFIG_HOME=${config.users.users.${cfg.user}.home}/.config";
+          # Restart=no: failed ticks logged (journalctl), not retried
+          # within the unit -- the next scheduled fire re-attempts;
+          # transient failures self-heal at cron tempo.
           Restart = "no";
         };
-        # Pass the task-id positional; tick reads the JSON at
-        # /etc/kfactory/scheduled/<id>.json (default path).
         script = "${cfg.package}/bin/kfactory tick ${id}";
       })
     cfg.tasks;

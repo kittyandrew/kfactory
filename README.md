@@ -196,7 +196,7 @@ resolution; the actual source lands in `$out` of `packages.<name>` at
 build time via `mkThirdPartyPlugin`. Adding an entry to
 `thirdPartyPluginSrcs` in `flake.nix` auto-registers the
 `packages.<name>` output, a `factory-<name>-smoke` flake check, and
-the e2e tests opencode.json plugin-list entry -- same auto-reg model
+the regression-tests opencode.json plugin-list entry -- same auto-reg model
 as kfactory-owned plugins, just one extra step (carrier + lockfile
 generation, which needs network and so happens out-of-sandbox).
 Workflow: `.claude/rules/050-third-party-nix-plugins.md`.

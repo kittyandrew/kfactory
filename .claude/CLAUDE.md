@@ -24,9 +24,9 @@ modules/                     NixOS modules: scheduled-tasks.nix (timer-driven
                              lifecycle: heal ExecStartPre + sync-kick & recovery-
                              sweep ExecStartPost). Exposed via flake.nix
                              `nixosModules = { scheduledTasks; recovery; };`
-tests/e2e/                   Docker-based E2E test environment + lifecycle scripts
-                             (dev-up / dev-down / dev-clean / dev-test) + plugin/auth
-                             configs the test images consume
+tests/regression/            Docker-based regression test environment + lifecycle
+                             scripts (dev-up / dev-down / dev-clean / dev-test) +
+                             plugin/auth configs the test images consume
 docs/spec.md                 architecture intent + decisions log (portable; no kittyos refs)
 flake.nix                    packages.kfactory + plugins.* + patches.* + checks.* + devShells.default
 .github/workflows/           check.yml (single job: lint + flake check + attic push on default-branch push)
@@ -46,8 +46,9 @@ via `nix develop -c <cmd>`. To match CI locally, prefix with `nix develop -c`.
 - `nix develop -c actionlint && nix develop -c zizmor .github/workflows`
   -- workflow lint + security audit.
 - `nix develop -c betterleaks dir . --no-banner --redact` -- secrets
-  scan. Allowlist for e2e fake-token fixtures in `.betterleaks.toml`
-  (prefilter on `tests/e2e/configs/` + `e2e-fake-*` pattern filter).
+  scan. Allowlist for regression-tests fake-token fixtures in
+  `.betterleaks.toml` (prefilter on `tests/regression/configs/` +
+  `regression-fake-*` pattern filter).
 - `nix flake check` -- builds every `packages.${system}.*` (registered
   as checks via `flake.nix`) plus the bespoke `factory-*` checks defined
   in the `checks` attrset. The authoritative list lives in `flake.nix`;

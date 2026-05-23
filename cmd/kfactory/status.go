@@ -1,15 +1,9 @@
-// `kfactory auth status`: show who the operator is logged in as, the
-// access-token expiry state, whether a refresh token is present, and
-// (with --verify, the default) whether the server actually accepts the
-// current token. Exit codes follow the cross-component contract in
-// exit.go: exitOK if usable, exitNotLoggedIn if no token / token
-// rejected, exitOther for build/network/other failures.
+// `kfactory auth status`: identity + expiry + (with --verify, default)
+// server-acceptance. Exit codes per exit.go.
 //
-// @WARNING: NOT side-effect-free. The verify path goes through
-//
-//	ensureFresh, which rotates persisted state if the access token is
-//	expired (POSTs the refresh_token, atomic-renames the new tokens).
-//	Use `--no-verify` for a truly read-only inspection.
+// @WARNING: NOT side-effect-free -- the verify path goes through
+// ensureFresh, which rotates persisted state if the access token is
+// expired. Use `--no-verify` for read-only inspection.
 package main
 
 import (
@@ -45,7 +39,6 @@ func runAuthStatus(args []string) {
 
 	server := serverFor(t)
 
-	// Stale-aware access-token formatting.
 	now := time.Now()
 	accessLine := "expired"
 	if t.ExpiresAt.After(now) {
@@ -75,24 +68,19 @@ func runAuthStatus(args []string) {
 		return
 	}
 
-	// Server-side reachability + token validity. ensureFresh will use a
-	// refresh token if the access is stale, then we GET /experimental/workspace
-	// (the cheapest endpoint that requires bearer auth) and report.
+	// ensureFresh refreshes if stale; then GET /experimental/workspace
+	// (cheapest bearer-auth'd endpoint) to verify acceptance.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	fresh, err := ensureFresh(ctx)
 	if err != nil {
 		fmt.Printf("  server:    ✗ cannot refresh token (%v)\n", err)
-		// errNotLoggedIn = refresh_token rejected; anything else =
-		// transient (M2 work in ensureFresh classifies these).
 		if errors.Is(err, errNotLoggedIn) {
 			os.Exit(exitNotLoggedIn)
 		}
 		os.Exit(exitOther)
 	}
-	// Refresh may have rotated `t` -- re-pull. Note: t and fresh point
-	// to the same file content after ensureFresh persisted any rotation.
 	t = fresh
 
 	req, err := newRequest(ctx, t, server, http.MethodGet, "/experimental/workspace", nil)
@@ -100,9 +88,6 @@ func runAuthStatus(args []string) {
 		fmt.Printf("  verify:    ✗ build request: %v\n", err)
 		os.Exit(exitOther)
 	}
-	// Reuse the package-level client; the 10s budget here comes from
-	// the ctx above (`context.WithTimeout(... 10*time.Second)`), which
-	// is tighter than httpClient.Timeout (60s) and wins.
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("  verify:    ✗ unreachable (%v)\n", err)
@@ -124,8 +109,8 @@ func runAuthStatus(args []string) {
 	}
 }
 
-// truncDur rounds a duration to second precision under 5 minutes and to
-// minute precision above that. Avoids "11h53m42.18s" in the status output.
+// Second-precision under 5m, minute-precision above. Avoids
+// "11h53m42.18s" in the status output.
 func truncDur(d time.Duration) string {
 	if d < 5*time.Minute {
 		return d.Truncate(time.Second).String()

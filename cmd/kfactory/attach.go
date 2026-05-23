@@ -1,8 +1,6 @@
-// `kfactory attach` resolves a workspace ref (id or slug), refreshes the
-// access token, and execs `opencode attach <server> --bearer <token>
-// --workspace <id> --continue` in the current terminal. One specific
-// way: always continue the most recent session for the workspace. If
-// no prior session exists opencode falls back to home view silently.
+// `kfactory attach` resolves a ref, refreshes, execs `opencode attach
+// <server> --workspace <id> --continue`. Always continues the most-
+// recent session; opencode falls back to home view if none exists.
 package main
 
 import (
@@ -38,26 +36,19 @@ func runAttach(args []string) {
 		fail("attach: opencode not on PATH: %v", err)
 	}
 
-	// The patched opencode TUI spawns `kfactory auth refresh` as a
-	// subprocess when its bearer nears expiry (see
-	// patches/opencode-kfactory-refresh.patch). If `kfactory` itself
-	// isn't on PATH at the point the TUI runs, refresh fails forever
-	// and the operator only finds out after the first 401 mid-session.
-	// Surface early.
+	// The patched TUI spawns `kfactory auth refresh` on near-expiry
+	// (opencode-kfactory-refresh.patch); without kfactory on PATH the
+	// operator only finds out via mid-session 401. Surface early.
 	if _, err := exec.LookPath("kfactory"); err != nil {
 		fail("attach: kfactory not on PATH for subprocess refresh: %v\n"+
 			"       opencode TUI will fail to refresh the access token; reattach won't help",
 			err)
 	}
 
-	// Shared refresh-token cache: the opencode TUI (patched via
-	// patches/opencode-kfactory-refresh.patch) reads
-	// OPENCODE_SERVER_BEARER_CACHE_PATH and pulls the access token from
-	// the file at attach time. When the token nears expiry the TUI
-	// spawns `kfactory auth refresh` (subprocess) which refreshes under a
-	// flock-coordinated path in kfactory and rewrites the file; the TUI
-	// then re-reads. kfactory never has to pre-stage the token into the
-	// environment -- the file IS the single source of truth.
+	// Shared token cache: TUI reads OPENCODE_SERVER_BEARER_CACHE_PATH,
+	// spawns `kfactory auth refresh` on near-expiry (flock-coordinated
+	// rewrite), then re-reads. The file is the single source of truth;
+	// kfactory never pre-stages the token into the env.
 	cachePath, err := tokenPath()
 	if err != nil {
 		fail("attach: resolve token path: %v", err)

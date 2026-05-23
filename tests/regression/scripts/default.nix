@@ -1,4 +1,4 @@
-# Lifecycle scripts for the kfactory E2E test environment.
+# Lifecycle scripts for the kfactory regression test environment.
 # One file per command, registered here. `nix run .#dev-up` etc.
 # resolve through flake.nix's `apps` attrset.
 {pkgs}: {

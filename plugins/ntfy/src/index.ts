@@ -27,31 +27,20 @@
 //   - github.com/lannuttia/opencode-notification-sdk @ a5bd684df1e16e0bbe0faa8b42b8202cf74dd3e1
 //
 // kfactory modifications (AGPLv3, see top-level LICENSE):
-//   - Event routing + subagent suppression (formerly in
-//     opencode-notification-sdk/src/plugin-factory.ts) is inlined here so
-//     the wait + skip-on-connect logic can intercept before send.
-//   - Per-event `notifyAfter` wait window: after a notification-trigger
-//     event fires, the plugin defers `backend.send()` by N ms. During
-//     that window, if ANY opencode subscriber connects to this workspace,
-//     the pending send is cancelled (sticky -- subsequent detaches don't
-//     re-arm). Once cancelled, the operator must take a new action to
-//     trigger another notification.
-//   - `kfactory.subscribers.changed` is the bus event published by the
-//     `opencode-session-subscribers` patch on every SSE attach/detach.
-//     The plugin tracks the latest count and reacts. Plugin works on
-//     unpatched opencode too -- the count stays at 0 (never observed
-//     incrementing), so every event fires after its `notifyAfter`
-//     wait. Useful for development / single-attach deployments.
-//
-// Plugin entry point. The npm-package shape is honored via package.json's
-// `exports["./server"]` field; opencode's PluginLoader follows that.
+//   - Event routing + subagent suppression inlined (formerly in
+//     opencode-notification-sdk) so wait + skip-on-connect can
+//     intercept before send.
+//   - Per-event `notifyAfter` wait window: defers backend.send() by
+//     N ms; subscriber attach cancels in-flight timers (not re-armed
+//     on detach; later events for the same key start fresh windows).
+//   - `kfactory.subscribers.changed` is the bus event from the
+//     opencode-session-subscribers patch (absolute per-workspace
+//     count). On unpatched opencode the count stays 0 and every
+//     event fires after its wait -- useful for dev / single-attach.
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { spawnSync } from "node:child_process"
 import { basename } from "node:path"
 
-// `PluginInput["client"]` is the full opencode SDK client (returned by
-// `createOpencodeClient`). Aliased here so signatures inside this file
-// don't repeat the indexed-access type.
 type OpencodeClient = PluginInput["client"]
 import {
   loadConfig,
@@ -63,20 +52,11 @@ import { sendNtfy, type EventMetadata, type NotificationContext } from "./backen
 
 // ---- Subagent check ----
 
-// A session is a SUBAGENT (child) session if its row carries a non-empty
-// parentID. opencode dispatches subagent loops as children of the operator's
-// session; firing ntfy for every subagent idle/error would flood. Suppress.
-// Fail-CLOSED: if the lookup fails (network, missing session), treat the
-// session as a subagent and suppress. The operator who installed ntfy is
-// implicitly choosing fewer-but-correct notifications; a missed
-// notification on a network blip is recoverable, a noisy false-positive
-// stream of subagent notifications during a long task is not.
-//
-// Returns a closure that memoizes successful lookups per sessionID.
-// parentID is immutable after session creation, so caching forever is
-// safe. Failures are NOT cached -- a transient blip shouldn't pin the
-// session as a subagent for the plugin's lifetime; the next event
-// retries. Map sits in the plugin-instance closure (per-workspace).
+// A session with non-empty parentID is a subagent (child of the operator's
+// session). Firing ntfy per-subagent floods; suppress. Fail-CLOSED on
+// lookup error: missed notification recoverable, noisy false-positive
+// stream is not. parentID is immutable so successful lookups memoize
+// forever; failures don't cache (next event retries).
 function makeSubagentChecker(client: OpencodeClient): (sessionId: string) => Promise<boolean> {
   const cache = new Map<string, boolean>()
   return async function isSubagent(sessionId: string): Promise<boolean> {
@@ -101,24 +81,13 @@ function nowISO(): string {
   return new Date().toISOString()
 }
 
-// `KFACTORY_ADAPTER_GIT` is the same env var the kfactory-adapter
-// plugin uses for its git path (see plugins/kfactory-adapter/src/
-// index.ts -- "PATH-resolved defaults work in interactive shells
-// but FAIL under systemd User= units, which sanitize PATH down to a
-// minimal coreutils/findutils/grep set"). Reusing the SAME var here
-// rather than minting a separate `KFACTORY_NTFY_GIT` because
-// operators wire one absolute git path per deployment; an asymmetric
-// wiring (adapter resolves git, ntfy doesn't) is exactly the silent
-// systemd-PATH degradation that turns notification bodies into
-// `<slug> · no-git` on healthy workspaces.
+// Shared with kfactory-adapter (one absolute git path per deployment;
+// asymmetric wiring under systemd PATH sanitization turns notification
+// bodies into `<slug> · no-git` on healthy workspaces).
 const GIT = process.env.KFACTORY_ADAPTER_GIT ?? "git"
 
-// Resolve the workspace's current git branch at NOTIFICATION time.
-// Run `git rev-parse --abbrev-ref HEAD` inside the workspace dir; on
-// detached HEAD this prints "HEAD" which we re-label to "detached" for
-// readability. If the dir isn't a repo at all (e.g. clone failed
-// mid-create -- waybap incident) we return "no-git" so the body still
-// renders a meaningful "<slug> · no-git" rather than an empty trailer.
+// Detached HEAD -> "detached"; non-repo (e.g. clone failed mid-create)
+// -> "no-git" so the body still renders a meaningful trailer.
 function resolveBranch(directory: string): string {
   try {
     const r = spawnSync(GIT, ["-C", directory, "rev-parse", "--abbrev-ref", "HEAD"], {
@@ -142,12 +111,8 @@ function extractIdle(
   return { sessionId: props.sessionID, projectName, branch, timestamp: nowISO() }
 }
 
-// The session.error event's `error` is a discriminated union of opencode's
-// NamedError shapes (ProviderAuthError | UnknownError | etc. -- see
-// @opencode-ai/sdk's gen/types.gen.ts). All variants share `data.message:
-// string`. Read it via optional chaining + a type guard on the leaf
-// string. Returning undefined is fine; the operator still gets the
-// notification with default messaging, just no error context.
+// opencode's NamedError union (ProviderAuthError | UnknownError | etc.)
+// always carries `data.message: string`.
 function errorMessage(v: unknown): string | undefined {
   const msg = (v as { data?: { message?: unknown } } | null | undefined)?.data?.message
   return typeof msg === "string" ? msg : undefined
@@ -194,10 +159,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // ---- Plugin ----
 
 const Ntfy: Plugin = async (input) => {
-  // Config load failure should NOT crash opencode boot. Log + disable
-  // the plugin instead -- the host process matters more than
-  // notifications. `info` rather than `warn`: this is a configuration
-  // STATE (operator hasn't set up notifications yet), not a malfunction.
+  // Config load failure should NOT crash opencode boot. `info`
+  // because missing config = "not set up yet", not a malfunction.
   let config: NtfyPluginConfig
   try {
     config = loadConfig()
@@ -213,38 +176,20 @@ const Ntfy: Plugin = async (input) => {
 
   // ---- Subscriber-tracking state ----
   //
-  // Updated by `kfactory.subscribers.changed` bus events from the
-  // opencode-session-subscribers patch. The patch publishes the
-  // ABSOLUTE per-workspace subscriber count (not a delta), so we
-  // assign it directly. `>0` means an SSE / web client is attached --
-  // the operator can see events live, so new notifications are skipped
-  // and any pending (within-notifyAfter) ones are cancelled.
+  // `kfactory.subscribers.changed` publishes the ABSOLUTE per-workspace
+  // count (not a delta) so we assign directly. Transitions:
+  //   0 -> >0  cancel ALL in-flight timers (operator just attached)
+  //   >0 -> 0  no-op (next event evaluates fresh; cancelled timers
+  //            are NOT re-armed)
+  // Cold start while already-attached: next publish (their detach or
+  // a new attach) brings us into sync; absolute-count semantics
+  // sidesteps the accumulator-desync class.
   //
-  // Semantics on subscriber transition:
-  //   count 0 -> >0  cancel ALL in-flight timers (operator just attached)
-  //   count >0 -> 0  no-op (next event will schedule a fresh timer if
-  //                  appropriate; we do NOT re-arm timers that were
-  //                  cancelled by the attach)
-  // Cancellation is per-timer, not per-key. A subsequent event for the
-  // same (sessionID, eventType) -- after the cancel -- creates a fresh
-  // timer and the fresh window decides fresh.
-  //
-  // Cold start: if the plugin loads while a subscriber is already
-  // attached, we missed the publish announcing them. The next publish
-  // (the subscriber's detach, or a new subscriber's attach) brings us
-  // into sync immediately. Absolute-count semantics removes the
-  // accumulator-desync class that a delta-based protocol had.
-  //
-  // Granularity: count is **per-workspace**, NOT per-session. The
-  // upstream patch publishes the absolute count on the workspace
-  // instance bus, which is workspace-scoped. Consequence: attaching
-  // an SSE subscriber to ANY session inside a workspace suppresses
-  // (and cancels in-flight) notifications for ALL sessions in that
-  // workspace. This is the intended semantic -- "watching" is a
-  // workspace-level concept and operators typically rotate between
-  // sessions within a workspace -- but it means concurrent sessions
-  // in the same workspace will all stay silent while you're tailing
-  // any one of them.
+  // Granularity is per-workspace (the patch publishes on the workspace
+  // bus). Subscribing to ANY session in a workspace suppresses ALL
+  // notifications for the workspace -- intended ("watching" is
+  // workspace-level), but concurrent sessions stay silent while
+  // tailing any one.
   let subscriberCount = 0
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
 
@@ -299,29 +244,19 @@ const Ntfy: Plugin = async (input) => {
     const eventCfg = config.events[event]
     if (!eventCfg.enabled) return
 
-    // Drop any event with an empty sessionID. session.error is the
-    // realistic case (cause: server-side dispatch before a session is
-    // established); session.idle and permission.asked gate sessionID
-    // to non-empty strings at parse time so this is defense in depth
-    // for them. The reason to drop unconditionally: timerKey("", event)
-    // = "|<event>" collides across calls for the same event, so a
-    // second empty-sessionID arrival of the same event would replace
-    // the first's pending timer instead of scheduling its own. Better
-    // to drop than to silently coalesce.
+    // Drop empty-sessionID events: timerKey("", event) collides
+    // across calls, so a coalesce would silently overwrite pending
+    // timers. session.error is the realistic empty case (server-side
+    // dispatch before a session is established).
     if (sessionID === "") {
       console.info(`ntfy: dropping ${event} notification: empty sessionID`)
       return
     }
 
-    // Subagent suppression -- before scheduling timers we don't need.
     if (await isSubagent(sessionID)) return
-
-    // If a subscriber is currently attached at event time, suppress THIS
-    // notification entirely. A subsequent event after they detach will
-    // schedule a fresh timer normally -- we do NOT track per-key sticky
-    // state, so the next event gets a clean evaluation. Non-configurable:
-    // the plugin's stated purpose is "notify only when nobody's
-    // watching" so an opt-out doesn't make sense.
+    // Subscriber attached at event time -> suppress unconditionally
+    // (non-configurable: "notify when nobody's watching" is the
+    // plugin's stated purpose). Next event evaluates fresh.
     if (subscriberCount > 0) return
 
     const key = timerKey(sessionID, event)
@@ -331,19 +266,14 @@ const Ntfy: Plugin = async (input) => {
 
   return {
     async event({ event }) {
-      // The published @opencode-ai/plugin Event union doesn't cover
-      // permission.asked or our kfactory.subscribers.changed; widen via
-      // string for a single dispatch table that handles all four cases
-      // consistently. Per-branch we cast properties into the narrow shape
-      // the handler needs.
+      // @opencode-ai/plugin's Event union doesn't cover permission.asked
+      // or kfactory.subscribers.changed; widen via string for a single
+      // dispatch handling all four cases.
       const evt = event as { type: string; properties?: unknown }
       const props = evt.properties
 
       switch (evt.type) {
         case "kfactory.subscribers.changed": {
-          // The opencode-session-subscribers patch publishes the absolute
-          // per-workspace count. We trust it directly -- no accumulation,
-          // no clamping, no cold-start asymmetry.
           if (!isRecord(props) || typeof props.count !== "number") return
           const prev = subscriberCount
           subscriberCount = props.count
@@ -353,14 +283,8 @@ const Ntfy: Plugin = async (input) => {
           return
         }
         case "permission.asked": {
-          // The opencode permission.asked event ships the
-          // PermissionRequest schema (packages/opencode/src/permission/
-          // index.ts:32-44): {permission: string, patterns: Array<string>,
-          // sessionID, metadata, always, tool?}. An earlier shape of this
-          // handler read `props.type` and `props.pattern` (singular) --
-          // wrong field names -- so every permission.asked notification
-          // shipped with empty permissionType + undefined
-          // permissionPatterns since carve-out. Fixed.
+          // Schema: {permission, patterns: string[], sessionID, ...} per
+          // packages/opencode/src/permission/index.ts.
           if (!isRecord(props)) return
           const sessionID = typeof props.sessionID === "string" ? props.sessionID : ""
           const permission = typeof props.permission === "string" ? props.permission : ""

@@ -33,8 +33,8 @@ NTFY_URL="http://localhost:${NTFY_PORT}"
 TOPIC="$NTFY_TOPIC"
 # The bearer the opencode container's healthcheck accepts (server
 # runs unauthenticated; any non-empty bearer passes). Same value
-# baked into tests/e2e/configs/auth.json.
-TOKEN="e2e-fake-bearer"
+# baked into tests/regression/configs/auth.json.
+TOKEN="regression-fake-bearer"
 OPENCODE_DB=/root/.local/share/opencode/opencode.db
 OPENCODE_BASE="http://${OPENCODE_CONTAINER}:4096"
 
@@ -45,5 +45,5 @@ OPENCODE_BASE="http://${OPENCODE_CONTAINER}:4096"
 
 echo
 echo "========================================================"
-echo " kfactory e2e validation"
+echo " kfactory regression validation"
 echo "========================================================"

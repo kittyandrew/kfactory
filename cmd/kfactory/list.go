@@ -32,9 +32,8 @@ func runList(args []string) {
 		return
 	}
 
-	// Stable order: by id ascending = creation order. The 1-based index
-	// shown here is the same one `kfactory attach <n>` resolves -- pick a
-	// row by its leading number.
+	// id-asc = creation order; the printed 1-based index matches
+	// `kfactory attach <n>`.
 	sortWorkspaces(ws)
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)

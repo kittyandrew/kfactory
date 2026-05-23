@@ -49,7 +49,7 @@ in {
         `kfactory` overridden via overrideAttrs/ldflags for their
         endpoint defaults).
       '';
-      example = lib.literalExpression "inputs.kfactory.packages.\${pkgs.system}";
+      example = lib.literalExpression "inputs.kfactory.packages.\${pkgs.stdenv.hostPlatform.system}";
     };
 
     user = lib.mkOption {
@@ -154,20 +154,12 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    # Recovery-sweep helper. Reads the queue heal emitted; loops over
-    # the workspace IDs; ticks each one with `--prompt <recovery-prompt>`.
-    # Empty queue (heal found nothing) -> instant no-op via the loop
-    # body never running. Failure on a single workspace logs and
-    # continues; doesn't block restart of opencode-serve.
+    # Per-workspace failure logs + continues; never blocks restart.
     systemd.services.${cfg.opencodeServiceName} = let
       recoverySweep = pkgs.writeShellApplication {
         name = "kfactory-recovery-sweep";
         runtimeInputs = [pkgs.jq pkgs.coreutils cfg.packages.kfactory];
         text = ''
-          # Usage: kfactory-recovery-sweep (no args; queue path via
-          # KFACTORY_RECOVERY_QUEUE env, recovery prompt via
-          # KFACTORY_RECOVERY_PROMPT).
-
           QUEUE=''${KFACTORY_RECOVERY_QUEUE:-${cfg.queuePath}}
           if [ ! -f "$QUEUE" ]; then
             echo "kfactory-recovery-sweep: no queue at $QUEUE; nothing to do"
@@ -187,38 +179,30 @@ in {
         '';
       };
     in {
-      # systemd merges ExecStartPre / ExecStartPost across attribute
-      # writes (NixOS concatenates list-shaped fields), so this
-      # appends to whatever the operator's opencode-serve unit already
-      # has.
+      # ExecStartPre/Post are list-shaped: NixOS concatenates rather
+      # than clobbers, so this appends to the operator's unit.
+      # recovery-sweep needs auth.json (mode 0600) so it must run as
+      # cfg.user; heal + sync-kick inherit the unit's User= and only
+      # need DB / internal-API access (no auth.json read).
       serviceConfig = {
         ExecStartPre = ["${cfg.packages.opencode-heal}/bin/opencode-heal ${lib.escapeShellArg cfg.opencodeDB}"];
         ExecStartPost = [
           "${cfg.packages.opencode-sync-kick}/bin/opencode-sync-kick --base ${cfg.opencodeBaseURL} --health-timeout ${toString cfg.healthTimeoutSeconds}"
           "${recoverySweep}/bin/kfactory-recovery-sweep"
         ];
-        # recovery-sweep must run as the user with auth.json. heal +
-        # sync-kick inherit the opencode-serve unit's existing User=,
-        # which the operator owns.
       };
-      # Env vars MERGE into the operator's unit (NixOS treats
-      # `.environment` as an attrset, so co-existing keys add rather
-      # than overwrite). The earlier serviceConfig.Environment =
-      # [...] shape would CLOBBER the operator's existing
-      # Environment= line; using `.environment` keeps both halves
-      # alive. XDG_CONFIG_HOME points recovery-sweep's
-      # `kfactory tick` at the operator's auth.json; the heal +
-      # sync-kick steps don't need it (they operate on the local DB
-      # / unauthenticated internal API).
+      # `.environment` (attrset, merges) not `serviceConfig.Environment`
+      # (list, clobbers) -- preserves operator's existing Environment=.
+      # XDG_CONFIG_HOME via `users.users.<name>.home` handles non-/home
+      # deployments (e.g. persistent-volume `/var/lib/factory/<user>`).
       environment = {
         KFACTORY_RECOVERY_QUEUE = cfg.queuePath;
-        XDG_CONFIG_HOME = "/home/${cfg.user}/.config";
+        XDG_CONFIG_HOME = "${config.users.users.${cfg.user}.home}/.config";
       };
     };
 
-    # Ensure /run/kfactory exists with the right ownership; heal
-    # mkdir's the queue's parent but a tmpfiles rule makes the perms
-    # predictable across reboots.
+    # heal mkdir's the queue parent, but tmpfiles owns the perms
+    # (predictable across reboots, independent of unit umask).
     systemd.tmpfiles.rules = [
       "d ${builtins.dirOf cfg.queuePath} 0755 ${cfg.user} ${cfg.group} -"
     ];

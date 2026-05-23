@@ -3,11 +3,9 @@
 in
   pkgs.writeShellApplication {
     name = "dev-up";
-    # docker (CLI; talks to the host daemon over /var/run/docker.sock),
-    # curl (ntfy health poll), git (rev-parse for repo root resolution).
-    # `nix` itself isn't here -- writeShellApplication PREPENDS
-    # runtimeInputs to PATH rather than replacing it, so the host's
-    # `nix build` from /run/current-system/sw/bin stays reachable.
+    # writeShellApplication PREPENDS runtimeInputs to PATH (not
+    # replaces) -- the host's `nix` from /run/current-system stays
+    # reachable so we can `nix build` from within.
     runtimeInputs = [pkgs.docker-client pkgs.curl pkgs.git];
     text = ''
       cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
@@ -18,8 +16,6 @@ in
       fi
 
       echo "[1/5] Building OCI images via Nix..."
-      # Build first, load after. nix build prints the store path; we feed
-      # it to `docker load` which understands streamed image tarballs.
       opencode_img=$(nix build .#opencode-image --no-link --print-out-paths -L)
       cli_img=$(nix build .#kfactory-cli-image --no-link --print-out-paths -L)
       docker load < "$opencode_img" 2>&1 | tail -1
@@ -44,10 +40,7 @@ in
 
       echo "[3/5] Starting ntfy + opencode + kfactory-cli..."
 
-      # ntfy.sh server. Public binwiederhier image pinned by digest is the
-      # standard upstream; --base-url and behind-proxy=false make the web
-      # UI work over plain http.
-      # @NOTE: pinned by digest for reproducibility -- bump via
+      # @NOTE: ntfy image is `:latest`, not pinned by digest. Bump via
       #   `docker pull binwiederhier/ntfy:latest && docker inspect ... | jq '.[0].RepoDigests'`
       start_if_needed ${env.ntfyContainer} \
         -d --name ${env.ntfyContainer} \
@@ -68,9 +61,7 @@ in
         sleep 1
       done
 
-      # opencode-kfactory: the patched opencode server + all three plugins.
-      # OPENCODE_EXPERIMENTAL_WORKSPACES is set inside the image's
-      # entrypoint already, so no need to repeat here.
+      # OPENCODE_EXPERIMENTAL_WORKSPACES is baked into the image's entrypoint.
       start_if_needed ${env.opencodeContainer} \
         -d --name ${env.opencodeContainer} \
         --network ${env.network} \
@@ -79,12 +70,9 @@ in
         ${env.images.opencode}
 
       printf "      → waiting for opencode..."
-      # Poll Docker's own health status instead of re-implementing the
-      # check. The image declares `Healthcheck` (see opencode-image.nix)
-      # which runs every 5s and reports "healthy" once the server's
-      # bearer-auth-patched endpoint responds 2xx with our fake token.
-      # 90 retries × 2s = 3 min budget; first boot's sqlite migration
-      # consumes ~30s of that, subsequent dev-ups come up in seconds.
+      # Poll Docker's own Healthcheck (see opencode-image.nix). 90×2s=3min
+      # budget covers first-boot's sqlite migration (~30s); subsequent
+      # dev-ups come up in seconds.
       for i in $(seq 1 90); do
         status=$(docker inspect --format='{{.State.Health.Status}}' \
           ${env.opencodeContainer} 2>/dev/null || echo "unknown")
@@ -96,8 +84,7 @@ in
         sleep 2
       done
 
-      # kfactory-cli: idle container holding the binaries + pre-staged auth.
-      # No port mapping -- operator drives via `docker exec`.
+      # Idle container; drive via `docker exec`. No port mapping.
       start_if_needed ${env.cliContainer} \
         -d --name ${env.cliContainer} \
         --network ${env.network} \

@@ -45,7 +45,7 @@ Do NOT use this pattern when:
 
 The shape is auto-registered: a single entry in `thirdPartyPluginSrcs`
 exposes the `packages.<name>` flake output, a generic
-`factory-<name>-smoke` flake check, and the e2e tests opencode.json
+`factory-<name>-smoke` flake check, and the regression-tests opencode.json
 plugin-list entry. The only per-plugin manual work is generating the
 carrier + lockfile (which needs network egress and so happens
 out-of-sandbox).

@@ -1,16 +1,8 @@
-# [4b/9] Per-workspace session-list isolation -- regression test for
-# the listByProject workspaceID filter (see opencode-bearer-and-
-# routing.patch). The TUI's `--continue` path calls
-# GET /session?directory=<wsDir> with the x-opencode-workspace header.
-# Without the filter, all workspaces sharing a project_id (typical:
-# dispatches against the same repo, or production's 'global')
-# collapse to a single result list and --continue lands on the same
-# session every time, regardless of workspace.
-#
-# We hit the actual TUI endpoint (/session, NOT /experimental/session)
-# with each workspace's header and assert the response is scoped to
-# that workspace. Symmetric adversarial probe at the end: mismatched
-# header+directory must still respect the header.
+# [4b/9] Per-workspace /session isolation -- listByProject workspaceID
+# filter regression. Without the filter, workspaces sharing project_id
+# collapse to one result list and --continue lands on the same session.
+# Hits the TUI's actual /session (not /experimental/session) +
+# `?directory=` shape with the x-opencode-workspace header.
 
 echo
 echo "[4b/9] Per-workspace session-list isolation (the bug --continue triggers)..."
@@ -28,7 +20,7 @@ if [ "$WS1_SESS" = "$WS1" ]; then
   echo "      ✓ /session?directory header=$WS1 returned only WS1 sessions"
 else
   echo "      ❌ /session for WS1 returned workspace ids: $WS1_SESS (expected only $WS1)"
-  echo "         Regression: opencode-bearer-and-routing listByProject filter broken."
+  echo "         opencode-bearer-and-routing listByProject filter regressed."
   exit 1
 fi
 if [ "$WS2_SESS" = "$WS2" ]; then

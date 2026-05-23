@@ -1,22 +1,13 @@
-# [8/9] kfactory tick (scheduled) -- continue branch + skip-if-exists.
-# The skip branch is tested via a SECOND scheduled config with
-# `mode: "skip-if-exists"` (the CLI flag `--skip-if-exists` was
-# dropped per ThermoNuclear F1; config is the single source of
-# truth for mode).
-#
-# Per ThermoNuclear F10: skip-if-exists now prints the workspace ID
-# on stdout (same as every other tick exit), so a wrapper that
-# captures `$(kfactory tick foo)` always gets a usable reference.
+# [8/9] tick (scheduled) -- continue + skip-if-exists (separate config).
+# Stdout = workspace id on every tick exit (including skip) so wrappers
+# capturing $(kfactory tick ...) always get a usable reference.
 
 echo
 echo "[8/9] kfactory tick (scheduled) -- continue + skip-if-exists..."
 
 # ---- continue branch ----
 
-# Resolve the workspace's most-recent root session so we can count
-# messages before vs after continuation. The /experimental/session
-# path filters by workspace; the root predicate is parentID empty
-# (subagents have a parentID set).
+# Most-recent root session (no parentID) for before/after message-count.
 TICK_SESS=$(cli curl -sf -H "Authorization: Bearer $TOKEN" \
   -H "x-opencode-workspace: $TICK_WS" \
   "$OPENCODE_BASE/experimental/session?workspace=$TICK_WS" |
@@ -54,10 +45,8 @@ else
   exit 1
 fi
 
-# Verify the appended user message matches the continuation prompt
-# exactly. Per ThermoNuclear F4: don't `| tail -1` against multiple
-# text parts -- join them all and string-compare so future multi-part
-# user messages can't silently weaken the assertion.
+# Join ALL text parts of the last user message; `| tail -1` would be
+# satisfied by a multi-part message ending with the continuation prompt.
 LAST_USER_TEXT=$(cli curl -sf -H "Authorization: Bearer $TOKEN" \
   -H "x-opencode-workspace: $TICK_WS" \
   "$OPENCODE_BASE/session/$TICK_SESS/message" |
@@ -92,9 +81,7 @@ cli sh -c "cat > /tmp/kfactory-scheduled/${SKIP_TASK}.json" <<'JSON'
 }
 JSON
 
-# First tick: workspace doesn't exist yet, so it mints (skip-if-exists
-# only blocks when the workspace ALREADY exists; first tick goes
-# through the normal fresh path).
+# First tick mints (skip-if-exists only blocks on subsequent ticks).
 SKIP_WS=$(cli env KFACTORY_SCHEDULED_DIR=/tmp/kfactory-scheduled \
   kfactory tick "$SKIP_TASK")
 echo "      → first tick (mint) returned $SKIP_WS"
@@ -109,9 +96,7 @@ SKIP_MSG_BEFORE=$(cli curl -sf -H "Authorization: Bearer $TOKEN" \
   -H "x-opencode-workspace: $SKIP_WS" \
   "$OPENCODE_BASE/session/$SKIP_SESS/message" | jq 'length')
 
-# Second tick: workspace EXISTS, mode=skip-if-exists, must NOT post
-# a continuation. F10: stdout still prints the workspace id; stderr
-# carries the 'skipped' log.
+# Second tick: workspace exists -> skip path. Stdout still prints id.
 SKIP_OUT=$(cli env KFACTORY_SCHEDULED_DIR=/tmp/kfactory-scheduled \
   kfactory tick "$SKIP_TASK" 2>/tmp/skip-stderr)
 SKIP_LOG=$(cat /tmp/skip-stderr)

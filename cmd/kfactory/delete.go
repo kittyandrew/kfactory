@@ -1,7 +1,6 @@
-// `kfactory delete <id|slug|#>` resolves the workspace ref, confirms with
-// the operator (unless --yes), then DELETEs the WorkspaceTable row via
-// /experimental/workspace/<id>. The factory adapter's remove() callback
-// wipes the on-disk clone at /var/lib/factory/workspaces/<slug>/.
+// `kfactory delete <ref>`: resolve + confirm (unless --yes) + DELETE
+// /experimental/workspace/<id>. The kfactory-adapter's remove() wipes
+// the on-disk clone.
 package main
 
 import (
@@ -46,10 +45,8 @@ func runDelete(args []string) {
 		answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if a := strings.TrimSpace(strings.ToLower(answer)); a != "y" && a != "yes" {
 			fmt.Fprintln(os.Stderr, "kfactory: aborted")
-			// Exit 0: user said no, command finished cleanly. Distinct
-			// from exitNotLoggedIn (1) and exitOther (2) per exit.go,
-			// so scripts can branch on "operator declined" vs "tried
-			// and failed."
+			// Exit 0 (not exitOther) so scripts distinguish "operator
+			// declined" from "tried and failed".
 			return
 		}
 	}

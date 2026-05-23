@@ -1,14 +1,10 @@
-# opencode-sync-kick: workaround for opencode's "workspace status only
-# syncs on SPA init" wart. Polls /global/health, iterates workspaces,
-# POSTs /sync/start per each. Per-workspace failures are logged and
-# the loop continues -- one-shot, no retry-with-backoff (the 30s
-# health poll covers the opencode-not-ready case; a per-workspace
-# failure degrades gracefully to "first interaction triggers sync
-# naturally").
+# Workaround for opencode's "workspace status only syncs on SPA init"
+# wart. Polls /global/health, then POSTs /sync/start per workspace.
+# Per-workspace failures degrade gracefully (first interaction triggers
+# sync naturally).
 #
-# Wiring: ExecStartPost on the opencode-serve unit via the recovery
-# module. Tests exec this script directly inside the opencode container.
-#
+# Wiring: modules/recovery.nix attaches this as ExecStartPost on the
+# opencode-serve unit.
 # Usage: opencode-sync-kick --base <URL> [--health-timeout <SECONDS>]
 
 BASE=""

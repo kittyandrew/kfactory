@@ -1,32 +1,18 @@
-// kfactory /loop plugin -- auto-continues a session until a user-defined
-// sentinel string appears in the assistant's output.
+// /loop plugin -- auto-continues a session until a sentinel appears as
+// the LAST line of the assistant's response (trimmed, case-sensitive
+// equality). Mid-response mentions don't terminate.
 //
-// Inspired by github.com/charfeng1/opencode-ralph-loop (MIT) and
-// Anthropic's ralph-wiggum pattern, but carved down to the minimum that
-// kfactory actually needs:
-//   - One slash command (/loop) + two tools (loop-start, loop-stop).
-//   - User-defined sentinel string passed as `--sentinel "..."`. Default
-//     is `<promise>EXHAUSTIVELY COMPLETED</promise>` -- intentionally
-//     verbose so the model is unlikely to emit it speculatively. The
-//     matcher does LAST-NON-EMPTY-LINE trimmed equality (case-sensitive)
-//     across the joined text parts of the last assistant message: the
-//     trailing line must equal the sentinel exactly. Mid-response
-//     mentions (a plan, a quoted prompt, a paraphrase) do NOT terminate
-//     the loop -- only a clean trailing sentinel does. An earlier shape
-//     used substring-anywhere matching, which trip-fired whenever the
-//     model restated the sentinel for any reason; matchesSentinel's
-//     header has the full rationale.
-//   - No coupling to kfactory.subscribers.changed; the loop runs on
-//     session.idle alone. Operator stops manually with /loop-stop.
+// Inspired by charfeng1/opencode-ralph-loop (MIT) + Anthropic's
+// ralph-wiggum pattern; reduced to one slash command (/loop) + two
+// tools (loop-start, loop-stop). Default sentinel
+// `<promise>EXHAUSTIVELY COMPLETED</promise>` is intentionally verbose
+// to avoid speculative emission. No coupling to subscribers.changed;
+// runs on session.idle alone; operator stops via /loop-stop.
 //
-// State lives in `$XDG_STATE_HOME/kfactory-loop/<hash>.json`, keyed by
-// the workspace directory's sha256. NOT in the workspace tree -- prevents
-// accidental `git add .` of the state file.
-//
-// Slash command markdown files (under `commands/`) are NOT auto-installed.
-// Consumers wire them into opencode's command dir explicitly (NixOS
-// example in the project README). This avoids a workspace-scope plugin
-// mutating operator-global config every load.
+// State at $XDG_STATE_HOME/kfactory-loop/<sha256(dir)>.json -- outside
+// the workspace tree to prevent accidental `git add .`. Slash-command
+// markdowns (commands/) are not auto-installed; consumers wire them
+// into opencode's command dir explicitly (README example).
 
 import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
@@ -34,8 +20,6 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
-// `PluginInput["client"]` is the full opencode SDK client. Aliased so
-// signatures don't repeat the indexed-access type.
 type OpencodeClient = PluginInput["client"]
 
 // ---- Constants ----
@@ -44,33 +28,24 @@ const DEFAULT_SENTINEL = "<promise>EXHAUSTIVELY COMPLETED</promise>"
 const DEFAULT_MAX_ITERATIONS = 100
 const MIN_MAX_ITERATIONS = 1
 const MAX_MAX_ITERATIONS = 10_000
-// After this many consecutive HTTP failures (messages OR prompt), clear
-// state with a warn log. Distinct from maxIterations (the "no completion
-// in N turns" cap); this is the "the server stopped accepting our
-// calls" cap. Three so transient blips don't kill an otherwise-healthy
-// loop, but unlimited retries on a broken backend don't drain the
-// iteration budget either.
+// Distinct from maxIterations (the "no completion in N turns" cap);
+// this caps "server stopped accepting our calls" -- 3 tolerates
+// transient blips without letting a broken backend drain the budget.
 const MAX_CONSECUTIVE_FAILURES = 3
 
-// On-disk state schema version. Bump and add a migration if the
-// LoopState shape changes incompatibly. readState rejects unknown
-// versions rather than parse garbage.
+// Bump + migrate on incompatible LoopState changes; readState rejects
+// unknown versions rather than parse garbage.
 const STATE_SCHEMA_VERSION = 1
 
 // ---- State file location ----
 
-// Per-workspace state lives under $XDG_STATE_HOME (or ~/.local/state)
-// rather than inside the workspace tree. Prevents accidental git-add of
-// the state file; the workspace dir stays clean of plugin internals.
 function stateRootDir(): string {
   const xdg = process.env.XDG_STATE_HOME
   const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".local", "state")
   return join(base, "kfactory-loop")
 }
 
-// Hash the workspace directory to derive a filesystem-safe filename.
-// SHA-256 truncated to 16 hex chars (64 bits) -- collision-free for any
-// realistic workspace count on a single host.
+// 64-bit truncated SHA-256: collision-free for realistic workspace counts.
 function workspaceKey(directory: string): string {
   return createHash("sha256").update(directory).digest("hex").slice(0, 16)
 }
@@ -99,9 +74,8 @@ function readState(directory: string): LoopState | null {
     const parsed: unknown = JSON.parse(readFileSync(p, "utf-8"))
     if (typeof parsed !== "object" || parsed === null) return null
     const obj = parsed as Record<string, unknown>
-    // Reject unknown schema versions -- an older plugin reading a
-    // newer state file shouldn't blindly parse fields it doesn't
-    // understand. Treat missing/zero as "no state".
+    // Older plugin + newer state file -> refuse to parse fields it
+    // doesn't understand. Missing/zero treated as "no state".
     if (obj.schemaVersion !== STATE_SCHEMA_VERSION) {
       console.warn(
         `loop: state file ${p} has schemaVersion=${String(obj.schemaVersion)} ` +
@@ -127,11 +101,9 @@ function readState(directory: string): LoopState | null {
   }
 }
 
-// Atomic write: serialize to <p>.tmp, fsync via close, rename over <p>.
-// rename is atomic on the same filesystem (POSIX guarantee). Without
-// this, a process kill mid-write truncates the JSON and the next
-// readState returns null, silently killing an in-flight loop. With it,
-// readers see either the previous state or the new one, never garbage.
+// Atomic write via tmp+rename (POSIX guarantee on same fs); a kill
+// mid-write would otherwise truncate to invalid JSON and silently
+// kill in-flight loops.
 function writeStateTo(directory: string, s: LoopState): void {
   const p = stateFile(directory)
   mkdirSync(dirname(p), { recursive: true })
@@ -140,12 +112,9 @@ function writeStateTo(directory: string, s: LoopState): void {
   renameSync(tmp, p)
 }
 
-// Remove the on-disk state file. Throws on rm failure so the caller
-// (typically /loop-stop) can surface it. An earlier shape swallowed
-// errors silently -- the operator then got `loop-stop: cancelled after
-// N iteration(s)` even when the file lingered, and the next
-// /loop-start would refuse because state was still active. Propagating
-// the error makes that recovery path explicit.
+// Throws on rm failure so /loop-stop surfaces it -- swallowing meant
+// "cancelled after N iterations" while the file lingered and the next
+// /loop-start refused.
 function clearState(directory: string): void {
   const p = stateFile(directory)
   if (!existsSync(p)) return
@@ -158,11 +127,8 @@ function clearState(directory: string): void {
   }
 }
 
-// Same as clearState but swallows the error after logging. Use from
-// internal cleanup paths (handleIdle's terminal branches, session.deleted)
-// where there's no operator-facing surface to throw to. The /loop-stop
-// tool uses the throwing variant so an operator-typed stop that
-// silently fails is surfaced.
+// Swallowing variant for internal cleanup paths (no operator surface
+// to throw to). /loop-stop uses the throwing variant.
 function tryClearState(directory: string): void {
   try {
     clearState(directory)
@@ -171,17 +137,11 @@ function tryClearState(directory: string): void {
   }
 }
 
-// ---- Subagent suppression ----
-//
-// A session is a SUBAGENT (child) session if its row carries a non-empty
-// parentID. opencode dispatches subagent loops as children of the
-// operator's session; firing continuations on subagent idles would
-// hijack the wrong session and spam the parent. Skip them.
-// Fail-CLOSED: if the lookup fails (network, missing session), treat
-// the session as a subagent and skip the continuation. False
-// suppression on a transient blip is recoverable (next idle retries);
-// a false-positive continuation injected into a subagent's session
-// mid-task corrupts work the operator cares about.
+// Non-empty parentID = subagent (child of operator's session). Firing
+// continuations on subagent idles would hijack the wrong session and
+// spam the parent. Fail-CLOSED on lookup error: false-positive
+// injection mid-task corrupts work the operator cares about; missed
+// suppression retries next idle.
 async function isSubagentSession(client: OpencodeClient, sessionID: string): Promise<boolean> {
   try {
     const resp = await client.session.get({ path: { id: sessionID } })
@@ -195,17 +155,11 @@ async function isSubagentSession(client: OpencodeClient, sessionID: string): Pro
 
 // ---- Completion detection ----
 
-// Pull the last assistant message via the opencode SDK, concatenate its
-// text parts. Returns `null` when no assistant message exists yet
-// (typically: the very first session.idle after loop-start, before the
-// first prompt has produced a response). Returns the concatenated text
-// (possibly empty) otherwise. Caller distinguishes "wait for first
-// response" from "response exists, no sentinel".
-//
-// throwOnError: true so HTTP failures propagate; the caller counts them
-// toward the consecutive-failure budget (NOT silently treating them as
-// "no sentinel found", which would burn maxIterations on iterations
-// that never actually checked completion).
+// `null` = no assistant message yet (first idle after loop-start);
+// caller distinguishes that from "response exists, no sentinel".
+// throwOnError so HTTP failures propagate to the consecutive-failure
+// budget (silently treating them as "no sentinel" would burn
+// maxIterations on iterations that never checked completion).
 async function lastAssistantText(
   client: OpencodeClient,
   sessionID: string,
@@ -230,13 +184,9 @@ async function lastAssistantText(
   return null
 }
 
-// Sentinel match anchored to the LAST non-empty line of the assistant
-// response, with whitespace trimmed. An earlier shape used a substring
-// match anywhere in the response, which trip-fired whenever the model
-// restated the sentinel for any reason (planning, paraphrasing, quoting
-// the continuation prompt back). Last-line equality eliminates that
-// class: the model has to emit the sentinel as its concluding line,
-// not just mention it.
+// Last-non-empty-line trimmed equality (case-sensitive). Substring-
+// anywhere would trip-fire whenever the model restated the sentinel
+// (planning, paraphrasing, quoting back).
 function matchesSentinel(text: string, sentinel: string): boolean {
   const lines = text.split(/\r?\n/)
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -273,28 +223,19 @@ const LoopPlugin: Plugin = async (input) => {
   const directory = input.directory
   const client = input.client
 
-  // Per-session in-flight tracking. `Map<sessionID, {pending}>` rather
-  // than a Set because we need to record "another idle arrived while
-  // the handler was running" so we can re-run once after the current
-  // handler finishes. The architect's flag was that a strict Set drops
-  // information from any idle arriving mid-handler -- multiple agent
-  // turns inside one long handler would advance iteration once for N
-  // turns. The pending flag bounds the re-run count at 1 per outer
-  // event: arrivals during the SECOND run are also dropped, but at
-  // that point we've made forward progress and the next true idle
-  // will pick up the rest. Prevents both double-prompting AND
-  // monotonic loss.
+  // {pending} (not Set): records "another idle arrived mid-handler"
+  // so we re-run once when the current handler finishes -- without
+  // that flag, multiple agent turns inside one long handler would
+  // advance iteration once for N turns. Capped at one re-run per
+  // outer event so a third nested arrival doesn't recurse; next
+  // true idle picks up the rest.
   const inFlight = new Map<string, { pending: boolean }>()
 
-  // Re-read the on-disk state and decide whether a pending write-back
-  // is still valid. The race: handleIdle reads state at entry, then
-  // awaits an HTTP call; during that await, the operator runs
-  // /loop-stop and clearState deletes the file. When the await
-  // resolves and we go to writeStateTo, the stale local `state`
-  // resurrects the stopped loop. Guard: re-read; if state is gone,
-  // OR if the active sessionID changed (operator stopped + started
-  // a new loop in a different session in the same workspace), abort
-  // the write.
+  // Race guard: handleIdle reads state then awaits HTTP; during the
+  // await /loop-stop can clearState. Without re-reading, writeStateTo
+  // would resurrect the stopped loop from the stale local. Also
+  // catches the operator stopping + starting in a different session
+  // in the same workspace.
   function stateStillOurs(originalSessionID: string): boolean {
     const current = readState(directory)
     return current !== null && current.sessionID === originalSessionID
@@ -305,15 +246,8 @@ const LoopPlugin: Plugin = async (input) => {
     if (!state) return
     if (state.sessionID !== sessionID) return
 
-    // Don't fire continuations on subagent idles -- they'd hijack the
-    // parent's session.
     if (await isSubagentSession(client, sessionID)) return
 
-    // Try to read the last assistant message. messages() failure is
-    // counted toward consecutiveFailures rather than silently treated
-    // as "no sentinel" -- otherwise an auth-expired/network-broken
-    // backend burns the operator's safety budget on iterations that
-    // never actually verified completion.
     let text: string | null
     try {
       text = await lastAssistantText(client, sessionID, directory)
@@ -322,11 +256,8 @@ const LoopPlugin: Plugin = async (input) => {
       return
     }
 
-    // If the session has no assistant message yet (very first idle
-    // after loop-start, before the initial prompt has been responded
-    // to), don't inject a continuation -- that would override the
-    // operator's initial prompt with the loop's "continue" text. Wait
-    // for the next idle. Doesn't increment iteration.
+    // First idle (no assistant response yet) -- don't inject; that
+    // would override the operator's initial prompt. Wait for next idle.
     if (text === null) return
 
     if (matchesSentinel(text, state.sentinel)) {
@@ -341,9 +272,8 @@ const LoopPlugin: Plugin = async (input) => {
       return
     }
 
-    // Send continuation. Pass throwOnError:true so HTTP errors surface;
-    // by default the SDK returns {data, error} without throwing, which
-    // would leave us thinking the prompt succeeded when it didn't.
+    // throwOnError: SDK defaults to {data, error} without throwing,
+    // which would leave us thinking the prompt succeeded when it didn't.
     const next = state.iteration + 1
     try {
       await client.session.prompt({
@@ -356,9 +286,6 @@ const LoopPlugin: Plugin = async (input) => {
       return
     }
 
-    // Success: advance iteration, reset failure counter. Re-read state
-    // first so a concurrent /loop-stop wins over our stale read at
-    // function entry.
     if (!stateStillOurs(sessionID)) {
       console.info(`loop: state cleared during handler, skipping write-back`)
       return
@@ -381,8 +308,6 @@ const LoopPlugin: Plugin = async (input) => {
       return
     }
     console.warn(`loop: ${op} failed (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${msg}`)
-    // Same race-guard as the success path: don't resurrect a stopped
-    // loop just because a failure handler is finishing up.
     if (!stateStillOurs(state.sessionID)) {
       console.info(`loop: state cleared during handler, skipping failure write-back`)
       return
@@ -430,12 +355,9 @@ const LoopPlugin: Plugin = async (input) => {
             return `loop-start: maxIterations must be an integer in [${MIN_MAX_ITERATIONS}, ${MAX_MAX_ITERATIONS}], got ${maxIterations}`
           }
           // Refuse to start if a loop is already active in this
-          // workspace. The previous design silently clobbered prior
-          // state; if the prior loop was running in a different
-          // session, that session's loop died invisibly. Explicit
-          // operator intent (/loop-stop first) is the safer default.
-          // Architect-recommended Option C (per docs/spec.md decisions
-          // log entry on loop scoping).
+          // workspace -- silent clobber would kill any in-flight loop
+          // running in a different session invisibly. (See docs/spec.md
+          // decisions log entry on loop scoping.)
           const existing = readState(directory)
           if (existing) {
             const sameSession = existing.sessionID === ctx.sessionID
@@ -445,10 +367,8 @@ const LoopPlugin: Plugin = async (input) => {
               `Run /loop-stop${sameSession ? "" : " in that session"} first, then re-run /loop-start.`
             )
           }
-          // ctx.sessionID is the canonical invoking session -- per
-          // @opencode-ai/plugin's ToolContext, opencode passes the session
-          // context to every tool execute. We persist it on start so the
-          // session.idle handler can match exactly.
+          // ctx.sessionID is the invoking session (per ToolContext);
+          // persisted so session.idle matches exactly.
           const state: LoopState = {
             schemaVersion: STATE_SCHEMA_VERSION,
             active: true,
@@ -491,9 +411,8 @@ const LoopPlugin: Plugin = async (input) => {
     },
 
     event: async ({ event }) => {
-      // Widen the event type via string-compare; the published Event
-      // union doesn't cover session.deleted in a way that lets us narrow
-      // cleanly here.
+      // String-compare to widen: published Event union doesn't cover
+      // session.deleted cleanly.
       const evt: { type: string; properties?: unknown } = event
       if (evt.type === "session.deleted") {
         const props = evt.properties
@@ -520,15 +439,7 @@ const LoopPlugin: Plugin = async (input) => {
           : undefined
       if (!sessionID) return
 
-      // Single-flight guard with at-most-one re-run. If a handler is
-      // already running for this session, mark it as pending and
-      // return -- when the current handler finishes, the wrapper will
-      // re-run once and clear pending. Idles arriving during the
-      // SECOND run set pending again but the third re-run is bounded
-      // out; the next true idle (after both runs complete) picks up
-      // wherever state stopped. Prevents both double-prompting AND
-      // the strict-drop's loss of information when multiple idles
-      // arrive during a long handler.
+      // Single-flight + at-most-one re-run. See inFlight comment above.
       const existing = inFlight.get(sessionID)
       if (existing !== undefined) {
         existing.pending = true

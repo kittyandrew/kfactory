@@ -1,7 +1,5 @@
-# buildGoModule wrapper for the kfactory CLI.
-#
-# Endpoint defaults (main.defaultServer / Issuer / ClientID / Audience)
-# are EMPTY in this upstream build. Consumers wrap with overrideAttrs:
+# kfactory CLI -- endpoint defaults (main.default{Server,Issuer,
+# ClientID,Audience}) ship empty; consumers bake via overrideAttrs:
 #
 #   kfactory.overrideAttrs (old: {
 #     ldflags = (old.ldflags or []) ++ [
@@ -12,10 +10,8 @@
 #     ];
 #   })
 #
-# vendorHash: buildGoModule downloads the Go module graph via a fixed-
-# output derivation keyed on this hash. To bump (or after changing
-# go.mod/go.sum), set to lib.fakeHash, run `nix build`, copy the hash
-# from the error.
+# Refresh vendorHash after go.mod/go.sum changes: set to lib.fakeHash,
+# `nix build`, copy the hash from the error.
 {
   buildGoModule,
   installShellFiles,

@@ -17,8 +17,7 @@ import (
 	"time"
 )
 
-// serverFor returns the factory base URL from the persisted auth.json,
-// or the baked default if no token file exists.
+// Base URL from persisted auth.json, falling back to baked default.
 func serverFor(t *tokenFile) string {
 	if t != nil && t.Server != "" {
 		return strings.TrimRight(t.Server, "/")
@@ -26,14 +25,9 @@ func serverFor(t *tokenFile) string {
 	return defaultServer
 }
 
-// Workspace mirrors the WorkspaceInfo shape returned by opencode's
-// /experimental/workspace endpoint. Only the fields kfactory consumes;
-// unknown fields are dropped by the json decoder.
-//
-// `Branch` is enriched server-side by the opencode-bearer-and-routing
-// patch: the workspace.list handler reads .git/HEAD for each row's
-// directory and fills the field fresh per call. Empty string means
-// "no .git in the workspace dir" (broken clone -- waybap-style).
+// `Branch` enriched server-side per opencode-workspace-branch patch:
+// fresh .git/HEAD read per call. Empty = no .git in the workspace dir
+// (broken clone).
 type Workspace struct {
 	ID        string `json:"id"`
 	Type      string `json:"type"`
@@ -44,11 +38,8 @@ type Workspace struct {
 	TimeUsed  int64  `json:"timeUsed"`
 }
 
-// newRequest builds an HTTP request with the bearer token attached when
-// `t` carries one. A nil `t` (or empty AccessToken) skips the Authorization
-// header -- mirrors serverFor's tolerance for unauthenticated callers, so
-// future "ping the server pre-login" code paths don't nil-deref here.
-// `body` may be nil for GET; for POST it's the JSON-marshaled payload.
+// Builds an HTTP request with optional bearer (nil/empty AccessToken
+// skips the header for pre-login pings) and JSON body.
 func newRequest(ctx context.Context, t *tokenFile, server, method, path string, body any) (*http.Request, error) {
 	var reader io.Reader
 	if body != nil {
@@ -71,9 +62,8 @@ func newRequest(ctx context.Context, t *tokenFile, server, method, path string, 
 	return req, nil
 }
 
-// httpClient is reused across all factory API calls so multi-call paths
-// (dispatch: create workspace -> session -> prompt) get HTTP keep-alive
-// instead of opening a fresh TCP connection per call.
+// Shared across calls so multi-step paths (dispatch: create workspace
+// -> session -> prompt) reuse keep-alive.
 var httpClient = &http.Client{Timeout: 60 * time.Second}
 
 func doJSON(req *http.Request, into any) error {
@@ -98,7 +88,6 @@ func doJSON(req *http.Request, into any) error {
 	return nil
 }
 
-// listWorkspaces fetches all workspaces.
 func listWorkspaces(ctx context.Context, t *tokenFile, server string) ([]Workspace, error) {
 	req, err := newRequest(ctx, t, server, http.MethodGet, "/experimental/workspace", nil)
 	if err != nil {
@@ -111,23 +100,14 @@ func listWorkspaces(ctx context.Context, t *tokenFile, server string) ([]Workspa
 	return ws, nil
 }
 
-// createWorkspace POSTs a new kfactory workspace for the given repo URL.
-// The kfactory-adapter plugin assigns the random 4-hex slug suffix; we
-// don't pass branch (clone resolves to remote HEAD).
-//
-// `type: "kfactory"` is the WorkspaceAdapter registration key used by
-// the kfactory-adapter plugin (plugins/kfactory-adapter/src/index.ts);
-// opencode dispatches creation through whichever adapter registered that key.
+// `type: "kfactory"` selects the kfactory-adapter (plugins/kfactory-
+// adapter registers under that key). Empty slugSuffix = random 4hex
+// (kfactory dispatch); non-empty pins for `kfactory tick` scheduled
+// workspaces.
 func createWorkspace(ctx context.Context, t *tokenFile, server, repoURL string) (*Workspace, error) {
 	return createWorkspaceWithSuffix(ctx, t, server, repoURL, "")
 }
 
-// createWorkspaceWithSuffix is the same as createWorkspace but plumbs an
-// optional `slugSuffix` through `extra` so the kfactory-adapter mints a
-// deterministic slug instead of the default random 4hex. Used by
-// `kfactory tick` so scheduled-task workspaces have predictable names
-// across opencode restarts. Empty `slugSuffix` falls back to the random
-// suffix path (identical behavior to the legacy createWorkspace).
 func createWorkspaceWithSuffix(ctx context.Context, t *tokenFile, server, repoURL, slugSuffix string) (*Workspace, error) {
 	extra := map[string]any{
 		"repoUrl": repoURL,
@@ -150,9 +130,7 @@ func createWorkspaceWithSuffix(ctx context.Context, t *tokenFile, server, repoUR
 	return &ws, nil
 }
 
-// deleteWorkspace DELETEs the workspace row. The factory adapter's
-// remove() callback wipes the on-disk clone; opencode drops the
-// WorkspaceTable row.
+// Adapter's remove() wipes the on-disk clone; opencode drops the DB row.
 func deleteWorkspace(ctx context.Context, t *tokenFile, server, id string) error {
 	req, err := newRequest(ctx, t, server, http.MethodDelete, "/experimental/workspace/"+id, nil)
 	if err != nil {
@@ -161,15 +139,13 @@ func deleteWorkspace(ctx context.Context, t *tokenFile, server, id string) error
 	return doJSON(req, nil)
 }
 
-// Session is a minimal subset of opencode's session shape -- we only
-// consume the id field. Everything else is opaque to kfactory.
 type Session struct {
 	ID string `json:"id"`
 }
 
-// createSession opens a fresh session bound to the given workspace.
-// Routes via `?workspace=<id>` so opencode dispatches the create into
-// the right InstanceStore context (the session row gets workspace_id = wid).
+// `?workspace=` routes through workspace-routing middleware so the
+// session row gets workspace_id = wid (otherwise it lands in the
+// front-opencode's project with no workspace binding).
 func createSession(ctx context.Context, t *tokenFile, server, workspaceID string) (*Session, error) {
 	path := "/session?workspace=" + url.QueryEscape(workspaceID)
 	req, err := newRequest(ctx, t, server, http.MethodPost, path, map[string]any{})
@@ -183,9 +159,6 @@ func createSession(ctx context.Context, t *tokenFile, server, workspaceID string
 	return &s, nil
 }
 
-// SessionInfo is the subset of /experimental/session response fields
-// kfactory consumes for the tick path. Most-recent-session resolution
-// uses `time.updated`; root-vs-subagent uses `parentID`.
 type SessionInfo struct {
 	ID          string `json:"id"`
 	WorkspaceID string `json:"workspaceID"`
@@ -195,13 +168,9 @@ type SessionInfo struct {
 	} `json:"time"`
 }
 
-// findMostRecentSession returns the most-recently-updated ROOT session
-// (no parentID) in the given workspace, or nil if there are none. Used
-// by `kfactory tick`'s continue path: an existing scheduled-task
-// workspace gets its prior conversation resumed, just like opencode's
-// `--continue` would land. Subagent sessions are filtered because we
-// never want to post the continuation prompt into a child agent's
-// context window; the operator-facing session is always a root.
+// Most-recent ROOT session (parentID == ""); subagent sessions excluded
+// since we never want to inject the continuation prompt into a child
+// agent's context. Matches opencode's `--continue` semantics.
 func findMostRecentSession(ctx context.Context, t *tokenFile, server, workspaceID string) (*SessionInfo, error) {
 	path := "/experimental/session?workspace=" + url.QueryEscape(workspaceID)
 	req, err := newRequest(ctx, t, server, http.MethodGet, path, nil)
@@ -224,12 +193,8 @@ func findMostRecentSession(ctx context.Context, t *tokenFile, server, workspaceI
 	return best, nil
 }
 
-// sendPromptAsync fires a prompt at a session and returns immediately
-// (server starts the model loop in the background). Use for `kfactory
-// dispatch` -- operator walks away while the agent works.
-//
-// Payload shape mirrors opencode's PromptPayload (session.ts:66 +
-// session/prompt.ts PromptInput): minimum is `{parts:[{type:"text",text}]}`.
+// Returns immediately; server starts the model loop in the background.
+// Payload mirrors PromptPayload in opencode/session.ts.
 func sendPromptAsync(ctx context.Context, t *tokenFile, server, workspaceID, sessionID, prompt string) error {
 	path := "/session/" + url.PathEscape(sessionID) + "/prompt_async?workspace=" + url.QueryEscape(workspaceID)
 	payload := map[string]any{
@@ -244,7 +209,6 @@ func sendPromptAsync(ctx context.Context, t *tokenFile, server, workspaceID, ses
 	return doJSON(req, nil)
 }
 
-// resolveWorkspace fetches the workspace list and delegates to findWorkspace.
 func resolveWorkspace(ctx context.Context, t *tokenFile, server, ref string) (*Workspace, error) {
 	ws, err := listWorkspaces(ctx, t, server)
 	if err != nil {
@@ -254,25 +218,18 @@ func resolveWorkspace(ctx context.Context, t *tokenFile, server, ref string) (*W
 	return findWorkspace(ws, ref)
 }
 
-// findWorkspace resolves a ref against a pre-sorted workspace slice:
-//   - exact ID match (`wrk_e3d1150e2001YHvzDNcrSNPSxV`)
-//   - exact slug match (`acme--widget--1144`)
-//   - 1-based index into the ordered list (`1`, `2`, ...) -- same order
-//     as `kfactory list`, so the operator can `kfactory list` then
-//     `kfactory attach 1` without copy-pasting an id
-//   - unique prefix of the slug (`acme`, `acme--widget`)
-//   - unique prefix of the id (`wrk_e3d1` or just `e3d1` -- `wrk_` is
-//     stripped before comparing since operators never type it)
+// Resolution order, most-specific first:
+//   - exact ID (`wrk_e3d1...`)
+//   - exact slug (`acme--widget--1144`)
+//   - 1-based index (same order as `kfactory list`)
+//   - unique slug prefix (`acme`, `acme--widget`)
+//   - unique ID prefix (with or without `wrk_`)
 //
-// Resolution is in that order: most-specific wins. Ambiguous prefix ->
-// error listing the candidates so the operator picks something narrower.
+// Ambiguous prefix = error listing candidates.
 //
-// @NOTE: numeric-prefix slugs are unreachable by prefix when the prefix
-//
-//	parses as a valid index (e.g. slug `12something--repo--1234` cannot
-//	be matched by `12` when only ~10 workspaces exist -- the numeric
-//	path errors "index out of range" before prefix matching runs).
-//	Operators with digit-prefixed slugs must use the full slug or id.
+// @NOTE: digit-prefixed slugs are unreachable by prefix when the
+// prefix parses as a valid index (e.g. slug starting with "12"
+// shadowed by index 12 if it exists). Use full slug or id.
 func findWorkspace(ws []Workspace, ref string) (*Workspace, error) {
 	// Exact id.
 	for i := range ws {
@@ -286,15 +243,13 @@ func findWorkspace(ws []Workspace, ref string) (*Workspace, error) {
 			return &ws[i], nil
 		}
 	}
-	// 1-based index. Pure digits only -- avoid catching e.g. a slug
-	// that happens to coincide with a partial number prefix.
 	if n, err := strconv.Atoi(ref); err == nil {
 		if n >= 1 && n <= len(ws) {
 			return &ws[n-1], nil
 		}
 		return nil, fmt.Errorf("index %d out of range (have %d workspace%s)", n, len(ws), plural(len(ws)))
 	}
-	// Prefix match (slug first, then id). Ambiguous = error.
+	// Slug prefix first, then id prefix.
 	var hits []*Workspace
 	for i := range ws {
 		if strings.HasPrefix(ws[i].Name, ref) {
@@ -323,14 +278,9 @@ func findWorkspace(ws []Workspace, ref string) (*Workspace, error) {
 	}
 }
 
-// sortWorkspaces orders by id ascending. opencode mints workspace ids
-// with a monotonic-prefix scheme (Identifier.ascending in opencode's
-// id/id.ts), so lexicographic id sort = creation order, oldest first.
-// This is stable across runs: an existing workspace's index in
-// `kfactory list` never changes; only newly created ones get appended at
-// the bottom. Don't sort by timeUsed -- last-touched changes every
-// time the operator opens a session, so today's `attach 1` would be
-// tomorrow's `attach 3`.
+// opencode's Identifier.ascending is monotonic-prefix, so id-lex order
+// = creation order. Stable across runs (existing indices don't shift);
+// sorting by timeUsed would make today's `attach 1` tomorrow's `attach 3`.
 func sortWorkspaces(ws []Workspace) {
 	sort.Slice(ws, func(i, j int) bool {
 		return ws[i].ID < ws[j].ID

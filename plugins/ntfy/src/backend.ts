@@ -62,24 +62,17 @@ const DEFAULT_TITLES: Record<NotificationEvent, string> = {
   "permission.asked": "Permission Asked",
 }
 
-// All three event bodies share one shape: `<workspace-slug> · <branch>`.
-// The earlier shape carried a static "The agent has finished and is
-// waiting for input." sentence -- redundant noise per the operator
-// review, since the title + tag already carry the event type. The
-// load-bearing per-notification signal is WHICH workspace, on WHICH
-// branch -- everything else is constant across notifications.
+// Per-notification signal is `<workspace-slug> · <branch>`; title +
+// tag already encode the event type.
 const DEFAULT_MESSAGES: Record<NotificationEvent, string> = {
   "session.idle": "{project} · {branch}",
   "session.error": "{project} · {branch}",
   "permission.asked": "{project} · {branch}",
 }
 
-// Tag names MUST match ntfy's emoji shortcode list
+// Tags MUST match ntfy's emoji shortcode list
 // (https://docs.ntfy.sh/emojis/) -- unrecognised names render as
-// literal text in the notification card. `hourglass_done` was a typo
-// of nothing real; ntfy doesn't have that shortcode and used to ship
-// the bare string. `hourglass` is the canonical "agent idle, waiting"
-// emoji (⌛). `warning` (⚠️) + `lock` (🔒) are standard.
+// literal text in the notification card.
 const DEFAULT_TAGS: Record<NotificationEvent, string> = {
   "session.idle": "hourglass",
   "session.error": "warning",
@@ -88,7 +81,6 @@ const DEFAULT_TAGS: Record<NotificationEvent, string> = {
 
 // ---- Templates ----
 
-// `{var_name}` substitution from the event context. Unknown vars become "".
 function buildTemplateVariables(
   event: NotificationEvent,
   metadata: EventMetadata,
@@ -105,13 +97,10 @@ function buildTemplateVariables(
   }
 }
 
-// `{var_name}` substitution from the event context. Unknown vars become "".
-// Pure string interpolation -- never feeds a shell. Operators configure
-// `{value: "..."}` templates with these placeholders; static `{env:VAR}`
-// and `{file:path}` substitution already happens at config-load time
-// (config.ts:substituteAll). An earlier shape accepted `{command: "..."}`
-// templates that ran the operator's shell with substituted (LLM-controlled)
-// values -- that's gone; see ContentTemplate's doc comment in config.ts.
+// `{var_name}` substitution from event context (unknown → ""). Pure
+// string interpolation; never feeds a shell. Static `{env:VAR}` /
+// `{file:path}` substitution happens at config-load time
+// (config.ts:substituteAll).
 function renderTemplate(template: string, context: NotificationContext): string {
   const vars = buildTemplateVariables(context.event, context.metadata)
   return template.replace(/\{(\w+)\}/g, (_, key: string) => vars[key] ?? "")

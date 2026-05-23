@@ -459,7 +459,7 @@ relevant to a consumer.
 
   Verification trail:
   - `/experimental/session?workspace=<id>` verified workspace-scoped
-    in the e2e tests since 2026-05.
+    in the regression tests since 2026-05.
   - `/session` (the TUI's actual endpoint) was NOT verified initially
     -- the earlier harness test asserted only on `/experimental/session`,
     which goes through `listGlobal`. The TUI goes through `listByProject`.
@@ -724,9 +724,9 @@ relevant to a consumer.
   the explicit tradeoff for auto-registration. Per-plugin tightening
   is opt-in via a future registry field. Tool-level behaviour
   (pty_spawn, pty_read, pty_kill) is exercised end-to-end by
-  dispatching tasks through the Docker e2e tests when meaningful
+  dispatching tasks through the Docker regression tests when meaningful
   changes land; this isn't currently a flake check because spinning
-  the e2e tests inside one would mean docker-in-nix-sandbox
+  the regression tests inside one would mean docker-in-nix-sandbox
   gymnastics that aren't worth the gate they buy.
 
 - **Upstream-contract watch list.** opencode is EXPERIMENTAL (gated by
@@ -884,7 +884,7 @@ patches/                            opencode-bearer-and-routing.patch
                                     + opencode-session-subscribers.patch
                                     + opencode-kfactory-refresh.patch
                                     + oauth2-proxy-pkce-no-secret.patch
-tests/e2e/                          Docker-based E2E test environment
+tests/regression/                   Docker-based regression test environment
   configs/                            opencode-base.json, notification-ntfy.json, auth.json
   scripts/                            dev-up / dev-down / dev-clean / dev-test (nix run apps)
   *-image.nix + test-repo.nix         OCI image builders + bundled test git repo
