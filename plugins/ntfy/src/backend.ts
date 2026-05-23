@@ -32,6 +32,7 @@
 //   - Backend interface trimmed: no abstraction layer over multiple
 //     backends -- ntfy is the only backend, inline its send().
 import type {
+  ContentTemplate,
   ContentTemplateMap,
   NotificationEvent,
   NtfyBackendConfig,
@@ -55,19 +56,26 @@ export interface NotificationContext {
 }
 
 // ---- Defaults per event ----
+//
+// ContentTemplate-shaped so resolveContent has ONE code path that runs
+// every value through renderTemplate (both defaults and operator
+// overrides) -- see buildTemplateVariables for the available
+// substitutions ({project}, {branch}, {permission_type}, etc).
 
-const DEFAULT_TITLES: Record<NotificationEvent, string> = {
-  "session.idle": "Agent Idle",
-  "session.error": "Agent Error",
-  "permission.asked": "Permission Asked",
+const DEFAULT_TITLES: Record<NotificationEvent, ContentTemplate> = {
+  "session.idle": { value: "Agent Idle" },
+  "session.error": { value: "Agent Error" },
+  "permission.asked": { value: "Permission Asked" },
 }
 
-// Per-notification signal is `<workspace-slug> · <branch>`; title +
-// tag already encode the event type.
-const DEFAULT_MESSAGES: Record<NotificationEvent, string> = {
-  "session.idle": "{project} · {branch}",
-  "session.error": "{project} · {branch}",
-  "permission.asked": "{project} · {branch}",
+// Per-notification signal: `<workspace-slug> · <branch>` for the
+// async events, `<workspace-slug> · <permission_type>` for the
+// interactive one so the operator sees WHAT was asked without
+// expanding the notification.
+const DEFAULT_MESSAGES: Record<NotificationEvent, ContentTemplate> = {
+  "session.idle": { value: "{project} · {branch}" },
+  "session.error": { value: "{project} · {branch}" },
+  "permission.asked": { value: "{project} · {permission_type}" },
 }
 
 // Tags MUST match ntfy's emoji shortcode list
@@ -109,12 +117,11 @@ function renderTemplate(template: string, context: NotificationContext): string 
 function resolveContent(
   templates: ContentTemplateMap | undefined,
   event: NotificationEvent,
-  defaults: Record<NotificationEvent, string>,
+  defaults: Record<NotificationEvent, ContentTemplate>,
   context: NotificationContext,
 ): string {
-  const t = templates?.[event]
-  if (!t) return defaults[event]
-  return renderTemplate(t.value, context)
+  const template = templates?.[event] ?? defaults[event]
+  return renderTemplate(template.value, context)
 }
 
 // ---- HTTP send ----

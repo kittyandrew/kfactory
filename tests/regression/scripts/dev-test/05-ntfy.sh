@@ -1,25 +1,54 @@
-# [5/9] Subscribe to ntfy + verify session.idle notification fires.
-# Spawns a 15-second background subscriber to the topic. The test
-# dispatches from [2/9] should trigger session.idle within seconds,
-# and the ntfy plugin's 3s notifyAfter window will fire.
+# [5/9] Verify session.idle ntfy notification fires AND its body has
+# real (substituted) content. Defaults like "{project} · {branch}"
+# must be passed through renderTemplate; the body assertion is what
+# catches plugins/ntfy/src/backend.ts:resolveContent skipping the
+# template-render call on the default-message path.
+#
+# Uses ntfy's poll-history endpoint (`/json?poll=1&since=...`) instead
+# of a live-stream capture window so we don't miss notifications that
+# fired BETWEEN dispatch (phase 2) and now -- session.idle typically
+# arrives within a couple seconds of dispatch, well before any 15s
+# capture window we'd open here.
 
 echo
-echo "[5/9] Subscribe to ntfy + verify session.idle notification fires..."
-NTFY_LOG=$(mktemp)
-(timeout 15 curl -s "$NTFY_URL/$TOPIC/json" >"$NTFY_LOG" || true) &
-NTFY_PID=$!
-sleep 12
-wait $NTFY_PID 2>/dev/null || true
+echo "[5/9] ntfy session.idle notification body (substituted vs literal)..."
 
-if grep -q '"message"' "$NTFY_LOG"; then
-  echo "      ✓ ntfy received at least one notification:"
-  grep '"message"' "$NTFY_LOG" | head -3 | sed 's/^/         /'
-else
-  echo "      ❌ no ntfy messages in 15s window. Possible causes:"
+# Poll all messages on the topic in the past hour. ntfy's `poll=1` mode
+# returns historical messages and exits, not a streaming connection.
+NTFY_LOG=$(mktemp)
+cli curl -sf "$NTFY_URL_INTERNAL/$TOPIC/json?poll=1&since=1h" >"$NTFY_LOG" || true
+
+if ! grep -q '"message"' "$NTFY_LOG"; then
+  echo "      ❌ no ntfy messages on topic in past hour. Possible causes:"
   echo "         - ntfy plugin failed to load (check opencode logs)"
-  echo "         - notifyAfter=3 didn't expire in time (agent still busy)"
-  echo "         - server.error path firing instead of session.idle"
-  echo "      Captured ntfy stream:"
-  sed 's/^/         /' "$NTFY_LOG"
+  echo "         - none of the dispatches reached session.idle"
+  echo "         - notification went to a different topic"
+  echo "      Captured (head of /json?poll=1):"
+  head -5 "$NTFY_LOG" | sed 's/^/         /'
+  rm -f "$NTFY_LOG"
+  exit 1
 fi
+NTFY_COUNT=$(grep -c '"message"' "$NTFY_LOG" || true)
+echo "      ✓ ntfy fired $NTFY_COUNT notification(s) on topic"
+
+# Body-content assertion: extract .message and confirm it contains NO
+# literal `{project}` / `{branch}` placeholders. backend.ts uses these
+# tokens in DEFAULT_MESSAGES (e.g. session.idle="{project} · {branch}");
+# buildTemplateVariables substitutes them at send time. If the default
+# path forgot to call renderTemplate, the placeholders ship verbatim.
+NTFY_MSG=$(head -1 "$NTFY_LOG" | jq -r '.message // ""')
+if [ -z "$NTFY_MSG" ]; then
+  echo "      ❌ first ntfy notification has empty .message field"
+  rm -f "$NTFY_LOG"
+  exit 1
+fi
+if echo "$NTFY_MSG" | grep -qE '\{(project|branch|session_id|event|time)\}'; then
+  echo "      ❌ ntfy body contains literal placeholders: '$NTFY_MSG'"
+  echo "         expected substituted content (e.g. '<repo-slug> · main')."
+  echo "         backend.ts:resolveContent must run DEFAULT_MESSAGES through"
+  echo "         renderTemplate before returning, not return them raw."
+  rm -f "$NTFY_LOG"
+  exit 1
+fi
+echo "      ✓ ntfy message body is substituted ('$NTFY_MSG')"
 rm -f "$NTFY_LOG"

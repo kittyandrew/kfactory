@@ -123,74 +123,145 @@ index e770a7c..559706f 100644
        {
          contentType: "text/event-stream",
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
-index f80869b..32e6496 100644
+index f80869b..7f6777b 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
-@@ -13,6 +13,12 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
+@@ -13,6 +13,17 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
  import * as Sse from "effect/unstable/encoding/Sse"
  import { RootHttpApi } from "../api"
  import { GlobalUpgradeInput } from "../groups/global"
-+// kfactory: share the per-instance subscriber-count WeakMap +
-+// publish-event definition with handlers/event.ts so the TUI's
-+// /global/event attach (routed-to-workspace by the workspace-routing
-+// middleware) and the per-instance /event attach both feed the same
-+// counter. See plugins/ntfy in the kfactory repo for the consumer.
++// kfactory: subscribers-changed event + per-bus counter shared with
++// handlers/event.ts. SSE attach bumps the workspace's count so
++// plugins/ntfy can skip-on-connect.
 +import { SubscribersChanged, adjustSubscriberCount } from "./event"
++// kfactory: maps x-opencode-workspace header -> instance bus via
++// Workspace.Service + InstanceStore.provide. Needed because
++// /global/event lives under RootHttpApi with no workspaceRoutingLayer
++// or instanceContextLayer (server.ts route tree).
++import { provideInstanceFromHeader } from "../middleware/instance-context"
++import { Workspace } from "@/control-plane/workspace"
++import { InstanceStore } from "@/project/instance-store"
  
  const log = Log.create({ service: "server" })
  
-@@ -33,7 +39,7 @@ function parseBody(body: string) {
+@@ -33,37 +44,44 @@ function parseBody(body: string) {
    }
  }
  
 -function eventResponse() {
-+function eventResponse(bus: Bus.Interface) {
-   log.info("global event connected")
-   const events = Stream.callback<GlobalBusEvent>((queue) => {
-     const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
-@@ -53,7 +59,16 @@ function eventResponse() {
-       Stream.map(eventData),
-       Stream.pipeThroughChannel(Sse.encode()),
-       Stream.encodeText,
+-  log.info("global event connected")
+-  const events = Stream.callback<GlobalBusEvent>((queue) => {
+-    const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
+-    return Effect.acquireRelease(
+-      Effect.sync(() => GlobalBus.on("event", handler)),
+-      () => Effect.sync(() => GlobalBus.off("event", handler)),
++function eventResponse(disconnect: Effect.Effect<void> | undefined) {
++  return Effect.gen(function* () {
++    log.info("global event connected")
++    const events = Stream.callback<GlobalBusEvent>((queue) => {
++      const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
++      return Effect.acquireRelease(
++        Effect.sync(() => GlobalBus.on("event", handler)),
++        () => Effect.sync(() => GlobalBus.off("event", handler)),
++      )
++    })
++    const heartbeat = Stream.tick("10 seconds").pipe(
++      Stream.drop(1),
++      Stream.map(() => ({ payload: { id: Bus.createID(), type: "server.heartbeat", properties: {} } })),
+     )
+-  })
+-  const heartbeat = Stream.tick("10 seconds").pipe(
+-    Stream.drop(1),
+-    Stream.map(() => ({ payload: { id: Bus.createID(), type: "server.heartbeat", properties: {} } })),
+-  )
+-
+-  return HttpServerResponse.stream(
+-    Stream.make({ payload: { id: Bus.createID(), type: "server.connected", properties: {} } }).pipe(
+-      Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
+-      Stream.map(eventData),
+-      Stream.pipeThroughChannel(Sse.encode()),
+-      Stream.encodeText,
 -      Stream.ensuring(Effect.sync(() => log.info("global event disconnected"))),
-+      Stream.ensuring(
-+        Effect.gen(function* () {
-+          log.info("global event disconnected")
-+          // kfactory: pair the +1 from the GlobalHttpApi.event handler.
-+          // The shared counter clamps at 0 inside adjustSubscriberCount
-+          // so a stray -1 (if the +1 publish was lost) can't underflow.
-+          const disconnectCount = adjustSubscriberCount(bus, -1)
-+          yield* bus.publish(SubscribersChanged, { count: disconnectCount })
-+        }),
+-    ),
+-    {
+-      contentType: "text/event-stream",
+-      headers: {
+-        "Cache-Control": "no-cache, no-transform",
+-        "X-Accel-Buffering": "no",
+-        "X-Content-Type-Options": "nosniff",
++
++    return HttpServerResponse.stream(
++      Stream.make({ payload: { id: Bus.createID(), type: "server.connected", properties: {} } }).pipe(
++        Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
++        Stream.map(eventData),
++        Stream.pipeThroughChannel(Sse.encode()),
++        Stream.encodeText,
++        Stream.ensuring(
++          Effect.gen(function* () {
++            log.info("global event disconnected")
++            if (disconnect) yield* disconnect
++          }),
++        ),
 +      ),
-     ),
-     {
-       contentType: "text/event-stream",
-@@ -77,7 +92,26 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
++      {
++        contentType: "text/event-stream",
++        headers: {
++          "Cache-Control": "no-cache, no-transform",
++          "X-Accel-Buffering": "no",
++          "X-Content-Type-Options": "nosniff",
++        },
+       },
+-    },
+-  )
++    )
++  })
+ }
+ 
+ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handlers) =>
+@@ -77,7 +95,45 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
      })
  
      const event = Effect.fn("GlobalHttpApi.event")(function* () {
 -      return eventResponse()
-+      // kfactory: pull the per-instance Bus.Service so the
-+      // subscriber-count adjustment lands on the SAME bus the per-
-+      // instance event handler uses. When the request is routed-to-
-+      // workspace (TUI attach with x-opencode-workspace header), this
-+      // resolves to the workspace's bus. When routed-as-global (no
-+      // workspace header), this resolves to the front-opencode's bus.
-+      //
-+      // Publish the +1 BEFORE returning the response so the connect
-+      // count lands before the body-pump fiber starts. The
-+      // corresponding -1 lives inside the response stream's
-+      // Stream.ensuring, so cleanup runs on client disconnect /
-+      // instance disposal / server shutdown. Same shape as the per-
-+      // instance event.ts handler (one place to publish on connect,
-+      // one place to publish on disconnect -- no Effect.gen wrapper
-+      // around the whole response builder just to host the connect
-+      // publish).
-+      const bus = yield* Bus.Service
-+      const connectCount = adjustSubscriberCount(bus, 1)
-+      yield* bus.publish(SubscribersChanged, { count: connectCount })
-+      return eventResponse(bus)
++      // kfactory: publish subscribers.changed +1 on connect, -1 on
++      // disconnect onto the workspace's instance bus. No-op when the
++      // request didn't carry x-opencode-workspace, or the workspace is
++      // unknown. bridge.run drops the disconnect Effect's R so
++      // Stream.ensuring typechecks at R=never; the catchAll keeps a
++      // mid-shutdown failure from disappearing silently.
++      const request = yield* HttpServerRequest.HttpServerRequest
++      const workspaceSvc = yield* Workspace.Service
++      const store = yield* InstanceStore.Service
++
++      yield* provideInstanceFromHeader(
++        request,
++        workspaceSvc,
++        store,
++        Effect.gen(function* () {
++          const bus = yield* Bus.Service
++          const connectCount = adjustSubscriberCount(bus, 1)
++          yield* bus.publish(SubscribersChanged, { count: connectCount })
++        }),
++      )
++
++      const disconnect = bridge.run(
++        provideInstanceFromHeader(
++          request,
++          workspaceSvc,
++          store,
++          Effect.gen(function* () {
++            const bus = yield* Bus.Service
++            const disconnectCount = adjustSubscriberCount(bus, -1)
++            yield* bus.publish(SubscribersChanged, { count: disconnectCount })
++          }),
++        ),
++      ).pipe(
++        Effect.catchCause((cause) =>
++          Effect.sync(() => log.warn("global event subscribers-changed (-1) publish failed", { cause })),
++        ),
++      )
++
++      return yield* eventResponse(disconnect)
      })
  
      const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {

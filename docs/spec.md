@@ -354,20 +354,36 @@ relevant to a consumer.
     the adapter regardless of which project the plugin loader ran in).
   - `opencode-session-subscribers.patch` -- publishes
     `kfactory.subscribers.changed` with the ABSOLUTE per-workspace
-    count `{count: N}` on every SSE attach / detach in `event.ts`. A
-    per-instance counter (keyed on the Bus.Interface via a WeakMap)
-    tracks live subscribers; the publish carries the post-change
-    total. The instance bus is workspace-scoped so each publish only
-    reaches plugins running in the same workspace. Used by
-    `plugins/ntfy` to derive a per-workspace "is anyone watching"
-    signal so notifications are skipped (or cancelled mid-wait) when
-    the operator is attached. Absolute-count semantics eliminates the
-    cold-start asymmetry inherent to delta accumulation -- a plugin
-    that loads after a subscriber attached can't reconstruct state
-    from deltas alone, but trivially assigns from the next published
-    count. ~30 LOC; lives in a file neither
-    neighbour patch touches, so stacking is mechanical rather than
-    line-pinned.
+    count `{count: N}` on every SSE attach / detach. The per-instance
+    `/event` handler in `event.ts` runs inside the instance-context
+    layer so it can `yield* Bus.Service` directly. The front-opencode
+    `/global/event` handler in `handlers/global.ts` (used by the TUI's
+    attach-mode SSE) lives under `RootHttpApi` which has no
+    workspaceRoutingLayer or instanceContextLayer, so it resolves the
+    workspace via `Workspace.Service.get(workspaceID)` and threads the
+    publish through `InstanceStore.provide({directory}, ...)`. The
+    shared `provideInstanceFromHeader` helper (added to
+    `middleware/instance-context.ts` in `opencode-bearer-and-routing`)
+    means one piece of code keeps the header-decode + store.provide
+    shape in sync across both call sites. Disconnect publish runs
+    through `bridge.run(...)` with `Effect.catchCause(log.warn)` so a
+    mid-shutdown failure (bus disposed, instance vanished) logs
+    instead of disappearing silently.
+    Absolute-count semantics eliminates the cold-start asymmetry
+    inherent to delta accumulation -- a plugin that loads after a
+    subscriber attached can't reconstruct state from deltas alone,
+    but trivially assigns from the next published count.
+
+    @WARNING (- May 23, 2026): `InstanceStore.provide` will BOOT a
+    workspace that isn't currently cached. /global/event attach can
+    therefore resurrect an instance the recovery-sweep just disposed
+    (modules/recovery.nix). The TUI's flow always attaches to a
+    workspace it just dispatched (warm cache), so the cost is
+    theoretical for kfactory's shape today -- but the next debugging
+    session that asks "why did opencode-serve respawn this workspace
+    I disposed" should land here. A `store.cached(...)` non-loading
+    lookup variant on InstanceStore.Interface would eliminate the
+    side-effect but expands the upstreamable patch surface.
   - `opencode-kfactory-refresh.patch` -- kfactory-specific deployment
     glue, applied on top: `OPENCODE_SERVER_BEARER_CACHE_PATH` env +
     `bearerFromCache()`; subprocess `kfactory auth refresh` spawn via

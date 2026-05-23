@@ -29,7 +29,14 @@ cli_d() { docker exec -d "$CLI_CONTAINER" "$@"; }
 ocexec() { docker exec "$OPENCODE_CONTAINER" "$@"; }
 
 REPO="file:///srv/test-repo.git"
+# Two ntfy URLs. NTFY_URL is host-side (operator opens the topic in a
+# browser via the docker port-publish); NTFY_URL_INTERNAL is the
+# in-network address from inside the cli container (the docker bridge
+# DNS resolves `kfactory-ntfy` to the ntfy container). Phases that
+# `cli curl` ntfy from inside the cli container MUST use the internal
+# URL -- localhost there doesn't reach ntfy.
 NTFY_URL="http://localhost:${NTFY_PORT}"
+NTFY_URL_INTERNAL="http://kfactory-ntfy:80"
 TOPIC="$NTFY_TOPIC"
 # The bearer the opencode container's healthcheck accepts (server
 # runs unauthenticated; any non-empty bearer passes). Same value

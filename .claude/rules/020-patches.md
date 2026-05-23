@@ -18,7 +18,11 @@ Stack order is mandatory:
    bearer flag, `--workspace` plumbing, workspace-routing header
    fallback (v1 + v2 path), `Session.list` + `Session.listGlobal`
    workspaceID filter (workspace_id supersedes project_id when set),
-   plugin-adapter ProjectID.global registration.
+   plugin-adapter ProjectID.global registration, plus the
+   `provideInstanceFromHeader` helper in
+   `middleware/instance-context.ts` (header -> workspace ->
+   InstanceStore.provide; used by /global/event SSE handler in the
+   session-subscribers patch).
 2. `patches/opencode-workspace-branch.patch` -- upstreamable subset:
    `WorkspaceHttpApi.list` enriches each row's `branch` field with a
    FRESH `.git/HEAD` read at request time (via Effect.forEach +
@@ -48,7 +52,10 @@ against a fresh opencode source**.
 A change is in **bearer-and-routing** if it's something opencode upstream
 would plausibly accept: env-var flag wiring, CLI flags on
 `opencode attach`, workspace-id plumbing, header-routing semantics,
-session.list filtering by workspace_id, plugin-adapter project scope.
+session.list filtering by workspace_id, plugin-adapter project scope,
+and the routing middleware in
+`server/routes/instance/httpapi/middleware/` (including the
+`provideInstanceFromHeader` helper).
 
 A change is in **workspace-branch** if it touches
 `WorkspaceHttpApi.list` row enrichment (today: live `branch` read

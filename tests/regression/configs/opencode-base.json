@@ -3,6 +3,6 @@
   "permission": {
     "edit": "allow",
     "bash": "allow",
-    "webfetch": "allow"
+    "webfetch": "ask"
   }
 }

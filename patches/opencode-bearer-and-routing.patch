@@ -418,6 +418,64 @@ index ffe8d0b..cf057f3 100644
          .pipe(Effect.ignore, Effect.forkIn(scope))
        return true
      })
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/instance-context.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/instance-context.ts
+index 90f3ce4..958580a 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/middleware/instance-context.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/middleware/instance-context.ts
+@@ -1,9 +1,15 @@
+ import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
+ import { InstanceStore } from "@/project/instance-store"
+-import { Effect, Layer } from "effect"
+-import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
++import { Effect, Layer, Option, Schema } from "effect"
++import { HttpServerRequest, HttpRouter, HttpServerResponse } from "effect/unstable/http"
+ import { HttpApiMiddleware } from "effect/unstable/httpapi"
+ import { WorkspaceRouteContext } from "./workspace-routing"
++// kfactory: provideInstanceFromHeader (below) shares the header-decode
++// + store.provide shape so routes outside workspaceRoutingLayer (today
++// the /global/event SSE handler in RootHttpApi) can still publish onto
++// a workspace's instance bus without rebuilding the lookup chain.
++import { Workspace } from "@/control-plane/workspace"
++import { WorkspaceID } from "@/control-plane/schema"
+ 
+ export class InstanceContextMiddleware extends HttpApiMiddleware.Service<
+   InstanceContextMiddleware,
+@@ -48,3 +54,35 @@ export const instanceRouterMiddleware = HttpRouter.middleware()(
+     return (effect) => provideInstanceContext(effect, store)
+   }),
+ )
++
++// kfactory: resolve x-opencode-workspace header -> directory ->
++// InstanceStore.provide. Used by the /global/event SSE handler, which
++// lives under RootHttpApi (no workspaceRoutingLayer / instanceContextLayer
++// in its layer chain) but still needs to publish onto the workspace's
++// instance bus on SSE attach/detach. `effect`'s requirements are
++// preserved end-to-end; InstanceRef is injected by store.provide so
++// Bus.Service resolves inside.
++//
++// @WARNING (- May 23, 2026): store.provide WILL boot a workspace that
++// isn't currently cached, which can resurrect an instance that the
++// recovery-sweep just disposed. The TUI's attach flow always reaches
++// an instance that was just dispatched (warm cache), so the cost is
++// theoretical for kfactory's current shape. Documented in docs/spec.md.
++export function provideInstanceFromHeader<E, R>(
++  request: HttpServerRequest.HttpServerRequest,
++  workspaceSvc: Workspace.Interface,
++  store: InstanceStore.Interface,
++  effect: Effect.Effect<void, E, R>,
++): Effect.Effect<void, E, R> {
++  return Effect.gen(function* () {
++    const header = request.headers["x-opencode-workspace"]
++    const workspaceID = header
++      ? Option.getOrUndefined(Schema.decodeUnknownOption(WorkspaceID)(header))
++      : undefined
++    if (!workspaceID) return
++    const workspace = yield* workspaceSvc.get(workspaceID)
++    const directory = workspace?.directory ?? undefined
++    if (!directory) return
++    yield* store.provide({ directory }, effect)
++  })
++}
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
 index 8bffe59..367b2a5 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
