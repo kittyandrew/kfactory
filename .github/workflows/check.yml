@@ -3,12 +3,10 @@ name: ci
 # Single job: lint + flake check + (conditionally) attic push.
 #
 # The attic setup step is gated by an `if:` so PR-from-fork runs never
-# see ATTIC_GENERAL_PUSH_TOKEN in their environment. attic-action's
-# post-hook only fires when its setup step actually ran (GHA semantics:
-# post is skipped iff main is skipped via `if:`), so the push happens
-# iff the gate passed. This avoids the older two-job shape (quality +
-# build) that re-ran `nix flake check` twice (once per job) to keep
-# secrets out of fork-PR runs.
+# see ATTIC_GENERAL_PUSH_TOKEN in their environment. The explicit push
+# step shares the same gate. This avoids the older two-job shape
+# (quality + build) that re-ran `nix flake check` twice (once per job)
+# to keep secrets out of fork-PR runs.
 #
 # Step ordering: linters + tests run BEFORE the attic setup so that
 # (1) on PR/fork runs the entire job is secret-free, and (2) on
@@ -16,8 +14,37 @@ name: ci
 # lint/test gates have passed -- preserving the old "linters pass
 # before secrets" property of the two-job shape.
 #
-# Adding a new package to `packages.${system}` in flake.nix automatically
-# becomes a CI gate: `nix flake check` builds it; nothing to edit here.
+# Substituter setup:
+#   - cache.nixos.org -- preconfigured by nix-installer-action; serves
+#     nixpkgs paths (glibc, gcc-lib, nodejs-slim, etc.).
+#   - Attic `general` -- attic-action registers it as a substituter
+#     (`skip-use: false` default) on push-to-default-branch only; for
+#     PR/fork runs, no substituter is added and the build pulls only
+#     from cache.nixos.org.
+# (We used to use DeterminateSystems/magic-nix-cache-action here as
+# a third layer to cache CI-run intermediates via GitHub Actions cache,
+# but it broke on two fronts: (a) FlakeHub auth fails without explicit
+# credentials [opt-in per repo], (b) GHA Actions Cache throttles
+# magic-nix-cache mid-run, after which it becomes a no-op for the
+# rest of the run. Net: marginal benefit, real maintenance burden.
+# Dropped in favor of the explicit Attic push below, which captures
+# the same artifacts more reliably and gives us a single inter-run
+# cache.)
+#
+# Push semantics: attic-action's automatic post-hook would push EVERY
+# path that appeared in the store during the job, including 1.9 GiB
+# build-time-only intermediates like `opencode-node_modules` (which
+# nothing references at runtime). We disable the auto-push and instead
+# run `attic push` ourselves against the explicit set drawn from
+# `checks.<system>.*` -- this is the flake's own canonical list of
+# "things kfactory verifies on every CI" and folds in
+# `packages.<system>.*` + `plugins.<system>.*` + the
+# `factory-*-typecheck` markers automatically (see flake.nix's
+# `checks = ... packageChecks // pluginChecks // ...` block).
+# attic push resolves each path's RUNTIME closure and pushes the union,
+# naturally skipping every build-time-only path without any allowlist
+# regex to maintain. Adding a new check (or package/plugin, which fold
+# into checks) automatically picks up Attic caching too.
 
 on:
   push:
@@ -36,13 +63,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3
-
-      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: GitHub Actions lint (actionlint)
         run: nix develop -c actionlint
@@ -85,14 +110,43 @@ jobs:
       # the artifacts to push) so credentials only enter the environment
       # after all lint/test gates have passed. PR/fork runs skip this
       # step entirely via the `if:` gate, leaving the rest of the job
-      # secret-free.
+      # secret-free. `skip-push: true` disables the action's automatic
+      # post-hook push; we run an explicit `attic push` below with a
+      # curated path set.
       - name: Setup Attic cache
         if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: ryanccn/attic-action@5635a15ef0c5462194ffbd05d1daeddc74625c3a
+        uses: ryanccn/attic-action@5635a15ef0c5462194ffbd05d1daeddc74625c3a # v0.5.0
         with:
           endpoint: ${{ vars.ATTIC_ENDPOINT }}
           cache: general
           token: ${{ secrets.ATTIC_GENERAL_PUSH_TOKEN }}
+          skip-push: "true"
 
       - name: Flake check (builds all packages + checks)
         run: nix flake check --print-build-logs
+
+      # Push every flake check's output + its runtime closure. flake.nix's
+      # checks attrset is the authoritative "what kfactory verifies" set:
+      # it folds in packages, plugins, plugin typechecks, integration
+      # typechecks, third-party smoke checks, dev-script shellchecks,
+      # and the bespoke factory-* checks. We enumerate it via `nix eval`
+      # so adding new entries to that attrset picks up Attic caching
+      # automatically with no workflow edit.
+      #
+      # attic push naturally excludes build-time-only paths
+      # (opencode-node_modules at 1.9 GiB, rustc, llvm, gcc toolchain,
+      # python3, bun, models-dev-node_modules) because none of them
+      # appear in any runtime closure.
+      - name: Push to Attic
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          set -euo pipefail
+          system="x86_64-linux"
+          mapfile -t paths < <(
+            nix eval --json ".#checks.${system}" --apply \
+              'cs: builtins.attrValues (builtins.mapAttrs (n: v: v.outPath) cs)' \
+              | jq -r '.[]'
+          )
+          echo "Pushing ${#paths[@]} paths + their runtime closures to attic:"
+          printf '  %s\n' "${paths[@]}"
+          attic push general "${paths[@]}"
