@@ -1,4 +1,4 @@
-# [4e/N] TUI live-progress: /global/event SSE delivers workspace events
+# [4e] TUI live-progress: /global/event SSE delivers workspace events
 # to a subscriber attached via the TUI's exact shape (Authorization:
 # Bearer + x-opencode-workspace header). The bug we're catching: the
 # TUI sees nothing live; messages and progress only appear after a
@@ -18,9 +18,9 @@
 # session.* / message.* / part.* event proves end-to-end live delivery.
 
 echo
-echo "[4e/9] TUI live-progress: /global/event SSE delivers workspace events..."
+echo "[4e] TUI live-progress: /global/event SSE delivers workspace events..."
 
-ATTACH_WS=$WS2  # WS2 was dispatched in [2/9], no other phase touches it.
+ATTACH_WS=$WS2  # WS2 was dispatched in [2], no other phase touches it.
 SSE_LOG=/tmp/sse-events-live.out
 SSE_PID_FILE=/tmp/sse-events-live.pid
 

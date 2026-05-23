@@ -128,10 +128,8 @@ in {
     prompt = lib.mkOption {
       type = lib.types.str;
       default = ''
-        opencode-serve was restarted while your turn was in flight. Your
-        previous response was interrupted (marked finish=interrupted-by-restart).
-        Review your last actions, decide whether the work needs to be
-        completed, re-tried, or abandoned, and continue accordingly.
+        Opencode just restarted while your turn was in flight. Pick up
+        where you left off and continue accordingly as you were.
       '';
       description = ''
         Prompt injected into each workspace's most-recent session by

@@ -1,9 +1,9 @@
-# [3/9] Verify kfactory list shows the three rows in creation order.
+# [3] Verify kfactory list shows the three rows in creation order.
 # Failure here means the SORT in client.go diverged from the
 # 1-based-index resolution that attach uses.
 
 echo
-echo "[3/9] kfactory list -- should show THREE rows in creation order..."
+echo "[3] kfactory list -- should show THREE rows in creation order..."
 cli kfactory list
 # `grep -c` exits 1 on zero matches, leaving LIST_COUNT empty under
 # `|| true` -- the subsequent `[ "$LIST_COUNT" -lt 3 ]` then crashes

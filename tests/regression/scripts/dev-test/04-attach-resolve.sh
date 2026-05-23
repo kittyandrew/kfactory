@@ -1,4 +1,4 @@
-# [4/9] Resolve each ref via 'kfactory attach' (no TUI -- just resolve).
+# [4] Resolve each ref via 'kfactory attach' (no TUI -- just resolve).
 # We're not actually attaching (TUI requires a real terminal); we ARE
 # validating that the CLI's ref-resolution path resolves each form
 # (id, slug, index, prefix) to the correct workspace ID -- the canary
@@ -11,7 +11,7 @@
 # operator to do the actual TUI attach manually.
 
 echo
-echo "[4/9] Resolve each ref via 'kfactory attach' (no TUI -- just resolve)..."
+echo "[4] Resolve each ref via 'kfactory attach' (no TUI -- just resolve)..."
 echo "      → Checking that index 1 corresponds to first-dispatched workspace ($WS1):"
 INDEX1=$(cli kfactory list 2>/dev/null | tail -n +2 | head -1 | awk '{print $2}')
 if [ "$INDEX1" = "$WS1" ]; then

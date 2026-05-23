@@ -1,4 +1,4 @@
-# [4c/9] listByProject workspaceID filter regression.
+# [4c] listByProject workspaceID filter regression.
 #
 # Sessions stamped with workspace's hashed project_id at INSERT (POST
 # /session forwards to the workspace instance); GET /session stays in
@@ -14,7 +14,7 @@
 # path; this phase replicates that.
 
 echo
-echo "[4c/9] listByProject filter for the TUI's session.list shape..."
+echo "[4c] listByProject filter for the TUI's session.list shape..."
 
 # Premise: sessions stamped with workspace's HASHED project_id (not
 # 'global'). If upstream changes that, the bug dissolves.

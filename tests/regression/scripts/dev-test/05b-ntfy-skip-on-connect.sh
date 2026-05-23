@@ -1,4 +1,4 @@
-# [5b/9] ntfy skip-on-connect regression: when an SSE subscriber is
+# [5b] ntfy skip-on-connect regression: when an SSE subscriber is
 # attached to /global/event with the workspace header (the TUI's exact
 # shape), session.idle's pending notification MUST be cancelled by the
 # subscriberCount > 0 signal published by the opencode-session-subscribers
@@ -19,9 +19,9 @@
 # window, polling-since-TS catches it.
 
 echo
-echo "[5b/9] ntfy skip-on-connect (suppress while SSE attached)..."
+echo "[5b] ntfy skip-on-connect (suppress while SSE attached)..."
 
-# WS3 keeps WS1 free for [9/9]. WS3's .git was wiped by 03b's no-branch
+# WS3 keeps WS1 free for [9]. WS3's .git was wiped by 03b's no-branch
 # assertion -- fine here, we only need a bus + session.
 ATTACH_WS=$WS3
 ATTACH_SESS=$(cli curl -sf -H "Authorization: Bearer $TOKEN" \

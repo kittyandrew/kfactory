@@ -1,11 +1,11 @@
-# [2/9] Dispatch THREE workspaces against the bundled test repo.
+# [2] Dispatch THREE workspaces against the bundled test repo.
 # Each dispatch creates its own random-slug workspace + session; the
 # returned workspace IDs are reused by later phases (attach
 # resolution + per-workspace session isolation + the heal/recovery
 # round-trip uses WS1 as its target).
 
 echo
-echo "[2/9] Dispatch THREE workspaces against $REPO..."
+echo "[2] Dispatch THREE workspaces against $REPO..."
 WS1=$(cli kfactory dispatch "$REPO" "say hi and immediately stop")
 echo "      → ws1 = $WS1"
 WS2=$(cli kfactory dispatch "$REPO" "echo done")

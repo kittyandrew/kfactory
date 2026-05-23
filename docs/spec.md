@@ -268,8 +268,19 @@ streaming" forever on the next attach (the sync layer renders a spinner
 until a finish marker shows up). The `opencode-heal` SQLite script
 (shipped as `packages.opencode-heal`, wired via
 `services.kfactory.recovery` as ExecStartPre) marks all such orphans
-as `finish: "interrupted-by-restart"` before opencode starts, so the
-TUI shows a clean "stopped" badge.
+before opencode starts so the TUI's interrupted-badge renders:
+
+- `data.time.completed = now()` -- unblocks the spinner.
+- `data.finish = "interrupted-by-restart"` -- informational; the
+  upstream UI ignores `finish` for rendering.
+- `data.error = {name: "MessageAbortedError", data: {message: "..."}}`
+  -- THIS is what triggers opencode's "Interrupted" badge: the
+  upstream timeline renderer checks `m.error?.name ===
+  "MessageAbortedError"` (see the `MessageAbortedError` branch in
+  `packages/app/src/pages/session/message-timeline.data.ts` of the
+  locked opencode source). Pre-2026-05, heal only set `finish`;
+  healed turns visually looked completed-normal. Now they show as
+  interrupted.
 
 Heal is also the FIRST step of the broader recovery flow: it doesn't
 just mark rows, it also EMITS the workspace IDs whose sessions had
@@ -285,6 +296,39 @@ leaving stuck-but-cleaned rows without any nudge for the operator).
 Heal + recovery are tightly coupled by design: empty queue (no stuck
 rows) = recovery-sweep no-op.
 
+**Abandoned-PTY pass (kfactory-specific).** opencode-pty's PTY state
+is purely in-memory (`SessionLifecycleManager.sessions: Map<id, Session>`
+in `dist/src/plugin/pty/session-lifecycle.js`). On restart the bun
+process dies; child PTY processes die with it; the `process.onExit`
+JS handler that would have injected `<pty_exited>` is gone. The
+spawning assistant turn was `time.completed=set` when the tool
+returned, so heal's `time.completed IS NULL` predicate doesn't match
+-- recovery queue stays empty, operator's task silently dropped.
+
+heal's second pass closes this: a TEMP TABLE `abandoned_pty` collects
+`(message_id, session_id, workspace_id, spawn_time, pty_id)` for every
+`pty_spawn(notifyOnExit=true)` tool part, then DELETEs entries that DO
+have a matching user-role `</pty_exited>...ID: <pty_id>` text part
+after the spawn. What remains is the set of abandoned PTYs. Each gets
+its containing message marked with the same `MessageAbortedError`
+shape (different `data.message`: "opencode-pty session killed by
+opencode-serve restart") and its workspace queued for recovery-sweep.
+Per-pty_id anchoring (not just `</pty_exited>`-substring) closes the
+multi-PTY-per-session false-negative class: pty_A's exit message
+can't accidentally resolve pty_B.
+
+@WARNING (- May 23, 2026): the abandoned-PTY pass couples to
+opencode-pty's `<pty_spawned>\nID: pty_<8-hex>` output format AND
+the `<pty_exited>...ID: pty_<8-hex>...</pty_exited>` synthetic-user-
+message format. Both come from a THIRD-PARTY plugin (shekohex/opencode-
+pty) we don't control. A future-work upstream PR would have
+opencode-pty publish `pty.spawned` / `pty.exited` bus events instead;
+then heal + plugins/ntfy could subscribe to structured signals rather
+than string-matching the plugin's text output. Until that lands, the
+format-coupling is the load-bearing risk; bumping `thirdPartyPluginSrcs.
+opencode-pty.version` in `flake.nix` requires re-verifying the
+regression suite covers 5d + 10.
+
 Between heal and recovery-sweep, an `opencode-sync-kick` ExecStartPost
 HTTP-pokes the per-workspace status sync that opencode otherwise only
 triggers on SPA init. Without this, the first session interact after
@@ -293,8 +337,17 @@ restart shows "Workspace Unavailable."
 The heal targets BOTH opencode's v1 `message` table and the v2
 `session_message` table; whichever doesn't exist on a given DB is a
 silent no-op (the script probes `sqlite_master` first). opencode
-v1.15.9 routes assistant rows through v2; v1 is legacy. Row counts
-+ affected-workspace count log to the journal.
+v1.15.9 routes assistant rows through v1; v2 only carries event
+rows (agent-switched, model-switched). The abandoned-PTY pass is v1-
+only today; a `heal_*_pty_v2` skeleton lands when opencode moves
+assistant rows to v2.
+
+The heal log is emitted as a single-line JSON object on stdout:
+`opencode-heal: {"v1_message":N, "v2_session_message":M,
+"abandoned_pty":P, "affected_workspaces":W}`. Stable schema for
+monitoring / scripted consumers; the previous `k=v k=v ...` shape was
+position-fragile (adding `abandoned_pty` silently shifted columns for
+anyone field-splitting it).
 
 ## 6. Decisions log
 
@@ -621,6 +674,38 @@ relevant to a consumer.
   in another shell -- you'll miss notifications from concurrent
   sessions in the same workspace.
 
+  **PTY-pending idle suppression.** When the agent uses opencode-pty's
+  `pty_spawn(notifyOnExit=true)` (the plugin's documented async
+  pattern), the tool returns immediately and the LLM turn completes;
+  `session.idle` fires while the PTY is still running. Without
+  intervention, ntfy fires a misleading "Agent Idle" notification
+  3s later. The PTY's own onExit callback eventually injects a
+  `<pty_exited>` user message that wakes the agent for turn 2 --
+  the "idle" was transient.
+
+  The ntfy plugin gates `session.idle` on a session-history scan
+  (`plugins/ntfy/src/index.ts:hasUnfinishedPtySpawn`): for each
+  assistant `pty_spawn(notifyOnExit=true)` tool part, extract the
+  `pty_id` from the tool's `state.output` (structured field, format
+  `<pty_spawned>\nID: pty_<8-hex>`), then walk forward looking for a
+  user-role text part containing `</pty_exited>` AND `ID: <pty_id>`.
+  Any spawn without a matching exit is a pending PTY -> suppress the
+  idle notification. Closing-tag + per-id anchoring discriminates the
+  plugin's synthetic message from the agent's prose (system_reminder
+  text mentions `<pty_exited>`) and prevents a multi-PTY false-
+  negative (pty_A's exit message can't accidentally resolve pty_B).
+  Same heuristic as the heal abandoned-PTY pass; both encode the
+  same third-party-format contract.
+
+  @WARNING (- May 23, 2026): `hasUnfinishedPtySpawn` calls
+  `client.session.messages` without a `limit`, so long-lived sessions
+  pay O(N) HTTP + O(N) walk per `session.idle` event. Acceptable for
+  current operator scale; the structural fix is the upstream PR to
+  shekohex/opencode-pty for `pty.spawned` / `pty.exited` bus events
+  (referenced in the heal section above). Once that lands, both
+  consumers (heal SQL + ntfy plugin) replace text-matching with a
+  structured signal.
+
 - **`opencode-pty` packaged as a third-party Nix dependency, NOT
   vendored.** Third-party opencode plugins that kfactory wants to
   ship live under `plugins/<name>/` -- same parent directory as
@@ -744,6 +829,17 @@ relevant to a consumer.
   changes land; this isn't currently a flake check because spinning
   the regression tests inside one would mean docker-in-nix-sandbox
   gymnastics that aren't worth the gate they buy.
+
+  @WARNING (- May 23, 2026): `tests/regression/scripts/dev-test/10-
+  pty-restart-abandons-task.sh` runs `docker restart
+  kfactory-opencode` mid-suite -- the restart leaks into any later
+  phase that gets added. The harness concatenates phases in lex order,
+  so 10 runs LAST today but a future `11-*` or `10b-*` would inherit
+  a freshly-restarted container without being told. Either keep
+  destructive phases anchored at the tail (current convention) OR
+  factor them into a separate `dev-test-destructive/` sub-suite if
+  the count grows past one. Documented here so the convention is
+  visible without having to read the phase header.
 
 - **Upstream-contract watch list.** opencode is EXPERIMENTAL (gated by
   `OPENCODE_EXPERIMENTAL_WORKSPACES`); re-verifying these on every

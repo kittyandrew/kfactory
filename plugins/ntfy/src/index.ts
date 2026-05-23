@@ -50,6 +50,75 @@ import {
 } from "./config.js"
 import { sendNtfy, type EventMetadata, type NotificationContext } from "./backend.js"
 
+// ---- Pending-PTY check (suppress idle while opencode-pty is running) ----
+
+// When the agent uses opencode-pty's pty_spawn with notifyOnExit=true,
+// the tool returns immediately and the LLM turn completes; session.idle
+// fires even though the *task* isn't done. opencode-pty's
+// notification-manager.js injects a `<pty_exited>` user message when
+// the PTY exits, kicking off a new agent turn. Without this check the
+// operator gets a misleading "Agent Idle" ping mid-task.
+//
+// We resolve unfinished PTYs by reading session history: collect every
+// pty_spawn(notifyOnExit=true) tool part, extract the pty_id from its
+// output (format: `<pty_spawned>\nID: pty_XXXX\n...`), then scan
+// subsequent user messages for the matching `<pty_exited>...ID: pty_X`
+// block. Any pty_id without a follow-up is still pending.
+//
+// Fail-OPEN on lookup error: the alternative (suppressing every idle
+// when the lookup fails) silently mutes notifications, which is worse
+// than the false-positive we're trying to avoid.
+async function hasUnfinishedPtySpawn(client: OpencodeClient, sessionID: string): Promise<boolean> {
+  try {
+    const resp = await client.session.messages({ path: { id: sessionID } })
+    const messages = resp.data
+    if (!Array.isArray(messages)) return false
+
+    // Forward walk: assistant pty_spawn(notifyOnExit=true) adds an
+    // entry; a subsequent user-role `</pty_exited>...ID: <pty_id>`
+    // text part removes it. Any entry surviving the walk is a
+    // pending PTY. Closing tag `</pty_exited>` discriminates the
+    // plugin's synthetic user message from the agent's prose
+    // (system_reminder "Waiting for the `<pty_exited>` signal").
+    // Per-id match closes the multi-PTY false-negative class.
+    //
+    // pty_id format: `pty_` + 8 hex chars (opencode-pty's
+    // session-lifecycle.js:5, SESSION_ID_BYTE_LENGTH=4). Tight regex
+    // catches a format change loudly instead of silently widening.
+    const pending = new Set<string>()
+    for (const msg of messages) {
+      const role = msg.info?.role
+      if (role === "assistant") {
+        for (const part of msg.parts ?? []) {
+          if (part.type !== "tool" || part.tool !== "pty_spawn") continue
+          // Narrow on the discriminated ToolState union. `output` is
+          // only present in the "completed" branch; "running" / "error"
+          // never carry a pty_id, so skip them.
+          if (part.state.status !== "completed") continue
+          if (part.state.input?.notifyOnExit !== true) continue
+          const m = part.state.output.match(/ID:\s+(pty_[a-f0-9]+)/)
+          if (m) pending.add(m[1])
+        }
+      } else if (role === "user" && pending.size > 0) {
+        const text = (msg.parts ?? [])
+          .filter((p) => p.type === "text")
+          .map((p) => (p as { text: string }).text)
+          .join("")
+        if (text.includes("</pty_exited>")) {
+          for (const id of [...pending]) {
+            if (text.includes(`ID: ${id}`)) pending.delete(id)
+          }
+        }
+      }
+    }
+    return pending.size > 0
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`ntfy: hasUnfinishedPtySpawn(${sessionID}) lookup failed: ${msg}`)
+    return false
+  }
+}
+
 // ---- Subagent check ----
 
 // A session with non-empty parentID is a subagent (child of the operator's
@@ -258,6 +327,16 @@ const Ntfy: Plugin = async (input) => {
     // (non-configurable: "notify when nobody's watching" is the
     // plugin's stated purpose). Next event evaluates fresh.
     if (subscriberCount > 0) return
+
+    // Pending opencode-pty session: agent's LLM is idle but a
+    // notifyOnExit=true PTY will inject `<pty_exited>` and wake the
+    // agent. Suppress idle to avoid a misleading "task done" ping.
+    // Only relevant for session.idle -- session.error / permission.asked
+    // are real signals regardless of PTY state.
+    if (event === "session.idle" && (await hasUnfinishedPtySpawn(client, sessionID))) {
+      console.info(`ntfy: suppressing session.idle for ${sessionID}: pending PTY (notifyOnExit=true)`)
+      return
+    }
 
     const key = timerKey(sessionID, event)
     const context: NotificationContext = { event, metadata }

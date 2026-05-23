@@ -1,11 +1,11 @@
-# [4b/9] Per-workspace /session isolation -- listByProject workspaceID
+# [4b] Per-workspace /session isolation -- listByProject workspaceID
 # filter regression. Without the filter, workspaces sharing project_id
 # collapse to one result list and --continue lands on the same session.
 # Hits the TUI's actual /session (not /experimental/session) +
 # `?directory=` shape with the x-opencode-workspace header.
 
 echo
-echo "[4b/9] Per-workspace session-list isolation (the bug --continue triggers)..."
+echo "[4b] Per-workspace session-list isolation (the bug --continue triggers)..."
 WS1_DIR=$(cli curl -sf -H "Authorization: Bearer $TOKEN" -H "x-opencode-workspace: $WS1" \
   "$OPENCODE_BASE/project" | jq -r '.[] | select(.vcs == "git") | .worktree')
 WS2_DIR=$(cli curl -sf -H "Authorization: Bearer $TOKEN" -H "x-opencode-workspace: $WS2" \

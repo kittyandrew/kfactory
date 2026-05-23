@@ -1,10 +1,10 @@
-# [3b/9] BRANCH column regression: the patched
+# [3b] BRANCH column regression: the patched
 # /experimental/workspace handler reads .git/HEAD per row server-side
 # (single round-trip, not N+1). WorkspaceTable.branch stays NULL
 # under kfactory-adapter; the patch fills the field live.
 
 echo
-echo "[3b/9] kfactory list BRANCH column..."
+echo "[3b] kfactory list BRANCH column..."
 
 # test-repo defaults to "main"; accept any non-empty/non-dash value
 # since git defaults can differ.

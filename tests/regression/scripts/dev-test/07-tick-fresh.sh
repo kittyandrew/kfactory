@@ -1,10 +1,10 @@
-# [7/9] tick (scheduled) -- fresh-workspace mint. Task-id is the
+# [7] tick (scheduled) -- fresh-workspace mint. Task-id is the
 # deterministic slug suffix so a second tick finds the workspace by
 # slug-ends-with-id. 4-hex constraint enforced at scheduled-tasks.nix,
 # cmd/kfactory/tick.go, and plugins/kfactory-adapter SLUG_RE.
 
 echo
-echo "[7/9] kfactory tick (scheduled) -- fresh-workspace path..."
+echo "[7] kfactory tick (scheduled) -- fresh-workspace path..."
 TASK_ID="aaaa"
 
 # Sweep stale workspaces so we observe a real mint, not an idempotent no-op.

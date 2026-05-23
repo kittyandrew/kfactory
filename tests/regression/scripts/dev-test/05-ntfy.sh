@@ -1,4 +1,4 @@
-# [5/9] Verify session.idle ntfy notification fires AND its body has
+# [5] Verify session.idle ntfy notification fires AND its body has
 # real (substituted) content. Defaults like "{project} · {branch}"
 # must be passed through renderTemplate; the body assertion is what
 # catches plugins/ntfy/src/backend.ts:resolveContent skipping the
@@ -11,7 +11,7 @@
 # capture window we'd open here.
 
 echo
-echo "[5/9] ntfy session.idle notification body (substituted vs literal)..."
+echo "[5] ntfy session.idle notification body (substituted vs literal)..."
 
 # Poll all messages on the topic in the past hour. ntfy's `poll=1` mode
 # returns historical messages and exits, not a streaming connection.

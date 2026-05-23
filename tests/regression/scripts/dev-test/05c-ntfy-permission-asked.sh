@@ -1,4 +1,4 @@
-# [5c/9] permission.asked ntfy notification: body must substitute
+# [5c] permission.asked ntfy notification: body must substitute
 # {project} + {permission_type} from event metadata, not deliver the
 # literal placeholders. Default template (backend.ts) is
 # "{project} · {permission_type}" specifically because the operator
@@ -12,7 +12,7 @@
 # reply that never comes -- fine for our purposes, dev-down cleans up.
 
 echo
-echo "[5c/9] permission.asked ntfy body (project + permission_type, not literal placeholders)..."
+echo "[5c] permission.asked ntfy body (project + permission_type, not literal placeholders)..."
 
 # Fresh workspace: WS3 (used in 5b) and WS2 (used in 4e) both had SSE
 # subscribers attached, so their ntfy plugin instances may still see

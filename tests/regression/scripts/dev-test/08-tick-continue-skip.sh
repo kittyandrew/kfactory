@@ -1,9 +1,9 @@
-# [8/9] tick (scheduled) -- continue + skip-if-exists (separate config).
+# [8] tick (scheduled) -- continue + skip-if-exists (separate config).
 # Stdout = workspace id on every tick exit (including skip) so wrappers
 # capturing $(kfactory tick ...) always get a usable reference.
 
 echo
-echo "[8/9] kfactory tick (scheduled) -- continue + skip-if-exists..."
+echo "[8] kfactory tick (scheduled) -- continue + skip-if-exists..."
 
 # ---- continue branch ----
 

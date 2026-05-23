@@ -1,9 +1,9 @@
-# [6/9] /loop manual instructions. The /loop slash command needs a
+# [6] /loop manual instructions. The /loop slash command needs a
 # session context, which requires interactive TUI attach. Print the
 # instructions; no automated assertions.
 
 echo
-echo "[6/9] Trigger /loop manually..."
+echo "[6] Trigger /loop manually..."
 echo "      The /loop slash command needs a session context, which"
 echo "      requires interactive TUI attach. To exercise it manually:"
 echo

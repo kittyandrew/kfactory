@@ -1,4 +1,4 @@
-# [9/9] heal + sync-kick + recovery round-trip canary.
+# [9] heal + sync-kick + recovery round-trip canary.
 #   1) manufacture stuck assistant turn (simulate mid-flight crash);
 #   2) heal marks the row + writes the recovery queue;
 #   3) sync-kick succeeds;
@@ -8,9 +8,9 @@
 # can't silently weaken it.
 
 echo
-echo "[9/9] opencode-heal + opencode-sync-kick + recovery round-trip..."
+echo "[9] opencode-heal + opencode-sync-kick + recovery round-trip..."
 
-# Reuse WS1 from [2/9]; "uncomplete" its assistant turn to simulate
+# Reuse WS1 from [2]; "uncomplete" its assistant turn to simulate
 # the crash. opencode stores turns in EITHER `message` (v1, role in
 # JSON) or `session_message` (v2, role in `type` column) depending on
 # version; probe both.
@@ -85,6 +85,28 @@ else
   exit 1
 fi
 
+# Opencode's UI renders the interrupted badge by checking
+# `m.error?.name === "MessageAbortedError"` (the MessageAbortedError
+# branch in packages/app/src/pages/session/message-timeline.data.ts
+# of the locked opencode source). The `finish` field is purely
+# informational and doesn't trigger the badge. Without `error.name`
+# set, an operator sees a healed turn as fully completed -- no
+# visual cue that opencode-serve crashed mid-flight.
+HEAL_ERROR_NAME=$(ocexec sqlite3 "$OPENCODE_DB" "
+  SELECT json_extract(data, '\$.error.name') FROM $HEAL_TABLE
+    WHERE id='$HEAL_MSG';")
+if [ "$HEAL_ERROR_NAME" = "MessageAbortedError" ]; then
+  echo "      ✓ assistant row has error.name='MessageAbortedError' (UI renders as interrupted)"
+else
+  echo "      ❌ assistant row has error.name='$HEAL_ERROR_NAME' (expected 'MessageAbortedError')"
+  echo "         opencode's UI ignores the 'finish' field for interrupted-rendering."
+  echo "         It checks m.error?.name === 'MessageAbortedError' in"
+  echo "         packages/app/src/pages/session/message-timeline.data.ts."
+  echo "         Without that, the operator sees a healed turn as fully"
+  echo "         completed -- no indication opencode-serve crashed mid-flight."
+  exit 1
+fi
+
 # Localhost-inside-container mirrors the production ExecStartPost wiring.
 SYNC_LOG=$(ocexec opencode-sync-kick --base http://localhost:4096 --health-timeout 10 2>&1)
 echo "      → sync-kick log: $SYNC_LOG"
@@ -134,8 +156,3 @@ else
   exit 1
 fi
 
-echo
-echo "========================================================"
-echo " Done."
-echo " ntfy UI:  $NTFY_URL/$TOPIC"
-echo "========================================================"

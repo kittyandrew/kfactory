@@ -1,4 +1,4 @@
-# [4d/9] sync/start?workspace= populates status -- regression for the
+# [4d] sync/start?workspace= populates status -- regression for the
 # project_id divergence in SyncHttpApi.start. Same class as the
 # listByProject fix in opencode-bearer-and-routing.patch (phase 4c):
 # routed instance's project.id is the worktree-hash but
@@ -11,7 +11,7 @@
 # the no-workspace-param path (project_id="global") for downstream.
 
 echo
-echo "[4d/9] /sync/start?workspace= populates status..."
+echo "[4d] /sync/start?workspace= populates status..."
 
 # Mirrors a real opencode-serve restart: DB stays, in-memory state wipes.
 docker restart "$OPENCODE_CONTAINER" >/dev/null
