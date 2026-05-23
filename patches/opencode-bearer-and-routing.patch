@@ -39,6 +39,24 @@ What this adds:
     same repo produces three sessions with identical project_id but
     distinct workspace_id, and `GET /experimental/session?workspace=<id>`
     returns exactly the session for that workspace.
+  - `Workspace.startWorkspaceSyncing` accepts an optional `workspaceID`
+    opt; when set (passed by the SyncHttpApi.start handler reading
+    `InstanceState.workspaceID`), the dispatch query filters by
+    `WorkspaceTable.id = workspaceID` instead of `project_id = projectID`.
+    Same shape as the listByProject divergence above: without this,
+    `POST /sync/start?workspace=<id>` returns true but never (re)populates
+    the in-memory `connections` Map for that workspace, because the
+    routed instance's `ctx.project.id` is the worktree-hashed value but
+    `WorkspaceTable.project_id` is "global" -- the project_id query
+    matches 0 rows, the `for (const ...)` iteration never runs, setStatus
+    never fires, and `/experimental/workspace/status` returns []. The
+    TUI then refuses to attach with DialogWorkspaceUnavailable because
+    `store.workspace.status[id]` is undefined. Restart is the common
+    reproducer (the create-path's implicit startSync seeds the Map at
+    INSERT, so `/sync/start?workspace=` is only exercised in anger after
+    the Map is wiped), but the query is broken for any caller of the
+    routed `/sync/start` endpoint regardless of restart. Verified in
+    the e2e harness via the 04d-sync-start-workspace regression phase.
   - Plugin-adapter registration is scoped to `ProjectID.global` rather
     than the boot instance's `ctx.project.id`. Plugins load once per
     opencode process but serve requests across many projects (via
@@ -236,6 +254,58 @@ index e5fa137..811fafa 100644
    if (custom) return custom
  
    const builtin = BUILTIN[type]
+diff --git a/packages/opencode/src/control-plane/workspace.ts b/packages/opencode/src/control-plane/workspace.ts
+index d1b4b12..b7756e0 100644
+--- a/packages/opencode/src/control-plane/workspace.ts
++++ b/packages/opencode/src/control-plane/workspace.ts
+@@ -163,7 +163,10 @@ export interface Interface {
+     signal?: AbortSignal,
+     timeout?: number,
+   ) => Effect.Effect<void, WaitForSyncError>
+-  readonly startWorkspaceSyncing: (projectID: ProjectID) => Effect.Effect<void>
++  readonly startWorkspaceSyncing: (
++    projectID: ProjectID,
++    opts?: { workspaceID: WorkspaceID },
++  ) => Effect.Effect<void>
+ }
+ 
+ export class Service extends Context.Service<Service, Interface>()("@opencode/Workspace") {}
+@@ -982,12 +985,33 @@ export const layer = Layer.effect(
+       )
+     })
+ 
+-    const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (projectID: ProjectID) {
++    const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (
++      projectID: ProjectID,
++      opts?: { workspaceID: WorkspaceID },
++    ) {
++      // kfactory: when opts.workspaceID is set (caller routed the request
++      // to a specific workspace via the workspace-routing middleware),
++      // filter by workspace_id instead of project_id. Same shape as the
++      // listByProject divergence: WorkspaceTable rows from kfactory-adapter
++      // carry project_id="global" but the routed instance's project.id is
++      // the worktree-hashed value -- a project_id query against that hash
++      // matches 0 rows, the iteration below never runs, setStatus never
++      // fires, and the in-memory connections Map (the source of
++      // /experimental/workspace/status) stays unpopulated for that
++      // workspace. Restart is the common trigger because the create-path's
++      // implicit startSync seeds the Map at INSERT, but the underlying
++      // query is broken for any caller of /sync/start?workspace= once the
++      // workspace isn't already in the Map. Workspace_id is itself a
++      // unique scope, so dropping project_id when it's set is safe.
+       const rows = yield* db((db) =>
+         db
+           .selectDistinct({ workspace: WorkspaceTable })
+           .from(WorkspaceTable)
+-          .where(eq(WorkspaceTable.project_id, projectID))
++          .where(
++            opts?.workspaceID
++              ? eq(WorkspaceTable.id, opts.workspaceID)
++              : eq(WorkspaceTable.project_id, projectID),
++          )
+           .all(),
+       )
+ 
 diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
 index e59fefe..7a8bb77 100644
 --- a/packages/opencode/src/plugin/index.ts
@@ -315,6 +385,39 @@ index 56a8de3..2d8a040 100644
            roots: ctx.query.roots,
            start: ctx.query.start,
            cursor: ctx.query.cursor,
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts
+index ffe8d0b..cf057f3 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts
+@@ -25,8 +25,27 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
+     const sync = yield* SyncEvent.Service
+ 
+     const start = Effect.fn("SyncHttpApi.start")(function* () {
++      // kfactory: when the workspace-routing middleware has set
++      // InstanceState.workspaceID (a request with ?workspace=<id>
++      // or x-opencode-workspace header), thread it through so the
++      // service can filter by workspace_id instead of project_id.
++      // Mirrors the listByProject divergence fix: kfactory-adapter
++      // stamps WorkspaceTable.project_id="global" for every row, but
++      // the routed instance's ctx.project.id is the worktree-hashed
++      // value -- a project_id-only query against that hash returns 0
++      // and setStatus never fires, so /experimental/workspace/status
++      // is empty for any workspace not previously seeded into the
++      // in-memory `connections` Map (the create-path's implicit
++      // startSync seeds at INSERT, but a server restart wipes the
++      // Map -- and a future caller relying on /sync/start?workspace=
++      // as the addressable repopulation operation would hit the
++      // same dead query regardless of restart).
++      const workspaceID = yield* InstanceState.workspaceID
+       yield* workspace
+-        .startWorkspaceSyncing((yield* InstanceState.context).project.id)
++        .startWorkspaceSyncing(
++          (yield* InstanceState.context).project.id,
++          workspaceID ? { workspaceID } : undefined,
++        )
+         .pipe(Effect.ignore, Effect.forkIn(scope))
+       return true
+     })
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
 index 8bffe59..367b2a5 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts

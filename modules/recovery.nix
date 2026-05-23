@@ -62,6 +62,31 @@ in {
       example = "kittyandrew";
     };
 
+    group = lib.mkOption {
+      type = lib.types.str;
+      default = cfg.user;
+      defaultText = lib.literalMD "{option}`services.kfactory.recovery.user`";
+      description = ''
+        Group that owns `/run/kfactory/` (the tmpfiles-managed directory
+        where heal writes the recovery queue). Defaults to `cfg.user`
+        because most NixOS users have a same-named primary group (the
+        nixpkgs `useDefaultShell`/`isNormalUser` shape creates one).
+        Override when the operator's primary group differs from the
+        username -- e.g., users created without a per-user group
+        whose primary group is the shared `users` group:
+
+          services.kfactory.recovery.group = "users";
+
+        If you don't override and the group doesn't exist, systemd-
+        tmpfiles emits "Unknown group" to the journal but doesn't fail
+        the unit on its own. The actual blocker is heal's ExecStartPre:
+        it tries to write the recovery queue under `/run/kfactory/`,
+        that directory doesn't exist (tmpfiles refused to create it),
+        the write fails, and opencode-serve fails to start.
+      '';
+      example = "users";
+    };
+
     opencodeServiceName = lib.mkOption {
       type = lib.types.str;
       description = ''
@@ -195,7 +220,7 @@ in {
     # mkdir's the queue's parent but a tmpfiles rule makes the perms
     # predictable across reboots.
     systemd.tmpfiles.rules = [
-      "d ${builtins.dirOf cfg.queuePath} 0755 ${cfg.user} ${cfg.user} -"
+      "d ${builtins.dirOf cfg.queuePath} 0755 ${cfg.user} ${cfg.group} -"
     ];
   };
 }

@@ -142,11 +142,30 @@ jobs:
         run: |
           set -euo pipefail
           system="x86_64-linux"
-          mapfile -t paths < <(
-            nix eval --json ".#checks.${system}" --apply \
-              'cs: builtins.attrValues (builtins.mapAttrs (n: v: v.outPath) cs)' \
+          # Enumerate every check by name, then `nix build` each one in
+          # a single invocation. Why `nix build` rather than `nix eval`
+          # + `nix-store --realise`: --realise only has the out-path,
+          # not the .drv, so it can only substitute -- if the path is
+          # neither in the local store nor in a cache, it cannot rebuild
+          # (the prior CI run hit this when `nix flake check` validated
+          # checks via narinfo HEAD against atticd without copying the
+          # bits locally). `nix build` has the full derivation and will
+          # substitute OR build as needed; it then prints the realized
+          # out paths, which we feed straight to `attic push`. Both the
+          # enumeration and the build use the flake's own
+          # `.#checks.<system>.*` shape, so adding a new check picks up
+          # caching with no workflow edit.
+          mapfile -t attrs < <(
+            nix eval --json ".#checks.${system}" --apply 'builtins.attrNames' \
               | jq -r '.[]'
           )
+          if [ "${#attrs[@]}" -eq 0 ]; then
+            echo "::error::no checks enumerated for .#checks.${system}"
+            exit 1
+          fi
+          refs=()
+          for a in "${attrs[@]}"; do refs+=(".#checks.${system}.${a}"); done
+          mapfile -t paths < <(nix build --no-link --print-out-paths "${refs[@]}")
           echo "Pushing ${#paths[@]} paths + their runtime closures to attic:"
           printf '  %s\n' "${paths[@]}"
           attic push general "${paths[@]}"
