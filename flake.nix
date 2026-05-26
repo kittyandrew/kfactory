@@ -2,7 +2,7 @@
   description = "kfactory -- opencode factory deployment toolkit: kfactory CLI + kfactory-adapter & ntfy plugins + opencode/oauth2-proxy patches";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
     # Patches under patches/ are line-number-pinned against this exact
     # opencode tag. To bump: change the tag, run `nix flake check` to
@@ -10,7 +10,17 @@
     # check). If hunks drift, re-diff against the new source -- the
     # bump playbook is documented in .claude/rules/022-patches-bump.md;
     # the re-diff workflow itself is in .claude/rules/021-patches-rediff.md.
-    opencode.url = "github:anomalyco/opencode/v1.15.9";
+    #
+    # `opencode.inputs.nixpkgs.follows = "nixpkgs"` collapses opencode's
+    # own nixpkgs node into ours so consumers see a single shared
+    # nixpkgs eval -- without this, every downstream that pulls
+    # `kfactory.packages.${system}.opencode-kfactory` pays an extra
+    # ~100 MB / ~1 s nixpkgs instantiation, and `align-kitty-flakes` can
+    # only bump kfactory's nixpkgs without touching opencode's.
+    opencode = {
+      url = "github:anomalyco/opencode/v1.15.9";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
