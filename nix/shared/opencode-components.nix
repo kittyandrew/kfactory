@@ -17,9 +17,9 @@
       # .claude/rules/020-patches.md and 021-patches-rediff.md.
       patches = (old.patches or []) ++ opencodePatchStack;
       configurePhase = mkOpencodeNodeModulesConfigurePhase {
-        inherit pkgs;
         nodeModules = old.node_modules;
       };
+      disallowedReferences = (old.disallowedReferences or []) ++ [old.node_modules];
     });
 
   opencodeHeal = pkgs.writeShellApplication {

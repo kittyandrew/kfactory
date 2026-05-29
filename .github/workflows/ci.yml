@@ -88,13 +88,32 @@ jobs:
           endpoint: ${{ vars.ATTIC_ENDPOINT }}
           cache: general
           token: ${{ secrets.ATTIC_GENERAL_PUSH_TOKEN }}
+          skip-push: "true"
 
       - name: Build cache roots
         run: |
-          nix build --no-link --print-build-logs \
+          set -euo pipefail
+          nix build --no-link --print-build-logs --print-out-paths \
             .#kfactory \
             .#oauth2-proxy-kfactory \
             .#checks.x86_64-linux.factory-opencode-kfactory \
             .#checks.x86_64-linux.opencode-pty \
             .#checks.x86_64-linux.factory-e2e-opencode-image \
-            .#checks.x86_64-linux.factory-e2e-kfactory-client-image
+            .#checks.x86_64-linux.factory-e2e-kfactory-client-image \
+            | sort -u > "${RUNNER_TEMP}/attic-cache-roots"
+          echo "Built curated Attic cache roots:"
+          while IFS= read -r root; do
+            echo "  $root"
+          done < "${RUNNER_TEMP}/attic-cache-roots"
+
+      - name: Push curated roots to Attic
+        run: |
+          set -euo pipefail
+          mapfile -t roots < "${RUNNER_TEMP}/attic-cache-roots"
+          if [ "${#roots[@]}" -eq 0 ]; then
+            echo "::error::no curated Attic cache roots were built"
+            exit 1
+          fi
+          echo "Pushing ${#roots[@]} curated roots and their runtime closures to Attic:"
+          printf '  %s\n' "${roots[@]}"
+          attic push general "${roots[@]}"
