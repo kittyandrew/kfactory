@@ -7,8 +7,7 @@
   mkOpencodeNodeModulesConfigurePhase = import ../shared/opencode-node-modules.nix;
   loopSpec = pluginSrcs.loop;
   ntfySpec = pluginSrcs.ntfy;
-  symlinkOpencodeNodeModules = mkOpencodeNodeModulesConfigurePhase {
-    inherit pkgs;
+  stageOpencodeNodeModules = mkOpencodeNodeModulesConfigurePhase {
     nodeModules = opencodePackage.node_modules;
   };
 
@@ -23,7 +22,7 @@
       inherit pname;
       kfactoryTestFile = testFile;
       nativeBuildInputs = (old.nativeBuildInputs or []) ++ extraNativeBuildInputs;
-      configurePhase = symlinkOpencodeNodeModules;
+      configurePhase = stageOpencodeNodeModules;
       buildPhase = ''
         runHook preBuild
         mkdir -p packages/opencode/test/kfactory
