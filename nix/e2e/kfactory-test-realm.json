@@ -1,0 +1,51 @@
+{
+  "realm": "kfactory-test",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "verifyEmail": false,
+  "oauth2DeviceCodeLifespan": 300,
+  "oauth2DevicePollingInterval": 1,
+  "clients": [
+    {
+      "clientId": "kfactory",
+      "name": "kfactory",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email", "offline_access"],
+      "optionalClientScopes": [],
+      "redirectUris": ["http://127.0.0.1/*", "urn:ietf:wg:oauth:2.0:oob"],
+      "webOrigins": ["*"],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "use.refresh.tokens": "true",
+        "access.token.lifespan": "60"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "device-login",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Device",
+      "lastName": "Login",
+      "email": "device-login@example.invalid",
+      "realmRoles": ["offline_access"],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password1234",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

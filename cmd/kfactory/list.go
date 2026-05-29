@@ -31,6 +31,7 @@ func runList(args []string) {
 		fmt.Fprintln(os.Stderr, "kfactory: no workspaces. create one with `kfactory dispatch <repo-url>`")
 		return
 	}
+	enrichWorkspaceBranches(ctx, tok, server, ws)
 
 	// id-asc = creation order; the printed 1-based index matches
 	// `kfactory attach <n>`.

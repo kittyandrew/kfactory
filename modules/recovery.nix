@@ -1,29 +1,8 @@
-# NixOS module: kfactory opencode-serve recovery lifecycle.
-#
-# Wires three lifecycle hooks into the opencode-serve systemd unit:
-#
-#   ExecStartPre  = opencode-heal <DB>
-#       Sweeps zombie assistant messages (turn was mid-flight when the
-#       prior opencode-serve died). Marks them `finish =
-#       interrupted-by-restart` and EMITS a JSON queue at
-#       /run/kfactory/recovery-queue.json listing the workspace IDs
-#       whose sessions had stuck turns.
-#
-#   ExecStartPost = opencode-sync-kick --base <URL>
-#       Pokes the per-workspace status sync that opencode otherwise
-#       only triggers on SPA init. Without this, the first session
-#       interact after restart shows "Workspace Unavailable."
-#
-#   ExecStartPost = recovery-sweep
-#       Reads the queue file and runs `kfactory tick <ref> --prompt
-#       <prompt>` against each workspace whose session was interrupted.
-#       The configured `prompt` tells the agent that opencode-serve
-#       restarted mid-run; the agent decides how to resume.
-#
-# Heal + recovery are tightly coupled: recovery only ticks workspaces
-# that heal actually found a stuck turn in. Restarts where every
-# session was already complete leave the queue empty + recovery is a
-# no-op.
+# Adds opencode-serve lifecycle hooks:
+#   ExecStartPre:  opencode-heal <DB> writes the recovery queue.
+#   ExecStartPost: opencode-sync-kick refreshes workspace status.
+#   ExecStartPost: recovery-sweep ticks queued workspaces with the restart prompt.
+# Empty queue = no recovery work.
 {
   config,
   lib,
@@ -31,25 +10,22 @@
   ...
 }: let
   cfg = config.services.kfactory.recovery;
+  opencodeServiceUser = config.systemd.services.${cfg.opencodeServiceName}.serviceConfig.User or null;
 in {
   options.services.kfactory.recovery = {
     enable = lib.mkEnableOption "kfactory opencode-serve recovery lifecycle (heal + sync-kick + tick-stuck-sessions)";
 
-    packages = lib.mkOption {
-      type = lib.types.attrsOf lib.types.package;
+    package = lib.mkOption {
+      type = lib.types.package;
       description = ''
-        kfactory's flake `packages.<system>` attrset. Three keys read:
-          - `kfactory`        -- CLI used by recovery-sweep to tick stuck workspaces
-          - `opencode-heal`   -- ExecStartPre DB-sweep
-          - `opencode-sync-kick` -- ExecStartPost workspace-status poke
-        Three-in-one because the heal queue file format couples to the
-        sweep's reader -- mixing versions across these three is not
-        supported. Operators wire one self-consistent flake's outputs:
-        `inputs.kfactory.packages.''${system}` (optionally with
-        `kfactory` overridden via overrideAttrs/ldflags for their
-        endpoint defaults).
+        Unified kfactory runtime package. The package supplies the CLI used by
+        recovery-sweep and exposes the matched `opencode-heal` and
+        `opencode-sync-kick` hooks through passthru. Mixing versions across
+        these three is not supported because the heal queue file format couples
+        to the sweep's reader. Endpoint defaults are runtime environment or
+        persisted auth state, not package overrides.
       '';
-      example = lib.literalExpression "inputs.kfactory.packages.\${pkgs.stdenv.hostPlatform.system}";
+      example = lib.literalExpression "inputs.kfactory.packages.\${pkgs.stdenv.hostPlatform.system}.kfactory";
     };
 
     user = lib.mkOption {
@@ -59,7 +35,7 @@ in {
         `kfactory auth login` at least once. Typically matches the
         opencode-serve user.
       '';
-      example = "kittyandrew";
+      example = "opencode";
     };
 
     group = lib.mkOption {
@@ -67,22 +43,14 @@ in {
       default = cfg.user;
       defaultText = lib.literalMD "{option}`services.kfactory.recovery.user`";
       description = ''
-        Group that owns `/run/kfactory/` (the tmpfiles-managed directory
-        where heal writes the recovery queue). Defaults to `cfg.user`
-        because most NixOS users have a same-named primary group (the
-        nixpkgs `useDefaultShell`/`isNormalUser` shape creates one).
-        Override when the operator's primary group differs from the
-        username -- e.g., users created without a per-user group
-        whose primary group is the shared `users` group:
+        Group that owns `/run/kfactory/`, where heal writes the recovery
+        queue. Defaults to `cfg.user`; override when the operator's
+        primary group differs from the username, for example:
 
           services.kfactory.recovery.group = "users";
 
-        If you don't override and the group doesn't exist, systemd-
-        tmpfiles emits "Unknown group" to the journal but doesn't fail
-        the unit on its own. The actual blocker is heal's ExecStartPre:
-        it tries to write the recovery queue under `/run/kfactory/`,
-        that directory doesn't exist (tmpfiles refused to create it),
-        the write fails, and opencode-serve fails to start.
+        If the group does not exist, tmpfiles will not create the queue
+        directory and heal's ExecStartPre will fail.
       '';
       example = "users";
     };
@@ -105,7 +73,7 @@ in {
         Absolute path to opencode's sqlite DB. opencode-heal
         operates on this file; first-boot (no file) is tolerated.
       '';
-      example = "/var/lib/factory/kittyandrew/.local/share/opencode/opencode.db";
+      example = "/var/lib/opencode/.local/share/opencode/opencode.db";
     };
 
     opencodeBaseURL = lib.mkOption {
@@ -152,11 +120,28 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = opencodeServiceUser == cfg.user;
+        message = ''
+          services.kfactory.recovery.user (${cfg.user}) must match
+          systemd.services.${cfg.opencodeServiceName}.serviceConfig.User
+          (${
+            if opencodeServiceUser == null
+            then "<unset>"
+            else opencodeServiceUser
+          }).
+          Recovery hooks run inside the opencode service unit, so queue ownership
+          and kfactory auth lookup split if these users diverge.
+        '';
+      }
+    ];
+
     # Per-workspace failure logs + continues; never blocks restart.
     systemd.services.${cfg.opencodeServiceName} = let
       recoverySweep = pkgs.writeShellApplication {
         name = "kfactory-recovery-sweep";
-        runtimeInputs = [pkgs.jq pkgs.coreutils cfg.packages.kfactory];
+        runtimeInputs = [pkgs.jq pkgs.coreutils cfg.package];
         text = ''
           QUEUE=''${KFACTORY_RECOVERY_QUEUE:-${cfg.queuePath}}
           if [ ! -f "$QUEUE" ]; then
@@ -183,9 +168,9 @@ in {
       # cfg.user; heal + sync-kick inherit the unit's User= and only
       # need DB / internal-API access (no auth.json read).
       serviceConfig = {
-        ExecStartPre = ["${cfg.packages.opencode-heal}/bin/opencode-heal ${lib.escapeShellArg cfg.opencodeDB}"];
+        ExecStartPre = ["${cfg.package.passthru.opencodeHeal}/bin/opencode-heal ${lib.escapeShellArg cfg.opencodeDB}"];
         ExecStartPost = [
-          "${cfg.packages.opencode-sync-kick}/bin/opencode-sync-kick --base ${cfg.opencodeBaseURL} --health-timeout ${toString cfg.healthTimeoutSeconds}"
+          "${cfg.package.passthru.opencodeSyncKick}/bin/opencode-sync-kick --base ${cfg.opencodeBaseURL} --health-timeout ${toString cfg.healthTimeoutSeconds}"
           "${recoverySweep}/bin/kfactory-recovery-sweep"
         ];
       };

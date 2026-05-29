@@ -28,14 +28,12 @@
 //
 // kfactory modifications (AGPLv3, see top-level LICENSE):
 //   - Per-event `notifyAfter` shorthand-duration ("3s") wait window.
-//   - Subscriber-aware suppression: always-on cancel if any operator is
-//     attached at event time or connects during T=0..T=+wait.
 //   - Removed runtime dependency on `iso8601-duration`; minimal in-tree
 //     parser instead (`PT...` only -- weeks/days/years rejected as
 //     out-of-scope for notification timers).
 //   - Removed `opencode-notification-sdk` indirection; the event-routing
-//     logic lives in ./index.ts so the wait + skip-on-connect can be
-//     wired into the same place that decides to fire.
+//     logic lives in ./index.ts so kfactory-specific gates and debounce
+//     happen in one place.
 //
 // Config file: $XDG_CONFIG_HOME/opencode/notification-ntfy.json (or
 // ~/.config/opencode/notification-ntfy.json on linux). `{env:VAR}` and
@@ -47,11 +45,7 @@ import { dirname, join } from "node:path"
 
 // ---- Event taxonomy ----
 
-export const NOTIFICATION_EVENTS = [
-  "session.idle",
-  "session.error",
-  "permission.asked",
-] as const
+export const NOTIFICATION_EVENTS = ["session.idle", "session.error", "permission.asked"] as const
 export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number]
 
 // ---- Duration parsing ----
@@ -65,9 +59,7 @@ const DURATION_SEGMENT_RE = /(\d+(?:\.\d+)?)\s*([hms])/gi
 
 export function parseDuration(s: string): number {
   if (!DURATION_RE.test(s)) {
-    throw new Error(
-      `ntfy: invalid duration "${s}"; expected shorthand like "3s", "5m", "1h30m"`,
-    )
+    throw new Error(`ntfy: invalid duration "${s}"; expected shorthand like "3s", "5m", "1h30m"`)
   }
   let totalSec = 0
   for (const m of s.matchAll(DURATION_SEGMENT_RE)) {
@@ -80,9 +72,10 @@ export function parseDuration(s: string): number {
   return Math.round(totalSec * 1000)
 }
 
-// undefined for non-string (caller picks default); throws on bad string.
-function parseDurationMs(value: unknown): number | undefined {
-  if (typeof value !== "string" || value.length === 0) return undefined
+function parseRequiredDurationMs(value: unknown, fieldName: string): number {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`ntfy: ${fieldName} must be a non-empty duration string`)
+  }
   return parseDuration(value)
 }
 
@@ -91,10 +84,8 @@ function parseDurationMs(value: unknown): number | undefined {
 export interface ValueTemplate {
   readonly value: string
 }
-// Only {value: "..."} templates supported. The previously-accepted
-// {command: "..."} variant ran the operator's shell with LLM-controlled
-// substitutions -- unsafe-by-design. Dynamic content uses {env:VAR} /
-// {file:path} substitution at config-load time instead.
+// Templates are value-only: `{command: ...}` executed the operator's shell;
+// use config-load `{env:VAR}` / `{file:path}` substitution for dynamic values.
 export type ContentTemplate = ValueTemplate
 export type ContentTemplateMap = Partial<Record<NotificationEvent, ContentTemplate>>
 
@@ -104,16 +95,9 @@ export interface EventConfig {
   /** Whether this event type triggers notifications at all. */
   enabled: boolean
   /**
-   * Wait window in ms before firing. During T=0..T=+notifyAfterMs, ANY
-   * subscriber connect on the workspace cancels the pending notification.
    * `0` means immediate. Configured as a shorthand string in JSON (`"3m"`).
-   *
-   * Subscriber-based suppression is non-configurable: if any operator is
-   * attached at event time the notification is suppressed, and if any
-   * operator attaches mid-wait the pending notification is cancelled.
-   * That semantic is load-bearing for the plugin's stated purpose
-   * ("notify only when nobody's watching") so an opt-out doesn't make
-   * sense.
+   * Nonzero values debounce notifications for the same `(session, event)`
+   * key; the latest event replaces the previous pending timer.
    */
   notifyAfterMs: number
 }
@@ -161,24 +145,17 @@ function substituteString(value: string, configDir: string): string {
   const envSubstituted = value.replace(/\{env:([^}]+)\}/g, (_m, varName: string): string => {
     const v = process.env[varName]
     if (v === undefined) {
-      console.warn(`ntfy: config {env:${varName}} -- env var unset, substituting empty string`)
-      return ""
+      throw new Error(`ntfy: config {env:${varName}} -- env var unset`)
     }
     return v
   })
   return envSubstituted.replace(/\{file:([^}]+)\}/g, (_m, filePath: string): string => {
-    const resolved = filePath.startsWith("/")
-      ? filePath
-      : filePath.startsWith("~")
-        ? join(homedir(), filePath.slice(1))
-        : join(configDir, filePath)
+    const resolved = filePath.startsWith("/") ? filePath : filePath.startsWith("~") ? join(homedir(), filePath.slice(1)) : join(configDir, filePath)
     try {
       return readFileSync(resolved, "utf-8").trim()
     } catch (err) {
-      // Log loudly: silent empty here causes 401s downstream with no clue why.
       const msg = err instanceof Error ? err.message : String(err)
-      console.warn(`ntfy: config {file:${filePath}} -- read failed at ${resolved}: ${msg}; substituting empty`)
-      return ""
+      throw new Error(`ntfy: config {file:${filePath}} -- read failed at ${resolved}: ${msg}`)
     }
   })
 }
@@ -191,7 +168,7 @@ function substituteAll(value: unknown, configDir: string): unknown {
   if (typeof value === "string") return substituteString(value, configDir)
   if (Array.isArray(value)) return value.map((v) => substituteAll(v, configDir))
   if (isRecord(value)) {
-    const out: Record<string, unknown> = {}
+    const out = Object.create(null) as Record<string, unknown>
     for (const k of Object.keys(value)) out[k] = substituteAll(value[k], configDir)
     return out
   }
@@ -204,24 +181,25 @@ function isValidEvent(key: string): key is NotificationEvent {
   return NOTIFICATION_EVENTS.some((e) => e === key)
 }
 
-function parseContentTemplateMap(
-  raw: Record<string, unknown>,
-  fieldName: string,
-): ContentTemplateMap {
+function assertKnownKeys(raw: Record<string, unknown>, allowed: readonly string[], where: string): void {
+  for (const key of Object.keys(raw)) {
+    if (!allowed.includes(key)) {
+      throw new Error(`ntfy: unknown key ${where}.${key}`)
+    }
+  }
+}
+
+function parseContentTemplateMap(raw: Record<string, unknown>, fieldName: string): ContentTemplateMap {
   const result: ContentTemplateMap = {}
   for (const key of Object.keys(raw)) {
     if (!isValidEvent(key)) {
-      throw new Error(
-        `ntfy: invalid event '${key}' in backend.${fieldName}; valid: ${NOTIFICATION_EVENTS.join(", ")}`,
-      )
+      throw new Error(`ntfy: invalid event '${key}' in backend.${fieldName}; valid: ${NOTIFICATION_EVENTS.join(", ")}`)
     }
     const entry = raw[key]
     if (!isRecord(entry)) throw new Error(`ntfy: backend.${fieldName}.${key} must be an object`)
+    assertKnownKeys(entry, ["value", "command"], `backend.${fieldName}.${key}`)
     if (typeof entry.command === "string") {
-      throw new Error(
-        `ntfy: backend.${fieldName}.${key}: 'command' template is no longer supported. ` +
-          `Use {value: "..."} with {env:VAR} / {file:path} substitution for dynamic content.`,
-      )
+      throw new Error(`ntfy: backend.${fieldName}.${key}: 'command' template is no longer supported. ` + `Use {value: "..."} with {env:VAR} / {file:path} substitution for dynamic content.`)
     }
     if (typeof entry.value !== "string") {
       throw new Error(`ntfy: backend.${fieldName}.${key} must contain a 'value' string`)
@@ -231,37 +209,48 @@ function parseContentTemplateMap(
   return result
 }
 
+function parseOptionalContentTemplateMap(raw: unknown, fieldName: string): ContentTemplateMap | undefined {
+  if (raw === undefined) return undefined
+  if (!isRecord(raw)) throw new Error(`ntfy: backend.${fieldName} must be an object`)
+  return parseContentTemplateMap(raw, fieldName)
+}
+
 function parseEventConfig(key: NotificationEvent, raw: unknown, defaults: EventConfig): EventConfig {
   if (raw === undefined) return defaults
   if (!isRecord(raw)) throw new Error(`ntfy: events.${key} must be an object`)
-  const enabled = typeof raw.enabled === "boolean" ? raw.enabled : defaults.enabled
-  // notifyAfter is a shorthand-duration string ("3s", "5m", "1h30m").
-  const notifyAfterMs = parseDurationMs(raw.notifyAfter) ?? defaults.notifyAfterMs
+  assertKnownKeys(raw, ["enabled", "notifyAfter"], `events.${key}`)
+  const enabled = raw.enabled === undefined ? defaults.enabled : raw.enabled
+  if (typeof enabled !== "boolean") throw new Error(`ntfy: events.${key}.enabled must be a boolean`)
+  const notifyAfterMs = raw.notifyAfter === undefined ? defaults.notifyAfterMs : parseRequiredDurationMs(raw.notifyAfter, `events.${key}.notifyAfter`)
   return { enabled, notifyAfterMs }
 }
 
 function parseBackendConfig(raw: unknown): NtfyBackendConfig {
   if (!isRecord(raw)) throw new Error("ntfy: backend config must be an object")
+  assertKnownKeys(raw, ["topic", "server", "token", "priority", "iconUrl", "fetchTimeout", "title", "message"], "backend")
 
   if (typeof raw.topic !== "string" || raw.topic.length === 0) {
     throw new Error("ntfy: backend.topic is required (non-empty string)")
   }
-  const server = typeof raw.server === "string" ? raw.server.replace(/\/$/, "") : "https://ntfy.sh"
-  const token = typeof raw.token === "string" && raw.token.length > 0 ? raw.token : undefined
-  const priorityRaw = typeof raw.priority === "string" ? raw.priority : "default"
+  const server = raw.server === undefined ? "https://ntfy.sh" : raw.server
+  if (typeof server !== "string" || server.length === 0) throw new Error("ntfy: backend.server must be a non-empty string")
+  const token = raw.token === undefined ? undefined : raw.token
+  if (token !== undefined && (typeof token !== "string" || token.length === 0)) throw new Error("ntfy: backend.token must be a non-empty string")
+  const priorityRaw = raw.priority === undefined ? "default" : raw.priority
+  if (typeof priorityRaw !== "string") throw new Error("ntfy: backend.priority must be a string")
   if (!VALID_PRIORITIES.some((p) => p === priorityRaw)) {
     throw new Error(`ntfy: backend.priority must be one of ${VALID_PRIORITIES.join(", ")}`)
   }
   const priority = priorityRaw as NtfyPriority
-  const iconUrl = typeof raw.iconUrl === "string" && raw.iconUrl.length > 0 ? raw.iconUrl : undefined
-  // fetchTimeout is a shorthand-duration string ("10s", "30s", "1m").
-  const fetchTimeoutMs = parseDurationMs(raw.fetchTimeout) ?? DEFAULT_FETCH_TIMEOUT_MS
-  const title = isRecord(raw.title) ? parseContentTemplateMap(raw.title, "title") : undefined
-  const message = isRecord(raw.message) ? parseContentTemplateMap(raw.message, "message") : undefined
+  const iconUrl = raw.iconUrl === undefined ? undefined : raw.iconUrl
+  if (iconUrl !== undefined && (typeof iconUrl !== "string" || iconUrl.length === 0)) throw new Error("ntfy: backend.iconUrl must be a non-empty string")
+  const fetchTimeoutMs = raw.fetchTimeout === undefined ? DEFAULT_FETCH_TIMEOUT_MS : parseRequiredDurationMs(raw.fetchTimeout, "backend.fetchTimeout")
+  const title = parseOptionalContentTemplateMap(raw.title, "title")
+  const message = parseOptionalContentTemplateMap(raw.message, "message")
 
   return {
     topic: raw.topic,
-    server,
+    server: server.replace(/\/$/, ""),
     token,
     priority,
     iconUrl,
@@ -283,20 +272,28 @@ export function parsePluginConfig(content: string, configDir: string): NtfyPlugi
 
   const subbed = substituteAll(parsed, configDir)
   if (!isRecord(subbed)) throw new Error("ntfy: config must be a JSON object after substitution")
+  assertKnownKeys(subbed, ["enabled", "events", "backend"], "config")
 
   const defEvents = defaultEvents()
-  const enabled = typeof subbed.enabled === "boolean" ? subbed.enabled : true
+  const enabled = subbed.enabled === undefined ? true : subbed.enabled
+  if (typeof enabled !== "boolean") throw new Error("ntfy: enabled must be a boolean")
   const events: Record<NotificationEvent, EventConfig> = { ...defEvents }
+  if (subbed.events !== undefined && !isRecord(subbed.events)) {
+    throw new Error("ntfy: events must be an object")
+  }
   if (isRecord(subbed.events)) {
+    for (const key of Object.keys(subbed.events)) {
+      if (!isValidEvent(key)) {
+        throw new Error(`ntfy: invalid event '${key}' in events; valid: ${NOTIFICATION_EVENTS.join(", ")}`)
+      }
+    }
     for (const key of NOTIFICATION_EVENTS) {
       events[key] = parseEventConfig(key, subbed.events[key], defEvents[key])
     }
   }
 
-  // Skip backend validation when disabled -- a topic-less config
-  // shouldn't error. Inert backend keeps the non-null contract;
-  // nothing reads it when !enabled.
   if (!enabled) {
+    if (subbed.backend !== undefined) parseBackendConfig(subbed.backend)
     const backend: NtfyBackendConfig = {
       topic: "",
       server: "",
@@ -325,9 +322,7 @@ export function loadConfig(): NtfyPluginConfig {
     content = readFileSync(p, "utf-8")
   } catch (err) {
     if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(
-        `ntfy: config not found at ${p}; create it with at minimum {"backend":{"topic":"..."}}`,
-      )
+      throw new Error(`ntfy: config not found at ${p}; create it with at minimum {"backend":{"topic":"..."}}`)
     }
     throw err
   }

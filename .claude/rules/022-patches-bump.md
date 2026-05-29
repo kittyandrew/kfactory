@@ -16,10 +16,10 @@ Stack identity: `.claude/rules/020-patches.md`. Re-diff workflow:
    `nix/hashes.json` is stale for this tag -- a recurring upstream CI
    race (anomalyco/opencode#18227 has been fixed and re-broken multiple
    times). kfactory routes around it via a `.override { node_modules =
-   ... }` block in `flake.nix`'s `opencode-kfactory`. Refresh the
+   ... }` block in `flake.nix`'s patched opencode construction. Refresh the
    embedded hash literal:
    ```bash
-   nix build .#opencode-kfactory 2>&1 | awk '/got:/ {print $2}'
+   nix build .#checks.x86_64-linux.factory-opencode-kfactory 2>&1 | awk '/got:/ {print $2}'
    ```
    Paste the resulting `sha256-...` into the `hash = "...";` argument
    of the `node_modules_updater.override` call. The override is
@@ -28,9 +28,9 @@ Stack identity: `.claude/rules/020-patches.md`. Re-diff workflow:
    matching `hashes.json`'s shape.
    When upstream eventually publishes a release with correct hashes,
    remove the entire `.override { node_modules = ... }` block. Verify
-   by deleting the override locally, re-running `nix build
-   .#opencode-kfactory`, and confirming it succeeds without a hash
-   error.
+   by deleting the override locally, re-running
+   `nix build .#checks.x86_64-linux.factory-opencode-kfactory`, and confirming
+   it succeeds without a hash error.
 5. The plugin typechecks use the published `@opencode-ai/plugin` types,
    not the source, so they're independent of this bump.
 6. `factory-opencode-typecheck` catches type-semantic drift across any
@@ -45,7 +45,3 @@ Stack identity: `.claude/rules/020-patches.md`. Re-diff workflow:
   the spawned binary name still matches the binary you ship (today:
   `spawn("kfactory", ["auth", "refresh"])`) and that the exit-code
   constants stay in sync with `cmd/kfactory/exit.go`.
-- For changes to session-subscribers' event.ts: verify
-  `plugins/ntfy/src/index.ts` still references the `kfactory.subscribers.changed`
-  event name verbatim. The plugin treats unknown event names as no-ops
-  (fail-open), so a rename would silently disable skip-on-connect.

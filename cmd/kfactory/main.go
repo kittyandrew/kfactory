@@ -1,15 +1,8 @@
 // kfactory: CLI for an opencode factory deployment.
 // See `kfactory --help` for the subcommand list, or docs/spec.md.
 //
-// Embedding endpoint defaults at build time:
-//
-//	go build -ldflags "-X main.defaultServer=https://factory.example.com \
-//	                   -X main.defaultIssuer=https://auth.example.com \
-//	                   -X main.defaultClientID=12345 \
-//	                   -X main.defaultAudience=67890" ./cmd/kfactory
-//
-// Upstream ships empty defaults; consumers inject via ldflags or
-// operators pass the flags on first `kfactory auth login`.
+// Runtime endpoint defaults come from KFACTORY_* env vars or explicit
+// `kfactory auth login` flags.
 package main
 
 import (
@@ -17,16 +10,7 @@ import (
 	"os"
 )
 
-// Defaults are -ldflags-injected. defaultAudienceScopeTemplate binds
-// audience into the access-token aud[] claim; Zitadel-shaped URN by
-// default. Empty = skip the scope. Must contain exactly one `%s`.
-var (
-	defaultServer                = ""
-	defaultIssuer                = ""
-	defaultClientID              = ""
-	defaultAudience              = ""
-	defaultAudienceScopeTemplate = "urn:zitadel:iam:org:project:id:%s:aud"
-)
+const zitadelAudienceScopeTemplate = "urn:zitadel:iam:org:project:id:%s:aud"
 
 func main() {
 	args := os.Args[1:]
@@ -91,7 +75,8 @@ func usage() {
 		"                                                # - scheduled (task-id matches /etc/kfactory/scheduled/<id>.json)\n"+
 		"                                                # - ad-hoc nudge (ref + --prompt; for recovery/manual)\n"+
 		"  kfactory delete [-y] <id|slug|#>    # delete workspace + wipe clone\n\n"+
-		"Tokens persist at $XDG_CONFIG_HOME/kfactory/auth.json (mode 0600).\n")
+		"Tokens persist at $XDG_CONFIG_HOME/kfactory/auth.json (mode 0600).\n"+
+		"Runtime defaults: KFACTORY_SERVER, KFACTORY_OIDC_ISSUER, KFACTORY_OIDC_CLIENT_ID, KFACTORY_OIDC_AUDIENCE.\n")
 }
 
 func fail(format string, args ...any) {

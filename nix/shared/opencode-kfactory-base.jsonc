@@ -1,0 +1,167 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Top-level `model` is the plain provider/id; variant goes on the agent entry below
+  // (opencode config/agent.ts).
+  "model": "openai/gpt-5.5",
+  "agent": {
+    "build": {
+      "model": "openai/gpt-5.5",
+      "variant": "xhigh"  // aka effort aka thinking level
+    }
+  },
+
+  // kfactory plugins. @PLUGIN_*@ tokens are substituted by the Nix package to
+  // absolute store paths, so plugins stay atomic with the packaged opencode /
+  // kfactory closure. To use a completely different opencode config at runtime,
+  // set OPENCODE_CONFIG to another file and include the plugin list yourself.
+  //   - kfactory-adapter: in-process WorkspaceAdapter (single `opencode serve`, no per-workspace
+  //     processes).
+  //   - ntfy: session.idle / session.error / permission.asked push via configured ntfy backend.
+  //     Subscriber-aware suppression when an operator is attached.
+  //   - loop: /loop slash command for self-iterating sessions.
+  //   - opencode-pty: pty_spawn / pty_read / pty_kill tools (third-party, JosXa/opencode-pty MIT).
+  "plugin": [
+    "@PLUGIN_KFACTORY_ADAPTER@",
+    "@PLUGIN_NTFY@",
+    "@PLUGIN_LOOP@",
+    "@PLUGIN_OPENCODE_PTY@"
+  ],
+
+  "command": {
+    "loop": {
+      "description": "Auto-continue the current session until a user-defined sentinel string appears in your output",
+      "template": @LOOP_COMMAND_TEMPLATE@
+    },
+    "loop-stop": {
+      "description": "Cancel the active /loop in this session",
+      "template": @LOOP_STOP_COMMAND_TEMPLATE@
+    }
+  },
+
+  // Operator persona (same file desktops see) + factory-specific rules.
+  //   - ~/.claude/CLAUDE.md is ALSO auto-discovered globally (opencode session/instruction.ts:63-66
+  //     hardcodes it as a global path); listed here defensively against upstream dropping CLAUDE.md
+  //     from the default global list.
+  //   - /etc/opencode/KFACTORY.md is NOT auto-discovered -- this entry is the only thing that loads
+  //     it. opencode auto-discovery only scans AGENTS.md/CLAUDE.md/CONTEXT.md (filenames) under the
+  //     cwd-to-worktree walk, plus the two hardcoded global paths above. Neither the path
+  //     (/etc/opencode/) nor the filename (KFACTORY.md) is on those lists.
+  "instructions": [
+    "~/.claude/CLAUDE.md",
+    "/etc/opencode/KFACTORY.md"
+  ],
+
+  "share": "disabled",  // No auto-upload to opencode.ai. Flip to "manual" for opt-in sharing.
+
+  "autoupdate": false,  // We want to control any upgrades very directly and explicitely.
+
+  // Last-match-wins on full command string (permission/evaluate.ts findLast over the flattened
+  // ruleset). Wildcard glob: `*` and `?` only, anchored ^...$. SPA "always" clicks are in-memory
+  // only and wipe on restart -- this file is the durable layer.
+  //
+  // @WARNING: do NOT add top-level blanket `"read": "allow"` / `"edit": "allow"` / `"write": "allow"`
+  //    here. opencode's build-agent defaults include `.env: "ask"` / `*.env: "ask"` env-file
+  //    protection; a top-level blanket would override it silently and let workers read .env without
+  //    asking. Refine specific tools only.
+  "permission": {
+    // Opencode's build-agent default `read` block (agent.ts) is:
+    //   "*": "allow", "*.env": "ask", "*.env.*": "ask", "*.env.example": "allow"
+    // mirroring github/gitignore Node.gitignore. The `*.env.*: ask` catches legitimate templates /
+    // variant files (.env.template, .env.local, .env.production, ...) that the agent often needs to
+    // read for context. Factory's worker is trusted (spec §3 fault containment, not an adversary
+    // boundary), so flip variant-files to allow. Permission.merge is list-concat + last-match-wins
+    // (core/permission.ts evaluate), so this rule lands AFTER the default `*.env.*: ask` and wins
+    // for variant files. Literal `.env` still falls through to the default `*.env: ask` because
+    // `*.env.*` is anchored and requires a suffix.
+    "read": {
+      "*.env.*": "allow"
+    },
+    "bash": {
+      "*": "allow",
+      "git reset --hard*": "ask",
+      // `gh pr` / `gh release` -- broad ask gate on outward-facing mutations, then carve out the
+      // known readonly subcommands as allow. Last-match-wins (core/permission.ts evaluate), so a
+      // pattern listed below "gh pr *: ask" overrides it. New gh subcommands (e.g. a future
+      // `gh pr automerge`) fall through to the broad ask -- safe by default.
+      //
+      // Patterns use trailing " *" (space + asterisk) not "*" so the matcher's special tail-rule
+      // turns ` .*` into `( .*)?`, matching both bare `gh pr list` and `gh pr list <args>` -- AND
+      // refusing to match `gh pr lister` or `gh pr list-foo` (which would slip through with the
+      // no-space form).
+      "gh pr *":               "ask",
+      "gh pr list *":          "allow",
+      "gh pr view *":          "allow",
+      "gh pr status *":        "allow",
+      "gh pr checks *":        "allow",
+      "gh pr diff *":          "allow",
+      "gh pr checkout *":      "allow",
+      "gh release *":          "ask",
+      "gh release list *":     "allow",
+      "gh release view *":     "allow",
+      "gh release download *": "allow",
+      // Deletions allowed by default (`*: allow`). Block only catastrophic wipes of literal `/` or
+      // literal home. Matcher is glob-not-regex (only `*` and `?` survive, no alternation) --
+      // enumerate the typed-out shapes the LLM might emit. `rm -fr /` (reordered flags),
+      // `rm --recursive --force /`, etc. are NOT covered; accept the residual risk for the unusual
+      // forms.
+      "rm -rf /":  "deny",
+      "rm -rf ~":  "deny",
+      "rm -rf ~/": "deny",
+      "sudo *":            "deny",
+      // @NOTE: `git reset --hard*` only matches lines starting with that exact prefix; forms like
+      //    `git -c x=y reset --hard`, `git -C dir reset --hard`, and `git --git-dir=... reset --hard`
+      //    bypass the rule by changing the prefix. The patterns below catch the same SUBCOMMAND
+      //    when one of the prefix-options appears first. Layered defense over the bare
+      //    "git reset --hard*" rule above.
+      //
+      //    Pattern reads `<prefix-option> * <subcommand> *`: each `*` is a `.*` segment, and the
+      //    trailing ` .*` is rewritten to `( .*)?` by the matcher (wildcard.ts), so
+      //    `git -C foo reset --hard` (no args) matches as well as
+      //    `git -C foo reset --hard HEAD~1`. Innocent forms like `git -C foo checkout sha`
+      //    flow freely -- the subcommand isn't reset --hard.
+      "git -c * reset --hard*":       "ask",
+      "git -C * reset --hard*":       "ask",
+      "git --git-dir* reset --hard*": "ask"
+    },
+    "external_directory": {
+      // Broad allow with surgical denies for secrets. Order matters: opencode evaluate.ts uses
+      // findLast, so BROAD rules go first, narrow exceptions LAST (last match wins). Schema +
+      // semantics: https://opencode.ai/config.json + the customize-opencode skill's
+      // external_directory section.
+      //
+      // Threat model (factory.md §3): worker is trusted (trusted-agent, fault containment), so this
+      // list is anti-mistake hardening, not anti-adversary defense. Secrets get hard `deny` -- there
+      // is no legitimate agent reason to read the signing key or the LLM API token, so we want loud
+      // failure instead of a "do you mean it" prompt.
+      //
+      // The agent's own workspace dir is its cwd; reads there don't trigger external_directory at
+      // all (instance-context.ts carve-out: "Paths within the worktree but outside the working
+      // directory should not trigger external_directory permission"). So
+      // /var/lib/factory/workspaces/** falling under `*: allow` lets the agent freely grab context
+      // from sibling workspaces -- soft boundary per spec §3 anyway.
+      "*": "allow",
+
+      "/run/factory-host-key/**": "deny",  // Factory signing key
+      "~/.ssh/**":                "deny",  // symlink, deny both forms because opencode checks paths pre-resolution
+
+      "~/.local/share/opencode/auth.json":    "deny",   // opencode's own LLM provider API keys
+      "~/.local/share/opencode/opencode.db*": "allow",  // explicitly allow to interact with full message history
+
+      "~/.config/gh/**":       "deny", // GitHub CLI OAuth token (gh + git use it via env, never via direct file read)
+      "~/.config/kshare/**":   "deny", // kshare paste-upload oauth
+      "~/.config/kfactory/**": "deny", // kfactory oauth credentials
+
+      // Precautionary system secrets.
+      "/etc/shadow":       "deny",
+      "/etc/sudoers":      "deny",
+      "/etc/sudoers.d/**": "deny"
+    }
+  },
+
+  // Compaction: prune old turns automatically when context fills. Compaction is non-destructive in
+  // the DB (compaction.ts only flips a flag, original part.state.output untouched), so this
+  // reconciles cleanly with factory's "workspace data never auto-deleted" persistence contract -
+  // the UI shows a truncated view, the DB retains everything.
+  "compaction": { "prune": true, "auto": true }
+}

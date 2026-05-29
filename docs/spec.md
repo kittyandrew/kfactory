@@ -26,13 +26,13 @@ the adapter is ~185 LOC of glue".
 
 - **`WorkspaceAdapter` callback contract** -- the four methods the plugin
   implements (`configure`, `create`, `target`, `remove`). `configure`
-  decides the workspace's `info.name` (round-trips into opencode's DB
-  row, restored on every subsequent adapter call) + its `directory`.
-  `create` is what runs the first time a workspace is materialized --
-  for us, a git clone. `target` tells opencode HOW to dispatch requests
-  for this workspace: either `{type:"local", directory}` (in-process
-  via `InstanceStore.provide`) or `{type:"remote", url}` (HTTP proxy to
-  a different opencode). We return `local`. `remove` is a no-op (see §5).
+  decides the workspace's `info.name` from explicit producer inputs + its
+  `directory`. `create` is what runs the first time a workspace is
+  materialized -- for us, a git clone. `target` tells opencode HOW to
+  dispatch requests for this workspace: either `{type:"local", directory}`
+  (in-process via `InstanceStore.provide`) or `{type:"remote", url}` (HTTP
+  proxy to a different opencode). We return `local`. `remove` deletes the
+  clone and must fail closed before opencode drops metadata (see §5).
 
 - **`workspace-routing.ts` dispatch** -- opencode's per-request middleware
   picks the workspace from `x-opencode-workspace` HTTP header OR
@@ -198,8 +198,9 @@ fields it actually consumes (`schema_version`, `access_token`,
 
 Version bumps: either side adding a non-backward-compatible field must
 bump `authFileSchemaVersion` (Go) AND the matching constant in the TS
-hunk. A missing/zero `schema_version` on disk is treated as v1 for
-back-compat with files written before the field was introduced.
+hunk. A missing/zero `schema_version` on disk is invalid; operators
+must re-run `kfactory auth login` with a matching binary rather than
+letting either side guess a schema.
 
 **Bootstrap mismatch caveat**: the TUI reads the file synchronously at
 `createBearerRefreshFetch` wire-up, BEFORE the toast-bus subscription
@@ -219,20 +220,15 @@ inside the patched opencode process:
      `schema_version === AUTH_FILE_SCHEMA_VERSION` and throws on
      mismatch. Used to build the dynamic refresh-fetch wrapper.
   2. `bearerFromCache` (in `server/auth.ts`, called from
-     `ServerAuth.header()`) -- does NOT assert. Used to construct the
-     static `Authorization` header at attach setup before the refresh
-     wrapper is wired in.
+     `ServerAuth.header()`) -- asserts the same schema and token fields.
+     Used to construct the static `Authorization` header at attach setup
+     before the refresh wrapper is wired in.
 
-Reader 1 runs second; the schema-mismatch throw from reader 1 fires
-before any unchecked bearer from reader 2 can be observed by the
-server. So the contract is intact today via ordering, not via reader
-symmetry. If anyone refactors `attach.ts` to call `validateSession`
-(or any other server-hitting code) BEFORE `createBearerRefreshFetch`,
-the unchecked read in reader 2 becomes the live failure surface and
-the version contract silently degrades. The principled fix is to
-mirror the `schema_version` assert in `bearerFromCache` -- deferred
-until either: (a) the asymmetry causes a real bug, or (b) the next
-opencode bump forces a re-diff of the refresh patch anyway.
+Both readers fail closed when `OPENCODE_SERVER_BEARER_CACHE_PATH` is
+configured and the cache is missing required fields, malformed, or
+unreadable. Continuing with stale or absent auth would hide a broken
+producer and turn the reverse proxy's later 401 into the first visible
+signal.
 
 The cross-component exit-code contract for `kfactory auth refresh`
 (spawned by the TUI as a subprocess) is documented next to the named
@@ -248,16 +244,16 @@ upgrades. The operator is the only one who can delete workspace data.
 
 The opencode SQLite DB is the source of truth for workspace identity.
 Specifically: opencode's `WorkspaceTable` row, keyed by `info.id`
-(`wrk_<ts>`), carries the slug as `info.name`. The KfactoryAdapter
-detects the slug shape on subsequent `configure()` calls and
-round-trips the name unchanged. There are NO adapter-side state files
--- v1 maintained a parallel JSON index; v2 deleted it entirely. The
-DB row IS the state.
+(`wrk_<ts>`), carries the slug as `info.name`. The KfactoryAdapter mints
+that slug during `configure()` from `extra.repoUrl` plus optional valid
+`extra.slugSuffix`; it does not preserve caller-supplied names as a second
+identity surface. There are NO adapter-side state files -- v1 maintained a
+parallel JSON index; v2 deleted it entirely. The DB row IS the state.
 
-`remove()` is a no-op on the adapter. opencode deletes its
-WorkspaceTable row when `remove()` returns; the on-disk clone stays.
-The operator manually `rm -rf`s the directory when they're done with
-the workspace.
+`remove()` deletes the on-disk clone. Adapter cleanup must succeed before
+opencode deletes the WorkspaceTable row or related session/sync state. A
+metadata-only delete would need to be a separately named operation such as
+`forget`, not a swallowed failure inside normal `remove`.
 
 ### Heal on boot (heal + recovery)
 
@@ -266,8 +262,8 @@ force-kill), any assistant message in-flight stays in the DB with
 `time.completed = null`. The TUI then paints those rows as "still
 streaming" forever on the next attach (the sync layer renders a spinner
 until a finish marker shows up). The `opencode-heal` SQLite script
-(shipped as `packages.opencode-heal`, wired via
-`services.kfactory.recovery` as ExecStartPre) marks all such orphans
+(shipped with `packages.kfactory`, wired via `services.kfactory.recovery` as
+ExecStartPre) marks all such orphans
 before opencode starts so the TUI's interrupted-badge renders:
 
 - `data.time.completed = now()` -- unblocks the spinner.
@@ -286,13 +282,11 @@ Heal is also the FIRST step of the broader recovery flow: it doesn't
 just mark rows, it also EMITS the workspace IDs whose sessions had
 stuck turns to a JSON queue at `/run/kfactory/recovery-queue.json`.
 The `recovery-sweep` step (ExecStartPost) reads that queue and runs
-`kfactory tick <wid> --prompt <recovery-prompt>` per workspace --
+`kfactory tick <workspace-id> --prompt <recovery-prompt>` per workspace --
 injecting the operator-supplied recovery prompt as a new user message
 in each affected session's most-recent root session. Without the
-queue file, recovery would either ping ALL workspaces (noisy +
-spurious user prompts in sessions that DID finish) or skip the prompt
-injection entirely (the previous shape was suspected of doing this,
-leaving stuck-but-cleaned rows without any nudge for the operator).
+queue file, recovery either pings every workspace (noisy prompts in
+sessions that did finish) or leaves cleaned rows without an operator nudge.
 Heal + recovery are tightly coupled by design: empty queue (no stuck
 rows) = recovery-sweep no-op.
 
@@ -307,9 +301,10 @@ returned, so heal's `time.completed IS NULL` predicate doesn't match
 
 heal's second pass closes this: a TEMP TABLE `abandoned_pty` collects
 `(message_id, session_id, workspace_id, spawn_time, pty_id)` for every
-`pty_spawn(notifyOnExit=true)` tool part, then DELETEs entries that DO
-have a matching user-role `</pty_exited>...ID: <pty_id>` text part
-after the spawn. What remains is the set of abandoned PTYs. Each gets
+`pty_spawn(notifyOnExit=true)` tool part with a structured
+`<pty_spawned>` block and a `pty_` + 8 lowercase hex id, then DELETEs
+entries that DO have a matching user-role structured `<pty_exited>`
+block after the spawn. What remains is the set of abandoned PTYs. Each gets
 its containing message marked with the same `MessageAbortedError`
 shape (different `data.message`: "opencode-pty session killed by
 opencode-serve restart") and its workspace queued for recovery-sweep.
@@ -317,37 +312,27 @@ Per-pty_id anchoring (not just `</pty_exited>`-substring) closes the
 multi-PTY-per-session false-negative class: pty_A's exit message
 can't accidentally resolve pty_B.
 
-@WARNING (- May 23, 2026): the abandoned-PTY pass couples to
-opencode-pty's `<pty_spawned>\nID: pty_<8-hex>` output format AND
-the `<pty_exited>...ID: pty_<8-hex>...</pty_exited>` synthetic-user-
-message format. Both come from a THIRD-PARTY plugin (shekohex/opencode-
-pty) we don't control. A future-work upstream PR would have
-opencode-pty publish `pty.spawned` / `pty.exited` bus events instead;
-then heal + plugins/ntfy could subscribe to structured signals rather
-than string-matching the plugin's text output. Until that lands, the
-format-coupling is the load-bearing risk; bumping `thirdPartyPluginSrcs.
-opencode-pty.version` in `flake.nix` requires re-verifying the
-regression suite covers 5d + 10.
+@WARNING: abandoned-PTY recovery is coupled to JosXa opencode-pty transcript
+records: `<pty_spawned>\nID: pty_<8-hex>` and matching synthetic-user
+`<pty_exited>\nID: pty_<8-hex>`. The TS parser lives in
+`plugins/ntfy/src/pty-lifecycle.ts`; `opencode-heal` mirrors it in SQL.
+Until the §6 durable PTY lifecycle ledger exists, bumping
+`thirdPartyPluginSrcs.opencode-pty.version` must re-verify regression cases
+5d and 10.
 
 Between heal and recovery-sweep, an `opencode-sync-kick` ExecStartPost
 HTTP-pokes the per-workspace status sync that opencode otherwise only
 triggers on SPA init. Without this, the first session interact after
 restart shows "Workspace Unavailable."
 
-The heal targets BOTH opencode's v1 `message` table and the v2
-`session_message` table; whichever doesn't exist on a given DB is a
-silent no-op (the script probes `sqlite_master` first). opencode
-v1.15.9 routes assistant rows through v1; v2 only carries event
-rows (agent-switched, model-switched). The abandoned-PTY pass is v1-
-only today; a `heal_*_pty_v2` skeleton lands when opencode moves
-assistant rows to v2.
+Heal targets BOTH opencode's v1 `message` table and v2 `session_message`
+table; absent tables are no-ops. At the pinned opencode version, assistant
+tool parts still live in the v1 table, so the abandoned-PTY pass is v1-only.
 
-The heal log is emitted as a single-line JSON object on stdout:
+The heal log is a stable single-line JSON object on stdout:
 `opencode-heal: {"v1_message":N, "v2_session_message":M,
-"abandoned_pty":P, "affected_workspaces":W}`. Stable schema for
-monitoring / scripted consumers; the previous `k=v k=v ...` shape was
-position-fragile (adding `abandoned_pty` silently shifted columns for
-anyone field-splitting it).
+"abandoned_pty":P, "affected_workspaces":W}` for monitoring and scripted
+consumers.
 
 ## 6. Decisions log
 
@@ -378,11 +363,21 @@ relevant to a consumer.
   0600). Operator runs kfactory in their own terminal -- the CLI stays
   out of window management.
 
+- **Dispatch prompt-file arguments are path-shaped and local to dispatch.**
+  `kfactory dispatch <repo-url> <prompt...>` treats the prompt as a file
+  only when the prompt position is exactly one argument, the argument starts
+  with `./`, `../`, `/`, or `~/`, and it contains no whitespace. Existing
+  regular files are read and dispatched as the prompt; missing path-shaped
+  files error with the absolute path plus an inline-prompt hint; directories
+  error clearly; `~/...` expands through the current user's home directory.
+  Bare names such as `prompt.txt`, normal multi-word prompts, and `kfactory
+  tick --prompt` stay inline text. The zsh completion offers file paths only
+  after the dispatch prompt argument already looks path-shaped.
+
 - **Four-patch opencode stack.** Upstream opencode v1.15.x's
-  `opencode attach` only knows HTTP Basic auth and the plugin API has
-  no surface for SSE subscriber lifecycle. Four patches, applied
-  in order:
-  - `opencode-bun-version-relax.patch` -- **TEMPORARY**. opencode
+  `opencode attach` only knows HTTP Basic auth and its workspace routing
+  defaults to project scope. Four patches, applied in order:
+  - `opencode-bun-version-relax.patch` -- bun-version build workaround. opencode
     v1.15.5+ pins `packageManager: "bun@1.3.14"` and the build script
     enforces `^${version}`. nixpkgs currently ships bun 1.3.13 because
     bun 1.3.14 produces segfaulting binaries when used to build
@@ -392,9 +387,12 @@ relevant to a consumer.
     upcoming Rust-rewrite Bun 2.x line. This patch relaxes the range
     to `>=1.3.13` so the build accepts the bun nixpkgs has. Drop the
     patch when nixpkgs ships bun 1.3.14+.
-  - `opencode-bearer-and-routing.patch` -- upstreamable subset:
-    `--bearer` / `OPENCODE_SERVER_BEARER` for Bearer attach;
-    `--workspace` flag plumbed through `tui()` into `SDKProvider`,
+  - `opencode-static-bearer.patch` -- generic client-side Bearer header
+    plumbing: `--bearer` / `OPENCODE_SERVER_BEARER` for Bearer attach.
+    Server-side opencode still does not validate Bearer; deployments use
+    this with a JWT-validating reverse proxy.
+  - `opencode-workspace-routing.patch` -- upstreamable workspace
+    correctness subset: `--workspace` flag plumbed through `tui()` into `SDKProvider`,
     `ProjectProvider`, AND `validateSession` (so the pre-attach probe
     runs against the requested workspace); workspace-routing header
     fallback for non-GET requests (the SDK only rewrites header ->
@@ -405,47 +403,15 @@ relevant to a consumer.
     registration scoped to `ProjectID.global` rather than the boot
     instance's `ctx.project.id` (so per-request workspaces can find
     the adapter regardless of which project the plugin loader ran in).
-  - `opencode-session-subscribers.patch` -- publishes
-    `kfactory.subscribers.changed` with the ABSOLUTE per-workspace
-    count `{count: N}` on every SSE attach / detach. The per-instance
-    `/event` handler in `event.ts` runs inside the instance-context
-    layer so it can `yield* Bus.Service` directly. The front-opencode
-    `/global/event` handler in `handlers/global.ts` (used by the TUI's
-    attach-mode SSE) lives under `RootHttpApi` which has no
-    workspaceRoutingLayer or instanceContextLayer, so it resolves the
-    workspace via `Workspace.Service.get(workspaceID)` and threads the
-    publish through `InstanceStore.provide({directory}, ...)`. The
-    shared `provideInstanceFromHeader` helper (added to
-    `middleware/instance-context.ts` in `opencode-bearer-and-routing`)
-    means one piece of code keeps the header-decode + store.provide
-    shape in sync across both call sites. Disconnect publish runs
-    through `bridge.run(...)` with `Effect.catchCause(log.warn)` so a
-    mid-shutdown failure (bus disposed, instance vanished) logs
-    instead of disappearing silently.
-    Absolute-count semantics eliminates the cold-start asymmetry
-    inherent to delta accumulation -- a plugin that loads after a
-    subscriber attached can't reconstruct state from deltas alone,
-    but trivially assigns from the next published count.
-
-    @WARNING (- May 23, 2026): `InstanceStore.provide` will BOOT a
-    workspace that isn't currently cached. /global/event attach can
-    therefore resurrect an instance the recovery-sweep just disposed
-    (modules/recovery.nix). The TUI's flow always attaches to a
-    workspace it just dispatched (warm cache), so the cost is
-    theoretical for kfactory's shape today -- but the next debugging
-    session that asks "why did opencode-serve respawn this workspace
-    I disposed" should land here. A `store.cached(...)` non-loading
-    lookup variant on InstanceStore.Interface would eliminate the
-    side-effect but expands the upstreamable patch surface.
   - `opencode-kfactory-refresh.patch` -- kfactory-specific deployment
     glue, applied on top: `OPENCODE_SERVER_BEARER_CACHE_PATH` env +
     `bearerFromCache()`; subprocess `kfactory auth refresh` spawn via
     `createBearerRefreshFetch`; shared auth.json schema with
     `schema_version` assertion; toast subscription for refresh hints.
-  Maintained locally until the upstreamable halves (bearer-and-routing,
-  session-subscribers) land upstream. Verified on every opencode bump
-  by the `factory-opencode-patch-applies` flake check (all three must
-  apply cleanly in order).
+  Maintained locally until the upstreamable workspace-routing work lands
+  upstream. Verified on every opencode bump by the
+  `factory-opencode-patch-applies` flake check (all re-diffable patches
+  must apply cleanly in order).
 
 - **Subprocess-delegated token refresh (kfactory owns; TUI spawns).**
   kfactory (Go) is the single source of truth for OIDC token refresh:
@@ -470,6 +436,20 @@ relevant to a consumer.
   `cmd/kfactory/auth.go:runAuthRefresh` and the TS fetch wrapper at
   `packages/opencode/src/cli/cmd/tui/attach.ts:createBearerRefreshFetch`
   in `patches/opencode-kfactory-refresh.patch`.
+
+- **Real IdP auth integration owns expired-token refresh coverage.**
+  The authoritative refresh regression is a NixOS VM flake check with a
+  real Keycloak service, the real `kfactory` binary, real `opencode serve`,
+  and real PTY-backed `opencode attach`. Fast TUI smoke tests may cover
+  explicit bearer and fresh-cache attach behavior, but they must not fake
+  `kfactory auth refresh`, OIDC discovery, device authorization, token, or
+  refresh endpoints. The Keycloak check drives OAuth device login through
+  the provider's returned verification URL, expires only `expires_at` in
+  `auth.json`, asserts real `kfactory auth refresh` rotates/futures the
+  token, then asserts the patched TUI-spawned refresh makes the recording
+  proxy observe the refreshed bearer and never the expired one. Refresh
+  initializes the relying party without scopes because Keycloak rejects
+  refresh-token requests that repeat the original login scopes.
 
 - **Bearer token is env-only / cache-file-only (never on argv).**
   kfactory passes `OPENCODE_SERVER_BEARER_CACHE_PATH` to the TUI; the
@@ -573,8 +553,9 @@ relevant to a consumer.
   `.claude/rules/010-plugin.md`.
 
 - **Carved-out ntfy plugin under `plugins/ntfy/`.** Sends push
-  notifications via ntfy.sh for `session.idle` / `session.error` /
-  `permission.asked` events. Vendored as a subset of two upstream MIT
+  notifications via ntfy.sh for idle (`session.status` with
+  `status.type === "idle"`), `session.error`, and `permission.asked`
+  events. Vendored as a subset of two upstream MIT
   projects by Anthony Lannutti:
   [opencode-ntfy.sh](https://github.com/lannuttia/opencode-ntfy.sh) (the
   HTTP backend) and
@@ -582,8 +563,8 @@ relevant to a consumer.
   (event routing + subagent suppression + config schema). The two-package
   upstream architecture is collapsed into a single self-contained plugin
   -- the SDK indirection added a layer kfactory doesn't need (we have
-  exactly one backend), and inlining the routing makes the
-  wait + skip-on-connect modifications below land in one obvious place.
+  exactly one backend), and inlining the routing keeps kfactory-specific
+  gates and debounce in one obvious place.
   Each vendored source file inlines the full MIT permission notice +
   Anthony Lannutti's copyright (per-file headers ARE the MIT notice;
   there is no separate LICENSE-MIT). Upstream commit pins + the
@@ -596,7 +577,7 @@ relevant to a consumer.
   [charfeng1/opencode-ralph-loop](https://github.com/charfeng1/opencode-ralph-loop)
   (MIT) and Anthropic's ralph-wiggum technique. After the operator runs
   `/loop --max 50 --sentinel "ALL DONE" <task>`, every subsequent
-  `session.idle` for that session fires a check: read the last assistant
+  `session.status` idle for that session fires a check: read the last assistant
   message, compare the LAST non-empty line (trimmed) against the
   configured sentinel for case-sensitive equality. If it doesn't match
   and `iteration < max`, inject a continuation prompt via
@@ -611,68 +592,36 @@ relevant to a consumer.
   emission so the operator's contract with the model is unambiguous.
   The session that owns the loop is captured
   at `loop-start` time from `ToolContext.sessionID` (no first-idle latch
-  race); subagent idles are filtered via `client.session.get(...).data.parentID`.
+  race); child/subagent starts are refused and subagent idles are filtered via
+  `client.session.get(...).data.parentID` for pre-existing state. Deprecated
+  `session.idle` events are ignored so upstream's duplicate idle publication
+  cannot double-prompt. On plugin initialization, active durable state is checked
+  against upstream `client.session.status`; missing status entries are treated as
+  idle because upstream stores only non-idle statuses in the status map.
   Per-session promise chain serializes concurrent idle handlers. State
   lives at `$XDG_STATE_HOME/kfactory-loop/<hash>.json` (NOT inside the
   workspace tree, so accidental `git add .` doesn't capture it). HTTP
   errors on `prompt` count toward a 3-consecutive-failures cap before
   the loop stops; `messages` errors are recoverable (treated as
   no-sentinel). Slash command markdown files (`commands/loop.md`,
-  `commands/loop-stop.md`) are shipped as part of the plugin's flake
-  output -- consumers wire them via NixOS module
-  (`environment.etc."opencode/command/loop.md".source = ...`); the
-  plugin does NOT auto-install (avoids a workspace-scope plugin
-  mutating operator-global config on every load). Deliberately
-  uncoupled from the `opencode-session-subscribers` patch -- the loop
-  fires whether the operator is attached or not. Footgun control is
-  the operator's job (`/loop-stop`).
+  `commands/loop-stop.md`) are inlined into the unified runtime's generated
+  default `OPENCODE_CONFIG`. The plugin does NOT write operator-global config on load.
+  The loop fires whether the operator is attached or not. Footgun control
+  is the operator's job (`/loop-stop`).
 
-- **`notifyAfter` debounce + always-on subscriber suppression.** The
+- **`notifyAfter` debounce + always-send notification semantics.** The
   ntfy plugin per-event knob in `~/.config/opencode/notification-ntfy.json`:
   - `notifyAfter` (shorthand duration: `"3s"`, `"5m"`, `"1h30m"`; default
     `"0s"`): wait this long before firing. If a previous timer for the
     same `(session, event)` pair is pending, the new event replaces it
     (latest wins).
 
-  Subscriber suppression is **non-configurable** and ALWAYS on: if any
-  subscriber is attached at event time the notification is suppressed,
-  and if any subscriber attaches mid-wait the pending timer is
-  cancelled. Cancellation is per-timer (not per-key) -- a subsequent
-  event after the operator detaches schedules a fresh timer normally.
-  An earlier shape exposed a `skipWhenWatched` per-event opt-out; we
-  dropped it because the plugin's whole purpose is "notify only when
-  nobody's watching." An even earlier shape latched the cancel as
-  process-lifetime sticky-state; that broke the common case (operator
-  peeks at a workspace, comes back hours later, never gets a
-  notification again) and is gone.
-  Subscriber state is fed by the `opencode-session-subscribers` patch's
-  `kfactory.subscribers.changed` bus event. The patch publishes the
-  ABSOLUTE per-workspace count `{count: N}` after every SSE attach /
-  detach -- counter lives in a `WeakMap<Bus.Interface, number>` so it's
-  per-instance (workspace-scoped); plugins assign rather than
-  accumulate. Absolute count was chosen over `{delta: ±1}` because
-  delta accumulation cannot recover from cold-start asymmetry: a
-  plugin that loads after a subscriber attached has no way to know
-  the true count from deltas alone, so it'd either miss the first
-  +1 (and notify with an operator attached) or clamp negative on the
-  first -1 (and stay stuck). Absolute counts make the "is anyone
-  watching" decision a single read against the latest published
-  value. Without the patch no `kfactory.subscribers.changed` events
-  arrive, so the count stays at 0 and notifications fire on every
-  `notifyAfter` expiry regardless of who is watching -- acceptable
-  degraded mode for development. `fetchTimeout` on ntfy POSTs defaults
-  to 10s so a hung ntfy server can't stall the plugin's event hook
-  indefinitely.
-  Note on session-level granularity: the count is **per-workspace**,
-  not per-session, because the bus is workspace-scoped and the
-  per-workspace `is anyone watching` signal is what the suppression
-  rule needs. A side-effect is that subscribing to ANY session inside
-  a workspace suppresses notifications for ALL sessions in that
-  workspace. This is intentional (operators typically rotate through
-  sessions in a workspace and "watching" is a workspace-level
-  concept), but it's worth knowing if you tail one session's events
-  in another shell -- you'll miss notifications from concurrent
-  sessions in the same workspace.
+  Notifications intentionally fire whether or not an operator is
+  attached through the TUI or web UI. Reconnecting is not a cancel
+  signal; the phone alert is still useful as a durable completion marker
+  and keeps behavior independent of opencode's subscriber lifecycle.
+  `fetchTimeout` on ntfy POSTs defaults to 10s so a hung ntfy server
+  can't stall the plugin's event hook indefinitely.
 
   **PTY-pending idle suppression.** When the agent uses opencode-pty's
   `pty_spawn(notifyOnExit=true)` (the plugin's documented async
@@ -683,163 +632,73 @@ relevant to a consumer.
   `<pty_exited>` user message that wakes the agent for turn 2 --
   the "idle" was transient.
 
-  The ntfy plugin gates `session.idle` on a session-history scan
-  (`plugins/ntfy/src/index.ts:hasUnfinishedPtySpawn`): for each
-  assistant `pty_spawn(notifyOnExit=true)` tool part, extract the
-  `pty_id` from the tool's `state.output` (structured field, format
-  `<pty_spawned>\nID: pty_<8-hex>`), then walk forward looking for a
-  user-role text part containing `</pty_exited>` AND `ID: <pty_id>`.
-  Any spawn without a matching exit is a pending PTY -> suppress the
-  idle notification. Closing-tag + per-id anchoring discriminates the
-  plugin's synthetic message from the agent's prose (system_reminder
-  text mentions `<pty_exited>`) and prevents a multi-PTY false-
-  negative (pty_A's exit message can't accidentally resolve pty_B).
-  Same heuristic as the heal abandoned-PTY pass; both encode the
-  same third-party-format contract.
+  ntfy suppresses idle when the shared PTY lifecycle parser reports pending
+  notify-on-exit PTYs; parser boundary: `plugins/ntfy/src/pty-lifecycle.ts`.
+  The parser reads exact records, not prose mentions, and matches per PTY ID
+  to avoid multi-PTY false negatives. Same third-party-format contract as the
+  heal abandoned-PTY pass.
 
-  @WARNING (- May 23, 2026): `hasUnfinishedPtySpawn` calls
-  `client.session.messages` without a `limit`, so long-lived sessions
-  pay O(N) HTTP + O(N) walk per `session.idle` event. Acceptable for
-  current operator scale; the structural fix is the upstream PR to
-  shekohex/opencode-pty for `pty.spawned` / `pty.exited` bus events
-  (referenced in the heal section above). Once that lands, both
-  consumers (heal SQL + ntfy plugin) replace text-matching with a
-  structured signal.
+  @WARNING: PTY idle suppression scans full session history per
+  `session.idle` (O(N) HTTP + walk). Acceptable at current scale; replace both
+  heal + ntfy transcript parsing when the durable PTY lifecycle ledger lands.
 
 - **`opencode-pty` packaged as a third-party Nix dependency, NOT
-  vendored.** Third-party opencode plugins that kfactory wants to
-  ship live under `plugins/<name>/` -- same parent directory as
-  kfactory-owned plugins, distinguished by the contents of the
-  directory (third-party carriers have only `package.json` +
-  `package-lock.json`; kfactory-owned plugins have `src/` +
-  `tsconfig.json` + typecheck deps). Each carrier is exposed as a
-  `packages.<name>` flake output via `mkThirdPartyPlugin`. For
-  shekohex/opencode-pty (MIT) the integration shape is:
+  vendored.** `plugins/opencode-pty/` is a manifest-only carrier for
+  `@josxa/opencode-pty@0.7.1`; no upstream source lives in this tree.
+  The internal `mkThirdPartyPlugin` package maps the local attr name to the
+  scoped npm `packageName`. The builder promotes the scoped package itself to `$out/` and hoists
+  runtime deps to `$out/node_modules/`, matching opencode's package loader
+  with `exports["./server"]` plus `main` fallback. `npmInstallFlags =
+  ["--ignore-scripts"]` is kept for greppability; the skipped
+  `msgpackr-extract` resolver is reached through runtime deps and is not
+  a compiler for this package. Registry tarballs already ship JosXa's
+  built `dist/` and prebuilt `bun-pty` binaries. The packaged artifact
+  patches `isQuickInterrupt()` to return `false` because elapsed time
+  alone is not an interrupt signal, and JosXa 0.7.1 otherwise aborts the
+  parent opencode session for any notify-on-exit process exiting within
+  two seconds. Carrier lockfiles are the transitive-version source of
+  truth; runtime auto-install and manual fetchurl closures are rejected as
+  non-reproducible or higher-maintenance.
 
-  - A thin carrier under `plugins/opencode-pty/` -- `package.json`
-    declaring `opencode-pty` as a dep + `package-lock.json` locking
-    the transitive resolution. The carrier exists purely so
-    `buildNpmPackage` has the manifest pair it needs for an offline
-    sandboxed install. NO opencode-pty source lives in our tree.
+- **Future PTY bridge contract is an append-only lifecycle ledger.** A
+  kfactory-owned PTY bridge must write JSONL records instead of making chat
+  transcript text canonical lifecycle state. Schema v1 records require
+  `schema_version: 1`, non-empty `workspace_id`, `session_id`, `message_id`,
+  `pty_id`, `event`, and integer epoch-ms `time`; `pty_id` remains
+  `pty_` + 8 lowercase hex chars until heal, ntfy, fixtures, and persisted
+  records migrate together. `event` is exactly `spawned` or `exited`.
+  `spawned` requires `notify_on_exit`; `exited` copies `notify_on_exit` and
+  adds `exit_code`, `timed_out`, and a bounded output summary. The bridge
+  writes `spawned` before reporting `pty_spawn` success and writes `exited`
+  before any notify-on-exit wakeup prompt. Unknown-version, malformed,
+  missing, or order-invalid data is `unknown`, not `clear`; ntfy suppresses
+  idle notifications on `pending` or `unknown` and emits an operator-visible
+  warning for `unknown`; heal treats pending records across restart as
+  abandoned PTYs and queues recovery. Transcript parsing is not part of the
+  ledger contract; remove it once heal and ntfy consume ledger records in tests.
 
-  - `packages.opencode-pty` runs `buildNpmPackage` with
-    `npmInstallFlags = ["--ignore-scripts"]`. The flag is redundant
-    with `buildNpmPackage`'s `npmConfigHook`, which already
-    hardcodes `--ignore-scripts` into its internal `npm ci` call; we
-    keep the explicit flag so the suppression is greppable. What it
-    ACTUALLY suppresses (despite an earlier comment to the contrary):
-    `msgpackr-extract`'s `install: node-gyp-build-optional-packages`,
-    reached transitively through `@opencode-ai/sdk` -> effect ->
-    msgpackr -> msgpackr-extract. node-gyp-build-optional-packages is
-    a runtime resolver, not a compiler, so the resolver runs again the
-    first time the plugin require()s msgpackr -- skipping it is
-    benign. It does NOT suppress bun-pty's `prepare: bun run build`:
-    npm's `prepare` lifecycle does not fire for tarball installs from
-    the registry, only for git-URL installs and local in-tree
-    development. The bun-pty Rust build was never going to run here
-    regardless of the flag; bun-pty's npm tarball ships prebuilt
-    platform binaries for Linux x86_64 + arm64, macOS x86_64 + arm64,
-    and Windows.
+- **`packages.kfactory` is the unified runtime package.** It contains the
+  kfactory CLI plus patched opencode, sets
+  `OPENCODE_EXPERIMENTAL_WORKSPACES=true`, bakes adapter tool/env defaults,
+  and sets default `OPENCODE_CONFIG` to a Nix-substituted copy of
+  `nix/shared/opencode-kfactory-base.jsonc`. That JSONC contains the base
+  model/instruction/permission policy plus plugin store paths
+  (`kfactory-adapter`, `ntfy`, `loop`, JosXa `opencode-pty`) and `/loop`
+  slash-command templates. Operators can replace it at runtime by setting
+  `OPENCODE_CONFIG`; a replacement file must include any desired plugins and
+  commands itself. There is no public CLI-only package; the `kfactory` binary
+  must move with its matched opencode/config/plugin closure.
 
-  - The install layout promotes opencode-pty itself to `$out/` and
-    hoists its runtime deps (bun-pty, open, open's transitive
-    closure) to `$out/node_modules/` -- so opencode's PluginLoader
-    can `await import($out)`, resolve via `package.json#exports."./server"`,
-    and the loaded plugin's `require("bun-pty")` etc resolve locally.
+- **Public flake API is deliberately small.** Public package outputs are only
+  `packages.kfactory` (`default` alias) and `packages.oauth2-proxy-kfactory`.
+  Plugins, third-party plugin packages, local opencode patches, lifecycle
+  helpers, and regression images are internal values promoted into `checks`,
+  not consumer-facing flake outputs.
 
-  Why under `plugins/<name>/` alongside kfactory's own plugins:
-  `plugins/` is "where opencode plugins live for this deployment."
-  Both shapes belong there because both ARE opencode plugins; the
-  difference is how they're packaged, not what they are. The
-  distinction is visible on `ls plugins/<name>/`:
-
-  - kfactory-owned plugin -> `src/`, `tsconfig.json`, `package.json`
-    declaring typecheck deps, optional `commands/` for slash command
-    markdown.
-  - third-party carrier -> ONLY `package.json` + `package-lock.json`
-    (no `src/`, no `tsconfig.json`). The carrier declares the npm
-    package + version + locks the transitive resolution; the actual
-    source lands in `$out` of `packages.<name>` at build time.
-
-  Registry split keeps the build paths cleanly separated: kfactory
-  plugins live in `pluginSrcs` and go through `mkPlugin` +
-  `mkPluginTypecheck` + `mkPluginIntegrationCheck`. Third-party
-  carriers live in `thirdPartyPluginSrcs` and go through
-  `mkThirdPartyPlugin` (no typecheck or integration-typecheck --
-  upstream owns its own tsc story). The directory location is
-  decoupled from the registry: both registries point INTO
-  `plugins/<name>/`, but the helper applied to each entry is
-  decided by which registry holds it.
-
-  An earlier shape parked third-party carriers under a separate
-  top-level `nix/<name>/`. The argument was "grep-conflation" -- but
-  agents grep `plugins/` looking for opencode plugins, which is
-  exactly what's there in both cases. The shape distinction is
-  visible at directory listing level. Reverting that split: one
-  directory, one mental model.
-
-  Why this shape over vendoring source:
-  - opencode-pty is upstream-actively-maintained; bumping follows the
-    procedure in `.claude/rules/050-third-party-nix-plugins.md`
-    (carrier package.json version edit + regenerate lockfile + recompute
-    npm hash + rebuild smoke check). The lockfile-refresh step is
-    non-sandboxed (requires network egress) -- that's a hard
-    constraint, not a one-liner.
-  - Their npm tarball is self-contained for the entry point (dist/ +
-    bun-pty's prebuilt .so), so we don't take on their build chain
-    (vite, React, tsc, playwright, jsdom devDependencies). The
-    PRODUCTION transitive closure is still non-trivial: typescript,
-    fast-check, effect, and others land in $out/node_modules because
-    @opencode-ai/sdk declares them as runtime dependencies. The Nix
-    store path is ~85MB for that reason (verified via `du -sh $out`);
-    that's a cost we accept in exchange for not running upstream's
-    build chain.
-  - License is MIT; combining with our AGPLv3 is fine in this
-    direction. No notice obligation on a Nix-package wrapper that
-    doesn't re-distribute their source in our tree.
-
-  Why this shape over `Path 3` (manual fetchurl of the transitive
-  closure): the carrier lockfile is a single source of truth for
-  every transitive version, and bumping is mechanical. Manual
-  fetchurls would mean re-deriving the closure on every upstream
-  release.
-
-  Why this shape over `Path 4` (opencode auto-installs on first
-  run): non-reproducible (runtime network), non-idempotent across
-  container restarts in dev, and breaks the kfactory deploy contract
-  that opencode.json points at absolute Nix store paths so the OCI
-  image is pinned to its plugin set at build time.
-
-  Layout regressions are caught by the auto-registered
-  `factory-<name>-smoke` flake check (see `mkThirdPartyPluginSmoke`
-  in flake.nix). The smoke mirrors opencode's PluginLoader algorithm
-  faithfully: read package.json, resolve `exports["./server"]`
-  (handling object/string forms) with fallback to `main`, import that
-  exact file, assert it exposes at least one named export. This
-  catches `installPhase hoisted the wrong directory`, `upstream
-  removed exports["./server"] without setting main`, and `upstream
-  changed exports["./server"] to point at a non-existent file` --
-  exactly the classes of failure that would silently break opencode
-  load while looking healthy from a casual inspection. The check
-  does NOT assert a specific export name (e.g. `PTYPlugin`); that's
-  the explicit tradeoff for auto-registration. Per-plugin tightening
-  is opt-in via a future registry field. Tool-level behaviour
-  (pty_spawn, pty_read, pty_kill) is exercised end-to-end by
-  dispatching tasks through the Docker regression tests when meaningful
-  changes land; this isn't currently a flake check because spinning
-  the regression tests inside one would mean docker-in-nix-sandbox
-  gymnastics that aren't worth the gate they buy.
-
-  @WARNING (- May 23, 2026): `tests/regression/scripts/dev-test/10-
-  pty-restart-abandons-task.sh` runs `docker restart
-  kfactory-opencode` mid-suite -- the restart leaks into any later
-  phase that gets added. The harness concatenates phases in lex order,
-  so 10 runs LAST today but a future `11-*` or `10b-*` would inherit
-  a freshly-restarted container without being told. Either keep
-  destructive phases anchored at the tail (current convention) OR
-  factor them into a separate `dev-test-destructive/` sub-suite if
-  the count grows past one. Documented here so the convention is
-  visible without having to read the phase header.
+- **Permissions live in the JSONC base config, not Nix data.** opencode's
+  permission engine preserves JSON object order and evaluates the last
+  matching rule. The checked-in JSONC file is therefore the durable policy
+  surface; Nix must not model that policy as unordered attrsets.
 
 - **Upstream-contract watch list.** opencode is EXPERIMENTAL (gated by
   `OPENCODE_EXPERIMENTAL_WORKSPACES`); re-verifying these on every
@@ -867,68 +726,78 @@ relevant to a consumer.
 
 - **No slash commands; permission rules ARE the supervision
   mechanism.** Earlier designs had `/commit` and `/yield` slash
-  commands. Dropped: the permission rules (`git commit *`, `git push *`,
-  `rm -rf /*`, `sudo *`, etc.) force the agent to ASK before
-  destructive ops, and the operator's approval IS the supervision
-  pause point. No separate yield primitive needed.
+  commands. Dropped: the permission rules (`gh pr *`, `gh release *`,
+  `git reset --hard*`, `rm -rf /`, `sudo *`, etc.) force the agent to ASK
+  before selected outward-facing or destructive ops, and the operator's
+  approval IS the supervision pause point. No separate yield primitive needed.
 
 - **`kfactory tick` as the unified idempotent-dispatch verb.** Two
   shapes share the same subcommand: scheduled fire (when
   `/etc/kfactory/scheduled/<id>.json` exists, ref is a task id, mode
-  drives behavior) and ad-hoc nudge (ref is a workspace id/slug/#,
-  `--prompt` required). One verb, one auth path, one resolver -- the
-  alternative would be two subcommands (`kfactory schedule-fire` +
-  `kfactory nudge`) that share 95% of their plumbing.
+  drives behavior) and ad-hoc nudge (ref is the target workspace ID or
+  4-hex slug suffix, `--prompt` required). `tick` deliberately does
+  NOT resolve by list index or arbitrary slug prefix: exact workspace
+  IDs support recovery queues and scheduled identity, while 4-hex slug
+  suffixes remain an ad-hoc operator handle for existing workspaces. The
+  alternative would be two subcommands
+  (`kfactory schedule-fire` + `kfactory nudge`) that share 95% of their
+  plumbing.
 
-- **Deterministic workspace slug suffix for scheduled tasks.** The
-  kfactory-adapter accepts an optional `extra.slugSuffix` (validated
-  against `[a-f0-9]{4}` -- the EXACT shape of a random-mint suffix),
-  which the CLI passes as the task id. Net: a task's workspace name
-  is `<owner>--<repo>--<task-id>`, stable across opencode restarts,
-  and indistinguishable from a randomly-minted workspace at the slug
-  level (one structural invariant everywhere -- random and scheduled
-  paths produce the same slug shape). The existing-workspace check
-  on subsequent ticks is a slug-suffix scan instead of a separate
-  "task -> workspace id" mapping (which would have needed its own
-  persistence file + invalidation). Operators document the
-  taskID -> human-name mapping in their NixOS module; the 4-hex
-  format buys symmetry at the cost of opacity (4-hex task IDs aren't
-  self-documenting), and operators accepted that trade in exchange
-  for keeping boundary defenses tight.
+- **Stable scheduled workspace ID.** Scheduled creates also send
+  `id = "wrk_kfactory_<task-id>"` in `POST /experimental/workspace`.
+  That is the only scheduled identity. Workspace names/slugs are display
+  labels, not identity, and scheduled ticks do not reuse suffix-only rows.
+  A failed create remains a failure; kfactory does not infer success from
+  a listed row after a generic create error. Ad-hoc `dispatch` still
+  omits `id` and uses opencode's normal random workspace IDs.
 
-- **`skip-if-dirty` shells `git status` per workspace on every list
-  call.** The `opencode-workspace-branch` patch enriches each row of
-  `GET /experimental/workspace` with a server-side `dirty: boolean`
-  via `git -C <dir> status --porcelain` (5-second per-call timeout,
-  `execFileSync` to stay out of shell parsing). Cost is N git
-  subprocesses per workspace list -- a previously free endpoint
-  becomes linearly more expensive in subprocesses. Acceptable
-  because:
-  - The endpoint is cold-path -- operator-driven (`kfactory list`,
-    `kfactory attach <TAB>`, `kfactory tick`), never per-event.
-  - The alternative (caching the bit on `WorkspaceTable.dirty` and
-    invalidating on session.idle / explicit refresh) trades
-    freshness for cost, which is the wrong direction for the
-    skip-if-dirty safety semantic (the whole point is to NOT
-    dispatch over uncommitted work; a stale "clean" bit defeats
-    that). A null `dirty` (probe failure, missing .git, git binary
-    absent) is fail-CLOSED -- consumers treat it as dirty.
-  - The branch enrichment paid for in the same patch is the
-    structural precedent: row-enrichment via per-row syscalls,
-    concurrency-unbounded, no cache. The dirty bit follows the
-    same shape.
-  If list latency ever shows up as an operational problem, the
-  natural follow-up is `?dirty=true` query-param gating so only the
-  CLI's `tick` path pays the cost, not `list` / completion paths.
+- **Scheduled first-run proof.** Existing-workspace scheduled modes run only
+  after canonical opencode state shows the workspace's root session contains
+  the configured `initial_prompt`. The per-task lock is only a mutex; cache
+  file contents are never first-run proof. If a stable workspace exists but
+  the initial prompt is absent, `kfactory tick` repairs the first run by
+  sending `initial_prompt` to the existing root session, or by creating a root
+  session in the existing workspace when none exists.
+
+- **Branch/dirty status stays in kfactory.** `kfactory list` enriches
+  display rows with upstream `GET /vcs?workspace=<id>`. `kfactory tick`
+  implements `skip-if-dirty` with upstream
+  `GET /vcs/status?workspace=<id>`: an empty status array is clean,
+  a non-empty array is dirty, and request errors skip the dispatch. This
+  keeps opencode's `/experimental/workspace` list unmodified.
+
+- **Scheduled-task creation is serialized at the CLI and opencode API
+  boundary.** Scheduled workspaces are keyed by caller-provided workspace
+  ID `wrk_kfactory_<task-id>`; workspace names/slugs are display labels,
+  not identity. `kfactory tick <id>` takes a per-task local file lock so
+  overlapping systemd/manual fires converge through one list/create/continue
+  path. A waiter no-ops only after opencode state shows the root session
+  contains `initial_prompt`, and it still prints the workspace ID for
+  operator visibility. For later non-overlapping runs, the same canonical
+  state gates existing-workspace modes. A failed create remains a failure;
+  kfactory does not list workspaces after a generic create error and infer
+  success from a matching row.
+
+- **Tests are checks-first.** `nix flake check` is the primary verification
+  surface. Durable harnesses should be exposed as flake checks, either
+  individual checks or grouped aggregate checks; local helper apps may
+  remain for operator workflows, but checks are the blocking CI/review
+  contract. Methodology-owned checks live under `nix/<methodology>/default.nix`
+  and aggregate through `nix/default.nix`; this repo's real-process, VM,
+  and Docker regression checks classify as fixed-example checks under
+  `nix/unit/`, not a separate `nix/e2e/` methodology. Real TUI workflows
+  need PTY-backed process coverage with server-observed request behavior as
+  the primary oracle. Patch-stack behavior needs semantic contract tests
+  before ownership splits. Docker behavioral assertions live in the Go
+  regression runner, with shell retained only for lifecycle wrappers.
 
 - **Heal + recovery coupled via heal-emitted queue.** Heal does two
   things: marks stuck rows AND writes the affected-workspace IDs to
   a queue file at `/run/kfactory/recovery-queue.json`. Recovery
-  reads that queue and ticks ONLY those workspaces. Without the
-  queue, recovery would have to either iterate ALL workspaces (noisy
-  prompts injected into finished sessions) or skip prompt injection
-  entirely (the previously-broken kittyos shape: rows got cleaned
-  but no nudge surfaced). Empty queue (heal found nothing) -> empty
+  reads that queue and ticks ONLY those workspaces. Without the queue,
+  recovery either iterates ALL workspaces (noisy prompts injected into
+  finished sessions) or skips prompt injection entirely (rows cleaned but no
+  nudge surfaced). Empty queue (heal found nothing) -> empty
   recovery sweep. The tight coupling is the design: heal answers
   "what's stuck", recovery answers "what to do about it", neither
   half is useful alone.
@@ -939,13 +808,12 @@ relevant to a consumer.
   drop-ins on the opencode-serve unit. Both surface
   attribute-schemas that read naturally as NixOS options. The CLI
   defines the JSON config schema; the module emits JSON the CLI
-  accepts. Everything else stays module-free -- operators wire
-  opencode-kfactory + oauth2-proxy-kfactory + plugins + patches into
-  their own configs (per the "no Caddyfile / no docker-compose"
-  stance in the README).
+  accepts. Everything else stays module-free -- operators wire the unified
+  runtime and oauth2-proxy sibling into their own host/reverse-proxy configs
+  (per the "no Caddyfile / no docker-compose" stance in the README).
 
-- **`factory-opencode-typecheck` Nix check.** Reuses the
-  `opencode-kfactory` build (patched source + opencode's own
+- **`factory-opencode-typecheck` Nix check.** Reuses the patched opencode
+  component (patched source + opencode's own
   `node_modules.nix`-built deps) and runs `tsc --noEmit` against
   `packages/opencode/`. Uses standard `tsc` rather than `tsgo` (which
   needs a postinstall-downloaded native binary that opencode's
@@ -1003,30 +871,32 @@ plugins/kfactory-adapter/           opencode WorkspaceAdapter (env-driven)
   package.json + package-lock.json    @kfactory/kfactory-adapter; main + exports.server -> src/index.ts
   tsconfig.json
 plugins/ntfy/                       ntfy.sh notification plugin
-  src/{index,backend,config}.ts       event dispatch + wait + skip-on-connect / HTTP / config + shorthand-duration parser
+  src/{index,backend,config}.ts       event dispatch + debounce / HTTP / config + shorthand-duration parser
                                       (each file inlines the full MIT notice for the vendored subset)
   package.json + package-lock.json    @kfactory/ntfy
   tsconfig.json
 plugins/loop/                       /loop auto-continuation plugin
-  src/index.ts                        session.idle hook + user-defined sentinel + 3-failures-stop
-  commands/{loop,loop-stop}.md        slash command markdown (consumer wires via NixOS module)
+  src/index.ts                        session.status idle hook + user-defined sentinel + 3-failures-stop
+  commands/{loop,loop-stop}.md        slash command markdown (bundled into unified runtime config)
   package.json + package-lock.json    @kfactory/loop
   tsconfig.json
 plugins/opencode-pty/               third-party carrier (manifest-only) for
-                                    shekohex/opencode-pty; pinned through Nix as
-                                    packages.opencode-pty (see rule 050)
-  package.json + package-lock.json    declares opencode-pty + locks transitive resolution
+                                    @josxa/opencode-pty; packaged internally
+                                    by the unified runtime (see rule 050)
+  package.json + package-lock.json    declares @josxa/opencode-pty + locks transitive resolution
                                       (NO opencode-pty source in our tree; no src/)
-patches/                            opencode-bearer-and-routing.patch
-                                    + opencode-session-subscribers.patch
+patches/                            opencode-static-bearer.patch
+                                    + opencode-workspace-routing.patch
                                     + opencode-kfactory-refresh.patch
                                     + oauth2-proxy-pkce-no-secret.patch
-tests/regression/                   Docker-based regression test environment
-  configs/                            opencode-base.json, notification-ntfy.json, auth.json
-  scripts/                            dev-up / dev-down / dev-clean / dev-test (nix run apps)
+nix/e2e/                            Docker-based e2e images/configs + behavioral runner
   *-image.nix + test-repo.nix         OCI image builders + bundled test git repo
-default.nix                         kfactory CLI build (empty endpoint defaults; ldflags-injectable)
-flake.nix                           packages.kfactory / plugins.* / patches.* / checks.*
+  configs/                            opencode-base.json, notification-ntfy.json, auth.json
+nix/scripts/                        dev-up / dev-down / dev-clean / dev-test (nix run apps)
+nix/shared/kfactory-runtime.nix      unified runtime + plugin/command overlay wrapper
+nix/shared/opencode-kfactory-base.jsonc  base opencode config, permissions, model, instructions
+default.nix                         internal kfactory CLI build (runtime env endpoint defaults)
+flake.nix                           public packages: kfactory + oauth2-proxy-kfactory; checks + dev apps
 .claude/rules/                      plugin editing + patch re-diff + third-party-plugin workflows
 ```
 

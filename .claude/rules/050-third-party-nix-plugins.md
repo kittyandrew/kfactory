@@ -22,7 +22,7 @@ The distinguishing feature is the directory's contents:
 - third-party carrier -> ONLY `package.json` + `package-lock.json`
 
 The actual third-party source comes from npm at `buildNpmPackage` time
-and lands in `$out` of `packages.<name>`. See `flake.nix`'s
+and lands in `$out` of an internal package. See `flake.nix`'s
 `mkThirdPartyPlugin` helper for the canonical wiring + the
 `docs/spec.md` decision-log entry for the structural rationale (why a
 carrier vs. fetchurl-closure vs. opencode-auto-install + why it lives
@@ -44,11 +44,10 @@ Do NOT use this pattern when:
 ## Adding a new third-party plugin
 
 The shape is auto-registered: a single entry in `thirdPartyPluginSrcs`
-exposes the `packages.<name>` flake output, a generic
-`factory-<name>-smoke` flake check, and the regression-tests opencode.json
-plugin-list entry. The only per-plugin manual work is generating the
-carrier + lockfile (which needs network egress and so happens
-out-of-sandbox).
+creates an internal package, a generic `factory-<name>-smoke` flake check,
+and the regression-tests opencode.json plugin-list entry. The only per-plugin
+manual work is generating the carrier + lockfile (which needs network egress
+and so happens out-of-sandbox).
 
 1. Pick the npm package name + version. Confirm MIT (or
    AGPLv3-compatible) license; combining MIT-into-AGPLv3 is fine.
@@ -77,14 +76,16 @@ out-of-sandbox).
    nix shell nixpkgs#prefetch-npm-deps -c prefetch-npm-deps package-lock.json
    ```
 5. Add the entry to `thirdPartyPluginSrcs` in `flake.nix` with the
-   version, src path (`./plugins/<name>`), and npmDepsHash. Done --
-   the rest auto-registers:
-   - `packages.<name>` (via `mkThirdPartyPlugin`)
+   version, src path (`./plugins/<name>`), and npmDepsHash. If the npm
+   package name differs from the local Nix attr name, set `packageName`
+   too (for example `packageName = "@scope/pkg"`). Done -- the rest
+   auto-registers:
+   - internal package (via `mkThirdPartyPlugin`)
    - `factory-<name>-smoke` flake check (via `mkThirdPartyPluginSmoke` --
      a generic "import resolves + exposes >=1 export" gate; tightens
      to specific-export assertions can be added per-plugin as opt-in)
-   - `opencode-image`'s `thirdPartyPlugins` argument picks it up via
-     `builtins.intersectAttrs thirdPartyPluginSrcs self.packages`
+   - regression image and unified runtime default config pick it up from
+     `thirdPartyPluginSrcs`
 6. Document the addition in `docs/spec.md`'s decisions log (rationale
    + the runtime requirements -- prebuilt native binaries, install
    scripts, etc.).
@@ -97,8 +98,8 @@ cd plugins/<name>
 nix shell nixpkgs#nodejs_22 -c bash -c 'rm -rf node_modules package-lock.json && npm install --omit=dev --no-audit --ignore-scripts && rm -rf node_modules'
 nix shell nixpkgs#prefetch-npm-deps -c prefetch-npm-deps package-lock.json
 # Paste the new sha256-... into thirdPartyPluginSrcs.<name>.npmDepsHash in flake.nix
-nix build .#packages.x86_64-linux.<name>          # confirms install
-nix build .#checks.x86_64-linux.factory-<name>-smoke  # confirms layout
+nix build .#checks.x86_64-linux.<name>                 # confirms install
+nix build .#checks.x86_64-linux.factory-<name>-smoke    # confirms layout
 ```
 
 If `nix flake check` fails after a bump with runtime errors:
@@ -118,7 +119,7 @@ the wiring or stay on the older version on purpose with a note.
 to its internal `npm ci` (nixpkgs `build-support/node/build-npm-package/
 hooks/npm-config-hook.sh`). We pass it again explicitly via
 `npmInstallFlags` for greppability. What this actually suppresses
-depends on the dep tree -- for opencode-pty it's
+depends on the dep tree -- for `@josxa/opencode-pty` it's
 `msgpackr-extract`'s `node-gyp-build-optional-packages` resolver
 (benign; runs again at runtime). It does NOT suppress `prepare`
 hooks (those don't fire for tarball installs from the npm registry).

@@ -3,8 +3,8 @@
 // Returns `type: "local"` so opencode dispatches each workspace via
 // `InstanceStore.provide({directory}, effect)` in-process (no per-
 // workspace spawn / port / scope). Adapter responsibilities:
-//   configure(): mint or preserve `<owner>--<repo>--<4hex>` slug; set
-//                workspace `directory` to absolute path.
+//   configure(): mint `<owner>--<repo>--<4hex>` slug from explicit
+//                producer inputs; set workspace `directory` to absolute path.
 //   create():    mkdir + `git clone` the repo.
 //   remove():    rm -rf workspace dir. Operator-initiated only (DELETE
 //                /experimental/workspace/<id>); no auto-delete.
@@ -17,7 +17,7 @@
 //
 // @WARNING: the PATH-resolved defaults FAIL under systemd User= units
 //   (sanitized PATH). Set absolute paths via env vars; the
-//   `opencode-kfactory` wrapper in flake.nix does this automatically.
+//   unified runtime wrapper in flake.nix does this automatically.
 //
 // @WARNING: opencode's WorkspaceAdapter API is experimental (gated by
 //   OPENCODE_EXPERIMENTAL_WORKSPACES). Watch upstream for breaking
@@ -26,26 +26,34 @@
 import type { Plugin, WorkspaceInfo } from "@opencode-ai/plugin"
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
-import { mkdir, realpath, rm } from "node:fs/promises"
+import { mkdir, realpath, rename, rm } from "node:fs/promises"
+import path from "node:path"
 
 // ---- Runtime configuration ----
 
 const GIT = process.env.KFACTORY_ADAPTER_GIT ?? "git"
 const OPENSSH_SSH = process.env.KFACTORY_ADAPTER_OPENSSH_SSH ?? "ssh"
-const WORKSPACES_DIR =
-  process.env.KFACTORY_ADAPTER_WORKSPACES_DIR ?? "/var/lib/factory/workspaces"
+function requireAbsoluteWorkspacesDir(value: string): string {
+  if (!path.isAbsolute(value)) {
+    throw new Error(`kfactory: KFACTORY_ADAPTER_WORKSPACES_DIR must be absolute: ${value}`)
+  }
+  return value
+}
+
+function workspacesDir(): string {
+  return requireAbsoluteWorkspacesDir(
+    process.env.KFACTORY_ADAPTER_WORKSPACES_DIR ?? "/var/lib/factory/workspaces",
+  )
+}
 
 // ---- URL + slug helpers ----
 
 // Slug shape: `<owner>--<repo>--<4hex>`. Suffix is either random
-// (`randomBytes(2)`, 16-bit space) or a deterministic 4-hex task-id
-// from `extra.slugSuffix` (used by `kfactory tick` so scheduled-task
-// workspaces survive opencode restarts; cmd/kfactory/tick.go +
-// modules/scheduled-tasks.nix gate the input). Segments are
-// [A-Za-z0-9._] only (no hyphens -- `--` is the delimiter). isValidSlug
-// is the load-bearing defense against path traversal; asserted at
-// every boundary that concatenates the slug into a path (configure,
-// create, target, remove).
+// (`randomBytes(2)`, 16-bit space) or a caller-supplied 4-hex naming
+// hint from `extra.slugSuffix`. Segments are [A-Za-z0-9._] only (no
+// hyphens -- `--` is the delimiter). isValidSlug is the load-bearing
+// defense against path traversal; asserted at every boundary that
+// concatenates the slug into a path (configure, create, target, remove).
 const SLUG_RE = /^[A-Za-z0-9._]+--[A-Za-z0-9._]+--[a-f0-9]{4}$/
 
 function isValidSlug(name: string): boolean {
@@ -53,40 +61,57 @@ function isValidSlug(name: string): boolean {
 }
 
 // Parse owner + repo from a git URL. Handles https://, git@host:, and
-// file:// forms; nested paths (GitLab subgroups, Gitea orgs-with-paths)
-// join intermediate segments into `owner` with `_` so distinct parent
-// orgs sharing a subgroup name still produce distinct slugs. `..` and
-// empty segments dropped; remaining segments routed through
-// sanitizeSlugSegment to stay regex-clean. Throws if it can't reduce
-// to ≥2 segments.
+// file:// forms. Hosted URLs must be exactly /owner/repo(.git); file://
+// test fixtures use the final two path segments. Segments must already
+// match the slug grammar, otherwise distinct repos can collapse to the
+// same slug prefix.
 function parseOwnerRepo(repoUrl: string): {owner: string; repo: string} {
-  const path = repoUrl
+  const isFileURL = /^file:\/\//i.test(repoUrl)
+  const rawPath = repoUrl
     .replace(/\.git$/, "")
     .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*\/?/i, "") // strip scheme + host
     .replace(/^[^@/:]+@[^:/]+:/, "") // strip ssh user@host:
   const segments = path
+    .normalize(rawPath)
     .split("/")
     .map((s) => s.trim())
-    .filter((s) => s.length > 0 && s !== "..")
+    .filter((s) => s.length > 0)
   if (segments.length < 2) {
     throw new Error(`kfactory: cannot parse owner/repo from: ${repoUrl}`)
   }
-  const repo = sanitizeSlugSegment(segments[segments.length - 1]!)
-  const owner = segments
-    .slice(0, -1)
-    .map(sanitizeSlugSegment)
-    .filter((s) => s.length > 0)
-    .join("_")
-  if (owner.length === 0 || repo.length === 0) {
-    throw new Error(`kfactory: cannot parse owner/repo from: ${repoUrl}`)
+  if (!isFileURL && segments.length !== 2) {
+    throw new Error(`kfactory: repo URL path must be exactly owner/repo: ${repoUrl}`)
   }
+  const [owner, repo] = segments.slice(-2)
+  assertLosslessSlugSegment(owner!, "owner", repoUrl)
+  assertLosslessSlugSegment(repo!, "repo", repoUrl)
   return {owner, repo}
 }
 
-// Hyphens included in the strip-list -- SLUG_RE's delimiter is `--`, so
-// hyphens inside segments would create ambiguity.
-function sanitizeSlugSegment(s: string): string {
-  return s.replace(/[^a-zA-Z0-9._]/g, "_")
+function assertLosslessSlugSegment(segment: string, label: "owner" | "repo", repoUrl: string): void {
+  if (!/^[A-Za-z0-9._]+$/.test(segment)) {
+    throw new Error(
+      `kfactory: ${label} segment cannot be represented losslessly in workspace slug: ${repoUrl}`,
+    )
+  }
+}
+
+function parseSlug(slug: string): {owner: string; repo: string; suffix: string} {
+  if (!isValidSlug(slug)) {
+    throw new Error(`kfactory: invalid workspace slug: ${slug}`)
+  }
+  const parts = slug.split("--")
+  return {owner: parts[0]!, repo: parts[1]!, suffix: parts[2]!}
+}
+
+function assertSlugMatchesRepo(slug: string, repoUrl: string): void {
+  const expected = parseOwnerRepo(repoUrl)
+  const actual = parseSlug(slug)
+  if (actual.owner !== expected.owner || actual.repo !== expected.repo) {
+    throw new Error(
+      `kfactory: workspace slug ${slug} does not match repo owner/repo ${expected.owner}/${expected.repo}`,
+    )
+  }
 }
 
 function parseExtra(
@@ -100,25 +125,18 @@ function parseExtra(
     repoUrl: typeof extra.repoUrl === "string" ? extra.repoUrl : "",
   }
   // Caller-supplied slug suffix must match the random-mint shape (4 hex).
-  // CLI gates this upstream; regex here is boundary defense for direct
-  // API callers / future migrations.
-  if (typeof extra.slugSuffix === "string" && /^[a-f0-9]{4}$/.test(extra.slugSuffix)) {
+  // Present-but-invalid is a producer bug, not a reason to silently mint
+  // a different workspace name.
+  if (extra.slugSuffix !== undefined) {
+    if (typeof extra.slugSuffix !== "string" || !/^[a-f0-9]{4}$/.test(extra.slugSuffix)) {
+      throw new Error(`kfactory: extra.slugSuffix must be 4 lowercase hex characters`)
+    }
     out.slugSuffix = extra.slugSuffix
   }
   return out
 }
 
-// Durability: configure() re-runs on every adapter call; opencode passes
-// the persisted `info.name` back. Short-circuit on a valid slug so a
-// later call with `extra` nulled (DB round-trip, schema change) still
-// returns the existing slug rather than re-minting against an empty
-// repoUrl. Short-circuit predicate MUST be isValidSlug (same as every
-// downstream boundary) so a loosely-accepted slug can't pollute the DB
-// and die at the next dispatch.
 function buildWorkspaceSlug(info: Pick<WorkspaceInfo, "name" | "extra">): string {
-  if (info.name && isValidSlug(info.name)) {
-    return info.name
-  }
   const {repoUrl, slugSuffix} = parseExtra(info)
   const {owner, repo} = parseOwnerRepo(repoUrl)
   const suffix = slugSuffix ?? randomBytes(2).toString("hex")
@@ -126,10 +144,21 @@ function buildWorkspaceSlug(info: Pick<WorkspaceInfo, "name" | "extra">): string
 }
 
 function workspaceDir(slug: string): string {
-  return `${WORKSPACES_DIR}/${slug}`
+  return `${workspacesDir()}/${slug}`
 }
 
-// Symlink-escape defense: resolves both `dir` and WORKSPACES_DIR, then
+function expectedWorkspaceDir(info: Pick<WorkspaceInfo, "name" | "directory">): string {
+  const {owner, repo, suffix} = parseSlug(info.name)
+  const expected = workspaceDir(`${owner}--${repo}--${suffix}`)
+  if (info.directory !== expected) {
+    throw new Error(
+      `kfactory: workspace directory mismatch for ${info.name}: ${info.directory} != ${expected}`,
+    )
+  }
+  return expected
+}
+
+// Symlink-escape defense: resolves both `dir` and the configured root, then
 // verifies the prefix. The slug regex (isValidSlug) is the load-bearing
 // defense against path traversal -- both must hold. ENOENT fallback to
 // literal-prefix compare exists for fresh deployments (workspaces dir
@@ -143,9 +172,9 @@ async function assertWithinWorkspaces(dir: string): Promise<void> {
   }
   let realRoot: string
   try {
-    realRoot = await realpath(WORKSPACES_DIR)
+    realRoot = await realpath(workspacesDir())
   } catch {
-    realRoot = WORKSPACES_DIR
+    realRoot = workspacesDir()
   }
   const probe = realDir ?? dir
   // Trailing slash so /a/b-other isn't accepted under /a/b.
@@ -167,27 +196,13 @@ async function cloneRepoInto(slug: string, repoUrl: string): Promise<void> {
     throw new Error(`kfactory: refusing to clone with invalid slug: ${slug}`)
   }
   const dir = workspaceDir(slug)
-  // mkdir(recursive:false) is the atomic ownership claim: EEXIST = someone
-  // else owns this slug. Persistence contract (docs/spec.md §5): only a
-  // slug created by THIS invocation can be rolled back on clone failure.
-  await mkdir(WORKSPACES_DIR, {recursive: true})
-  let createdHere = false
-  try {
-    await mkdir(dir, {recursive: false})
-    createdHere = true
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
-    throw new Error(
-      `kfactory: slug collision -- workspace dir ${dir} already exists. ` +
-        `Re-run dispatch to mint a fresh slug.`,
-    )
-  }
+  const tmpDir = `${workspacesDir()}/.kfactory-clone-${slug}-${process.pid}-${randomBytes(4).toString("hex")}`
+  await mkdir(workspacesDir(), {recursive: true})
   try {
     await new Promise<void>((resolve, reject) => {
       // `--` end-of-options sentinel: hygiene against URLs starting with
       // `-` (the operator is trusted, this isn't a security boundary).
-      const p = spawn(GIT, ["clone", "--", repoUrl, "."], {
-        cwd: dir,
+      const p = spawn(GIT, ["clone", "--", repoUrl, tmpDir], {
         env: {
           ...process.env,
           GIT_TERMINAL_PROMPT: "0",
@@ -205,18 +220,27 @@ async function cloneRepoInto(slug: string, repoUrl: string): Promise<void> {
         else reject(new Error(`git clone exit ${code}: ${stderr}`))
       })
     })
-  } catch (err) {
-    if (createdHere) {
-      // Re-validate before rm: defense in depth against `dir` mutation.
-      try {
-        await assertWithinWorkspaces(dir)
-        await rm(dir, {recursive: true, force: true})
-      } catch (rmErr) {
-        console.warn(
-          `kfactory: cleanup of partial clone ${dir} failed:`,
-          rmErr instanceof Error ? rmErr.message : rmErr,
+    try {
+      await rename(tmpDir, dir)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(
+          `kfactory: slug collision -- workspace dir ${dir} already exists. ` +
+            `Re-run dispatch to mint a fresh slug.`,
         )
       }
+      throw err
+    }
+  } catch (err) {
+    // Re-validate before rm: defense in depth against path mutation.
+    try {
+      await assertWithinWorkspaces(tmpDir)
+      await rm(tmpDir, {recursive: true, force: true})
+    } catch (rmErr) {
+      console.warn(
+        `kfactory: cleanup of partial clone ${tmpDir} failed:`,
+        rmErr instanceof Error ? rmErr.message : rmErr,
+      )
     }
     throw err
   }
@@ -229,11 +253,8 @@ export const KfactoryAdapter: Plugin = async ({experimental_workspace}) => {
     name: "kfactory",
     description: "kfactory: per-repo workspaces, in-process via InstanceStore",
 
-    // `info.name` round-trips: opencode persists what we return and
-    // restores it on subsequent calls. buildWorkspaceSlug preserves
-    // valid slugs / mints fresh otherwise. isValidSlug here is the
-    // first slug-boundary check; catches any future bug in the mint
-    // path before it pollutes the DB.
+    // isValidSlug here is the first slug-boundary check; catches any
+    // future bug in the mint path before it pollutes the DB.
     configure(info) {
       const slug = buildWorkspaceSlug(info)
       if (!isValidSlug(slug)) {
@@ -255,6 +276,8 @@ export const KfactoryAdapter: Plugin = async ({experimental_workspace}) => {
       const slug = info.name
       const {repoUrl} = parseExtra(info)
       if (!repoUrl) throw new Error(`kfactory: extra.repoUrl is required`)
+      expectedWorkspaceDir(info)
+      assertSlugMatchesRepo(slug, repoUrl)
       await cloneRepoInto(slug, repoUrl)
     },
 
@@ -264,12 +287,7 @@ export const KfactoryAdapter: Plugin = async ({experimental_workspace}) => {
       // mutations). assertWithinWorkspaces is belt-and-suspenders.
       // Propagate rm failures: opencode deletes the DB row AFTER remove()
       // resolves, so a swallowed error orphans the clone silently.
-      if (!isValidSlug(info.name)) {
-        throw new Error(
-          `kfactory: refusing to remove workspace with invalid slug: ${info.name}`,
-        )
-      }
-      const dir = workspaceDir(info.name)
+      const dir = expectedWorkspaceDir(info)
       await assertWithinWorkspaces(dir)
       try {
         await rm(dir, {recursive: true, force: true})
@@ -288,12 +306,7 @@ export const KfactoryAdapter: Plugin = async ({experimental_workspace}) => {
       // Re-validate -- target() runs on EVERY request, so a corrupted
       // info.name would otherwise root an in-process context at an
       // attacker-influenced path.
-      if (!isValidSlug(info.name)) {
-        throw new Error(
-          `kfactory: refusing to dispatch workspace with invalid slug: ${info.name}`,
-        )
-      }
-      return {type: "local", directory: workspaceDir(info.name)}
+      return {type: "local", directory: expectedWorkspaceDir(info)}
     },
   })
   return {}

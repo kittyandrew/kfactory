@@ -35,8 +35,8 @@ import (
 const authFileSchemaVersion = 1
 
 // SchemaVersion is the cross-component contract with the TS reader.
-// Missing/zero on disk = legacy pre-version file (loadTokens treats
-// as v1); saveTokens always writes the current version.
+// saveTokens always writes the current version; loadTokens rejects any
+// other value so malformed or stale auth state cannot be used silently.
 type tokenFile struct {
 	SchemaVersion int       `json:"schema_version"`
 	Server        string    `json:"server"` // factory API base URL
@@ -73,17 +73,59 @@ func loadTokens() (*tokenFile, error) {
 	if err := json.Unmarshal(b, &t); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
-	// Future version > current = the binary was downgraded. Refuse
-	// rather than risk a partial-field misread.
-	if t.SchemaVersion > authFileSchemaVersion {
+	if t.SchemaVersion != authFileSchemaVersion {
 		return nil, fmt.Errorf(
-			"%s: schema_version %d > supported %d (downgrade?)",
+			"%s: schema_version %d != supported %d",
 			p, t.SchemaVersion, authFileSchemaVersion)
+	}
+	if strings.TrimSpace(t.Server) == "" {
+		return nil, fmt.Errorf("%s: server is required", p)
+	}
+	if strings.TrimSpace(t.Issuer) == "" {
+		return nil, fmt.Errorf("%s: issuer is required", p)
+	}
+	if strings.TrimSpace(t.ClientID) == "" {
+		return nil, fmt.Errorf("%s: client_id is required", p)
+	}
+	if strings.TrimSpace(t.Audience) == "" {
+		return nil, fmt.Errorf("%s: audience is required", p)
+	}
+	if strings.TrimSpace(t.AccessToken) == "" {
+		return nil, fmt.Errorf("%s: access_token is required", p)
+	}
+	if strings.TrimSpace(t.RefreshToken) == "" {
+		return nil, fmt.Errorf("%s: refresh_token is required", p)
+	}
+	if t.ExpiresAt.IsZero() {
+		return nil, fmt.Errorf("%s: expires_at is required", p)
 	}
 	return &t, nil
 }
 
+func applyRefreshedToken(t *tokenFile, accessToken, refreshToken string, expiresAt time.Time) error {
+	if expiresAt.IsZero() {
+		return errors.New("refresh response missing token expiry")
+	}
+	t.AccessToken = accessToken
+	if refreshToken != "" {
+		t.RefreshToken = refreshToken
+	}
+	t.ExpiresAt = expiresAt
+	return nil
+}
+
 func saveTokens(t *tokenFile) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	lock, err := acquireLock(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire auth lock: %w", err)
+	}
+	defer releaseLock(lock)
+	return saveTokensUnlocked(t)
+}
+
+func saveTokensUnlocked(t *tokenFile) error {
 	p, err := tokenPath()
 	if err != nil {
 		return err
@@ -102,9 +144,14 @@ func saveTokens(t *tokenFile) error {
 	// post-rename power loss would silently lock the operator out. The
 	// dir-fsync is the second guard (rename's atomicity covers visibility
 	// only); we return its error rather than silently downgrade.
-	tmp := p + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.CreateTemp(dir, ".auth.json.*.tmp")
 	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if _, err := f.Write(b); err != nil {
@@ -137,6 +184,17 @@ func saveTokens(t *tokenFile) error {
 }
 
 func deleteTokens() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	lock, err := acquireLock(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire auth lock: %w", err)
+	}
+	defer releaseLock(lock)
+	return deleteTokensUnlocked()
+}
+
+func deleteTokensUnlocked() error {
 	p, err := tokenPath()
 	if err != nil {
 		return err
@@ -147,11 +205,9 @@ func deleteTokens() error {
 	return nil
 }
 
-// `template` binds the audience into the access-token aud[] claim;
-// defaultAudienceScopeTemplate is the deployment default (Zitadel URN
-// out of the box, ldflag-injectable). Empty template = issuer default.
-// Passed as a param (not read off the package var) so tests are
-// t.Parallel()-safe.
+// `template` binds the audience into the access-token aud[] claim. Empty
+// template = issuer default. Passed as a param (not read off the package
+// var) so tests are t.Parallel()-safe.
 func loginScopes(audience, template string) []string {
 	scopes := []string{"openid", "profile", "email", "offline_access"}
 	if template != "" {
@@ -167,25 +223,29 @@ var errNotLoggedIn = errors.New("not logged in")
 // Parses login flags, runs RFC 8628 device authorization, persists tokens.
 func runLogin(args []string) {
 	fs := flag.NewFlagSet("kfactory auth login", flag.ExitOnError)
-	server := fs.String("server", defaultServer, "factory API base URL")
-	issuer := fs.String("issuer", defaultIssuer, "OIDC issuer URL")
-	clientID := fs.String("client-id", defaultClientID, "OIDC client id")
-	audience := fs.String("audience", defaultAudience, "OIDC audience / project id")
+	server := fs.String("server", os.Getenv("KFACTORY_SERVER"), "factory API base URL")
+	issuer := fs.String("issuer", os.Getenv("KFACTORY_OIDC_ISSUER"), "OIDC issuer URL")
+	clientID := fs.String("client-id", os.Getenv("KFACTORY_OIDC_CLIENT_ID"), "OIDC client id")
+	audience := fs.String("audience", os.Getenv("KFACTORY_OIDC_AUDIENCE"), "OIDC audience / project id")
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 {
 		fail("login: unexpected positional args: %v", fs.Args())
 	}
 	if *server == "" || *issuer == "" || *clientID == "" || *audience == "" {
 		fail("login: missing required endpoint config.\n" +
-			"       this build has no compiled-in defaults; pass all four:\n" +
-			"       kfactory auth login --server URL --issuer URL --client-id ID --audience ID\n" +
-			"       (consumers can also embed defaults via -ldflags -X)")
+			"       set KFACTORY_SERVER, KFACTORY_OIDC_ISSUER, KFACTORY_OIDC_CLIENT_ID, KFACTORY_OIDC_AUDIENCE\n" +
+			"       or pass all four flags:\n" +
+			"       kfactory auth login --server URL --issuer URL --client-id ID --audience ID")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	scopes := loginScopes(*audience, defaultAudienceScopeTemplate)
+	scopeTemplate := zitadelAudienceScopeTemplate
+	if v, ok := os.LookupEnv("KFACTORY_OIDC_AUDIENCE_SCOPE_TEMPLATE"); ok {
+		scopeTemplate = v
+	}
+	scopes := loginScopes(*audience, scopeTemplate)
 	relying, err := rp.NewRelyingPartyOIDC(ctx, *issuer, *clientID, "", "", scopes)
 	if err != nil {
 		fail("login: oidc init: %v", err)
@@ -196,10 +256,7 @@ func runLogin(args []string) {
 		fail("login: device authorization: %v", err)
 	}
 
-	// Zitadel v1 device UI has a WebAuthn projection bug for org-scoped
-	// users (passkey in DB but v1 lookup misses). Rewrite to v2. Harmless
-	// against non-Zitadel issuers that don't serve /ui/v2/login.
-	verify := strings.TrimRight(*issuer, "/") + "/ui/v2/login/device?user_code=" + url.QueryEscape(da.UserCode)
+	verify := deviceVerificationURL(*issuer, da)
 	fmt.Fprintf(os.Stderr, "kfactory: open %s\n", verify)
 	fmt.Fprintf(os.Stderr, "kfactory: code %s\n", da.UserCode)
 
@@ -221,6 +278,22 @@ func runLogin(args []string) {
 		fail("login: save tokens: %v", err)
 	}
 	fmt.Fprintf(os.Stderr, "kfactory: logged in (server=%s)\n", t.Server)
+}
+
+func deviceVerificationURL(issuer string, da *oidc.DeviceAuthorizationResponse) string {
+	if da.VerificationURIComplete != "" {
+		return da.VerificationURIComplete
+	}
+	if da.VerificationURI != "" {
+		if u, err := url.Parse(da.VerificationURI); err == nil {
+			q := u.Query()
+			q.Set("user_code", da.UserCode)
+			u.RawQuery = q.Encode()
+			return u.String()
+		}
+		return da.VerificationURI + "?user_code=" + url.QueryEscape(da.UserCode)
+	}
+	return strings.TrimRight(issuer, "/") + "/device?user_code=" + url.QueryEscape(da.UserCode)
 }
 
 func runLogout() {
@@ -331,7 +404,7 @@ func ensureFresh(ctx context.Context) (*tokenFile, error) {
 		return nil, errNotLoggedIn
 	}
 
-	relying, err := rp.NewRelyingPartyOIDC(ctx, t.Issuer, t.ClientID, "", "", loginScopes(t.Audience, defaultAudienceScopeTemplate))
+	relying, err := rp.NewRelyingPartyOIDC(ctx, t.Issuer, t.ClientID, "", "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("oidc init: %w", err)
 	}
@@ -346,15 +419,10 @@ func ensureFresh(ctx context.Context) (*tokenFile, error) {
 		}
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
-	t.AccessToken = refreshed.AccessToken
-	if refreshed.RefreshToken != "" {
-		t.RefreshToken = refreshed.RefreshToken
+	if err := applyRefreshedToken(t, refreshed.AccessToken, refreshed.RefreshToken, refreshed.Expiry); err != nil {
+		return nil, err
 	}
-	t.ExpiresAt = refreshed.Expiry
-	if t.ExpiresAt.IsZero() {
-		t.ExpiresAt = time.Now().Add(5 * time.Minute)
-	}
-	if err := saveTokens(t); err != nil {
+	if err := saveTokensUnlocked(t); err != nil {
 		return nil, fmt.Errorf("save refreshed tokens: %w", err)
 	}
 	return t, nil

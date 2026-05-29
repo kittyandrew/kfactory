@@ -15,8 +15,8 @@ plugins/kfactory-adapter/    opencode WorkspaceAdapter plugin (TS, env-driven)
 plugins/ntfy/                ntfy.sh notification plugin (TS, vendored MIT subset)
 plugins/loop/                /loop auto-continuation plugin (TS, slash command + tools)
 plugins/opencode-pty/        third-party carrier (manifest-only): package.json +
-                             package-lock.json pinning shekohex/opencode-pty.
-                             Packaged through Nix via packages.opencode-pty; no
+                             package-lock.json pinning @josxa/opencode-pty.
+                             Packaged internally by the unified runtime; no
                              upstream source in our tree. See rule 050.
 patches/                     opencode + oauth2-proxy source patches (line-pinned)
 modules/                     NixOS modules: scheduled-tasks.nix (timer-driven
@@ -24,12 +24,11 @@ modules/                     NixOS modules: scheduled-tasks.nix (timer-driven
                              lifecycle: heal ExecStartPre + sync-kick & recovery-
                              sweep ExecStartPost). Exposed via flake.nix
                              `nixosModules = { scheduledTasks; recovery; };`
-tests/regression/            Docker-based regression test environment + lifecycle
-                             scripts (dev-up / dev-down / dev-clean / dev-test) +
-                             plugin/auth configs the test images consume
+nix/e2e/                     Docker-based e2e images/configs + Go behavioral runner
+nix/scripts/                 interactive dev apps (`nix run .#dev-*`)
 docs/spec.md                 architecture intent + decisions log (portable; no kittyos refs)
-flake.nix                    packages.kfactory + plugins.* + patches.* + checks.* + devShells.default
-.github/workflows/           check.yml (single job: lint + flake check + attic push on default-branch push)
+flake.nix                    public packages: kfactory + oauth2-proxy-kfactory; checks + devShells.default
+.github/workflows/           ci.yml (quality job + default-branch attic cache job)
 .claude/rules/                rules auto-loaded by Claude Code on every session
 ```
 
@@ -47,20 +46,18 @@ via `nix develop -c <cmd>`. To match CI locally, prefix with `nix develop -c`.
   -- workflow lint + security audit.
 - `nix develop -c betterleaks dir . --no-banner --redact` -- secrets
   scan. Allowlist for regression-tests fake-token fixtures in
-  `.betterleaks.toml` (prefilter on `tests/regression/configs/` +
+  `.betterleaks.toml` (prefilter on `nix/e2e/configs/` +
   `regression-fake-*` pattern filter).
-- `nix flake check` -- builds every `packages.${system}.*` (registered
-  as checks via `flake.nix`) plus the bespoke `factory-*` checks defined
-  in the `checks` attrset. The authoritative list lives in `flake.nix`;
+- `nix flake check` -- builds public packages plus internal component/plugin
+  derivations and the bespoke `factory-*` checks defined in the `checks` attrset.
+  The authoritative list lives in `flake.nix`;
   query at runtime with
   `nix eval --json .#checks.x86_64-linux --apply 'attrs: builtins.attrNames attrs'`.
-  Adding a new package or check automatically becomes a CI gate; no
+  Adding a new internal component, plugin, package, or check automatically becomes a CI gate; no
   workflow edit needed.
-- `nix build .#kfactory` -- builds the CLI binary. Defaults are empty;
-  consumer `overrideAttrs` injects via `-ldflags -X` (see README).
-- `nix build .#opencode-kfactory` / `.#oauth2-proxy-kfactory` -- patched
-  upstream packages (convenience wrappers for consumers that don't need
-  to stack their own patches).
+- `nix build .#kfactory` -- builds the unified runtime package: kfactory
+  CLI, patched opencode, bundled config, and plugins.
+- `nix build .#oauth2-proxy-kfactory` -- builds the patched oauth2-proxy sibling.
 - `go build ./cmd/kfactory` -- direct Go build outside Nix.
 
 Before claiming work done: run `nix flake check`, `golangci-lint`,
@@ -75,23 +72,23 @@ of the above on every PR.
   Switch over subcommands -- no top-level aliases like `ls` / `rm`.
 - `kfactory tick <task-id|ref>` is the idempotent-dispatch verb. Two
   shapes: scheduled (config file at `/etc/kfactory/scheduled/<id>.json`
-  drives behavior; ref IS the task id which becomes the workspace slug
-  suffix) and ad-hoc (`--prompt TEXT` required; ref resolves a
-  workspace and the prompt is appended as a new user message in the
-  most-recent root session). The same verb services scheduled task
+  drives behavior; ref IS the task id and scheduled workspace identity is
+  exactly `wrk_kfactory_<task-id>`) and ad-hoc (`--prompt TEXT` required; ref is the workspace ID
+  or 4-hex slug suffix, never a list index, and the prompt is appended
+  as a new user message in the most-recent root session). The same verb
+  services scheduled task
   fires (via `modules/scheduled-tasks.nix`) and VM-reboot recovery
   (via `modules/recovery.nix` -> recovery-sweep). The JSON config
   schema is owned by `cmd/kfactory/tick.go`; the NixOS module emits
   JSON the CLI accepts.
-- CLI endpoint defaults are EMPTY in source (`defaultServer`, `defaultIssuer`,
-  `defaultClientID`, `defaultAudience` in `main.go`). Consumers bake values
-  via `overrideAttrs` + `-ldflags -X main.<name>=...`; operators can also
-  pass `--server` / `--issuer` / `--client-id` / `--audience` on first
-  `kfactory auth login`. **Exception**: `defaultAudienceScopeTemplate`
-  ships with the Zitadel URN `urn:zitadel:iam:org:project:id:%s:aud` as
-  a default so existing Zitadel deployments keep working without
-  ldflags. Non-Zitadel deployers override or empty-string it via
-  `-X main.defaultAudienceScopeTemplate=...`.
+- CLI endpoint defaults are runtime env vars:
+  `KFACTORY_SERVER`, `KFACTORY_OIDC_ISSUER`,
+  `KFACTORY_OIDC_CLIENT_ID`, `KFACTORY_OIDC_AUDIENCE`.
+  Operators can also pass `--server` / `--issuer` / `--client-id` /
+  `--audience` on first `kfactory auth login`. The audience-scope template
+  defaults to the Zitadel URN `urn:zitadel:iam:org:project:id:%s:aud`; set
+  `KFACTORY_OIDC_AUDIENCE_SCOPE_TEMPLATE` to override it, including empty
+  string for issuer default.
 - Token state: `$XDG_CONFIG_HOME/kfactory/auth.json` (mode 0600),
   cross-process refresh coordinated via POSIX `flock(2)` on
   `auth.json.lock`.

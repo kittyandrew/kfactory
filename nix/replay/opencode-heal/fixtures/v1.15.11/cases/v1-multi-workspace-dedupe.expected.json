@@ -1,0 +1,4 @@
+{
+  "queue": ["wrk_a", "wrk_b"],
+  "log": {"v1_message": 3, "v2_session_message": 0, "abandoned_pty": 0, "affected_workspaces": 2}
+}

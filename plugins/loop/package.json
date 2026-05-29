@@ -14,10 +14,10 @@
     "commands"
   ],
   "dependencies": {
-    "@types/node": "24.12.2",
-    "@opencode-ai/plugin": "1.15.4"
+    "@opencode-ai/plugin": "1.15.11"
   },
   "devDependencies": {
+    "@types/node": "24.12.2",
     "typescript": "5.8.2"
   }
 }

@@ -4,7 +4,7 @@ description: Auto-continue the current session until a user-defined sentinel str
 
 # /loop
 
-Start an auto-continuation loop. After your turn ends (`session.idle`),
+Start an auto-continuation loop. After your turn reaches `session.status` idle,
 the plugin checks the **last non-empty line** of the last assistant
 message: if that trimmed line equals the configured sentinel exactly,
 the loop terminates; otherwise it re-prompts you to continue. The loop

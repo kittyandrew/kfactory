@@ -1,7 +1,7 @@
 # kfactory secrets scan config -- runs alongside the other code-quality
 # linters (golangci-lint, gofmt, alejandra, actionlint, zizmor). The
 # scan is invoked via `nix develop -c betterleaks ...` from the dev
-# shell + the quality job in .github/workflows/check.yml.
+# shell + the quality job in .github/workflows/ci.yml.
 #
 # Local pre-commit invocation + CI invocation are identical:
 #   nix develop -c betterleaks dir . --no-banner --redact
@@ -15,16 +15,16 @@ title = "kfactory secrets scan"
 useDefault = true
 
 # `prefilter` skips entire files before any regex runs.
-# tests/regression/configs/ holds bogus credentials that bypass OIDC --
+# nix/e2e/configs/ holds bogus credentials that bypass OIDC --
 # the regression-tests opencode server has no JWT validator, so the
 # fake bearer/idp/client_id strings are deliberate (see
-# tests/regression/configs/auth.json for the runtime contract).
+# nix/e2e/configs/auth.json for the runtime contract).
 prefilter = '''
-attributes[?"path"].orValue("").startsWith("tests/regression/configs/")
+attributes[?"path"].orValue("").startsWith("nix/e2e/configs/")
 '''
 
 # `filter` runs per-finding (defense in depth if a `regression-fake-*`
-# placeholder ever lands outside tests/regression/configs/).
+# placeholder ever lands outside nix/e2e/configs/).
 filter = '''
 matchesAny(finding["secret"], [r"""^regression-fake-[a-z]+$"""])
 '''

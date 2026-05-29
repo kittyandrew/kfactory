@@ -1,14 +1,6 @@
-# kfactory CLI -- endpoint defaults (main.default{Server,Issuer,
-# ClientID,Audience}) ship empty; consumers bake via overrideAttrs:
-#
-#   kfactory.overrideAttrs (old: {
-#     ldflags = (old.ldflags or []) ++ [
-#       "-X main.defaultServer=https://factory.example.com"
-#       "-X main.defaultIssuer=https://auth.example.com"
-#       "-X main.defaultClientID=12345"
-#       "-X main.defaultAudience=67890"
-#     ];
-#   })
+# kfactory CLI. Endpoint defaults are runtime env vars:
+# KFACTORY_SERVER, KFACTORY_OIDC_ISSUER, KFACTORY_OIDC_CLIENT_ID,
+# KFACTORY_OIDC_AUDIENCE.
 #
 # Refresh vendorHash after go.mod/go.sum changes: set to lib.fakeHash,
 # `nix build`, copy the hash from the error.

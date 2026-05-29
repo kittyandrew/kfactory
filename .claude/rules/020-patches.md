@@ -1,43 +1,30 @@
 # Opencode patch stack
-<!-- patches -- five-patch stack, picking which patch to edit -->
+<!-- patches -- opencode patch stack, picking which patch to edit -->
 
-Five opencode patches are line-number-pinned against the
+Four opencode patches are line-number-pinned against the
 `inputs.opencode` flake input (the exact tag pinned in `flake.nix`).
 Stack order is mandatory:
 
-0. `patches/opencode-bun-version-relax.patch` -- **TEMPORARY**.
+0. `patches/opencode-bun-version-relax.patch` -- build workaround.
    Single-file (`packages/script/src/index.ts`) one-line change
    relaxing the bun-version range from `^${packageManager}` to
    `>=1.3.13` so nixpkgs's bun 1.3.13 can build opencode v1.15.5+.
-   Drop when nixpkgs#519796 (bun 1.3.13 -> 1.3.14) merges. Lives at
-   the top of the stack because it touches a file none of the other
-   patches do; ordering doesn't actually matter for this one but it
-   stays first by convention to keep the "drop me later" intent
-   visible.
-1. `patches/opencode-bearer-and-routing.patch` -- upstreamable subset:
-   bearer flag, `--workspace` plumbing, workspace-routing header
+   Drop when nixpkgs#519796 (bun 1.3.13 -> 1.3.14) merges. Keep first for
+   easy removal; no later patch depends on its touched file.
+1. `patches/opencode-static-bearer.patch` -- generic client Bearer
+   header plumbing: `OPENCODE_SERVER_BEARER`, `ServerAuth.header()`
+   Bearer emission, and `opencode attach --bearer`. Server-side
+   opencode still does not validate Bearer.
+2. `patches/opencode-workspace-routing.patch` -- upstreamable workspace
+   correctness subset: `--workspace` plumbing, workspace-routing header
    fallback (v1 + v2 path), `Session.list` + `Session.listGlobal`
    workspaceID filter (workspace_id supersedes project_id when set),
-   plugin-adapter ProjectID.global registration, plus the
-   `provideInstanceFromHeader` helper in
-   `middleware/instance-context.ts` (header -> workspace ->
-   InstanceStore.provide; used by /global/event SSE handler in the
-   session-subscribers patch).
-2. `patches/opencode-workspace-branch.patch` -- upstreamable subset:
-   `WorkspaceHttpApi.list` enriches each row's `branch` field with a
-   FRESH `.git/HEAD` read at request time (via Effect.forEach +
-   Effect.sync, concurrency unbounded). Independent file
-   (handlers/workspace.ts) -- neither neighbour patch touches it.
-3. `patches/opencode-session-subscribers.patch` -- publishes
-   `kfactory.subscribers.changed` bus events on every SSE attach /
-   detach to BOTH the per-instance `/event` AND the front-opencode
-   `/global/event` (shared WeakMap exported from handlers/event.ts,
-   imported by handlers/global.ts). Used by `plugins/ntfy` to skip /
-   cancel notifications when an operator is attached.
-4. `patches/opencode-kfactory-refresh.patch` -- kfactory-specific glue,
+   `/sync/start?workspace=`, and plugin-adapter ProjectID.global
+   registration/fallback.
+3. `patches/opencode-kfactory-refresh.patch` -- kfactory-specific glue,
    applied on top: cache file, subprocess refresh, schema-versioned
    auth.json read, toast subscription. Line-pinned against patches
-   1-3's post-apply hashes.
+   1+2's post-apply hashes.
 
 `patches/oauth2-proxy-pkce-no-secret.patch` is verbatim
 [oauth2-proxy#3168](https://github.com/oauth2-proxy/oauth2-proxy/pull/3168);
@@ -49,34 +36,26 @@ against a fresh opencode source**.
 
 ## Picking which patch to edit
 
-A change is in **bearer-and-routing** if it's something opencode upstream
-would plausibly accept: env-var flag wiring, CLI flags on
-`opencode attach`, workspace-id plumbing, header-routing semantics,
-session.list filtering by workspace_id, plugin-adapter project scope,
-and the routing middleware in
-`server/routes/instance/httpapi/middleware/` (including the
-`provideInstanceFromHeader` helper).
+A change is in **static-bearer** if it is generic client-side Bearer
+header plumbing: `OPENCODE_SERVER_BEARER`, `credentials.bearer`,
+`ServerAuth.header()` returning `Bearer ...`, or `opencode attach
+--bearer`.
 
-A change is in **workspace-branch** if it touches
-`WorkspaceHttpApi.list` row enrichment (today: live `branch` read
-from `.git/HEAD`). Adding e.g. `dirty: bool` or `head: <sha>` to
-list rows would belong here. Independent file; safe to edit in
-isolation.
-
-A change is in **session-subscribers** if it's about exposing SSE
-subscriber lifecycle to plugins (the `kfactory.subscribers.changed`
-event + the shared WeakMap counter that handlers/event.ts owns and
-handlers/global.ts imports). Adding more plugin surface area for
-"what's the server doing" signals belongs here.
+A change is in **workspace-routing** if it is workspace correctness
+opencode upstream would plausibly accept: CLI flags on `opencode attach`,
+workspace-id plumbing, header-routing semantics, session.list filtering by
+workspace_id, sync-start workspace targeting, plugin-adapter project
+scope, and the routing middleware in
+`server/routes/instance/httpapi/middleware/`.
 
 A change is in **kfactory-refresh** if it's kfactory-specific: anything
 touching `OPENCODE_SERVER_BEARER_CACHE_PATH`, `createBearerRefreshFetch`,
 `spawnKfactoryRefresh`, `AuthFile`, `KFACTORY_EXIT_*`, the
 `onBearerRefreshHint` toast bus.
 
-When in doubt: edit the refresh patch. Keeping the upstreamable
-patches (bearer-and-routing, workspace-branch, session-subscribers)
-clean of kfactory specifics is what makes them upstreamable.
+When in doubt: edit the refresh patch. Keeping static-bearer and
+workspace-routing clean of kfactory specifics is what makes them easier
+to upstream or delete independently.
 
 ## Related rules
 

@@ -1,0 +1,6 @@
+{
+  "queue": ["wrk_pty_idem"],
+  "log": {"v1_message": 0, "v2_session_message": 0, "abandoned_pty": 1, "affected_workspaces": 1},
+  "secondQueue": [],
+  "secondLog": {"v1_message": 0, "v2_session_message": 0, "abandoned_pty": 0, "affected_workspaces": 0}
+}

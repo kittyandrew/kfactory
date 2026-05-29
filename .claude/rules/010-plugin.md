@@ -31,34 +31,30 @@ plugins/
                                 -> src/index.ts
     package-lock.json
     tsconfig.json
-    src/index.ts                Plugin entry: event dispatch + wait + skip-on-connect
+    src/index.ts                Plugin entry: event dispatch + debounce + kfactory gates
     src/backend.ts              ntfy HTTP send + content defaults
     src/config.ts               config parsing + shorthand-duration parser ("3s", "5m", "1h30m")
 ```
 
 Each plugin is a self-contained npm package shape. Opencode's `PluginLoader`
 resolves entries either as npm package names OR as file paths -- for our
-deployment it sees an absolute store path (one of `plugins.<system>.<name>`
-in `flake.nix`) and reads `package.json`'s `exports["./server"]` to find
-the entrypoint. opencode runs Bun under the hood, so TS source is loaded
-directly -- no compile step required.
+deployment it sees an absolute store path from the unified runtime's internal
+plugin package set and reads `package.json`'s `exports["./server"]` to find the
+entrypoint. opencode runs Bun under the hood, so TS source is loaded directly --
+no compile step required.
 
 ## No `@VAR@` placeholders anymore
 
 Earlier plugins used `pkgs.replaceVars` to substitute `@GIT@` etc. with
 absolute Nix store paths at build time. That's gone. Plugins now read
 config from `process.env.*` with sensible defaults (PATH-resolved binaries
-where applicable). Consumers wrap opencode with the env vars they need:
+where applicable). Runtime env defaults belong in `nix/shared/kfactory-runtime.nix`:
 
 ```nix
-opencode-kfactory.overrideAttrs (old: {
-  postFixup = (old.postFixup or "") + ''
-    wrapProgram $out/bin/opencode \
-      --set KFACTORY_ADAPTER_GIT "${pkgs.git}/bin/git" \
-      --set KFACTORY_ADAPTER_OPENSSH_SSH "${pkgs.openssh}/bin/ssh" \
-      --set KFACTORY_ADAPTER_WORKSPACES_DIR "/var/lib/factory/workspaces"
-  '';
-})
+wrapProgram $out/bin/opencode \
+  --set-default KFACTORY_ADAPTER_GIT "${pkgs.git}/bin/git" \
+  --set-default KFACTORY_ADAPTER_OPENSSH_SSH "${pkgs.openssh}/bin/ssh" \
+  --set-default KFACTORY_ADAPTER_WORKSPACES_DIR "/var/lib/factory/workspaces"
 ```
 
 If you find yourself reaching for `@VAR@` substitution again, push back:

@@ -1,14 +1,9 @@
-# Sweep zombie assistant turns + emit affected workspace IDs to the
-# recovery queue (recovery-sweep ticks ONLY those workspaces). Handles
-# BOTH opencode v1 (`message` table, role in JSON) and v2
-# (`session_message` table, role in `type` column) -- whichever doesn't
-# exist on a given DB is a silent no-op.
-#
-# Wiring: modules/recovery.nix attaches this as ExecStartPre on the
-# opencode-serve unit.
+# Heal opencode restarts: mark interrupted assistant turns, queue affected
+# workspace IDs for recovery-sweep, and tolerate first boot by writing `[]`.
+# Handles v1 `message` and v2 `session_message`; absent tables are no-ops.
+# Wired by modules/recovery.nix as opencode-serve ExecStartPre.
 # Usage: opencode-heal <PATH-TO-DB>
-# Env:   KFACTORY_RECOVERY_QUEUE (default /run/kfactory/recovery-queue.json)
-# First-boot tolerant: missing DB writes empty queue + exits 0.
+# Env: KFACTORY_RECOVERY_QUEUE (default /run/kfactory/recovery-queue.json)
 
 if [ $# -lt 1 ]; then
   echo "usage: opencode-heal <PATH-TO-DB>" >&2
@@ -53,22 +48,15 @@ SELECT DISTINCT session.workspace_id
   FROM $table
   JOIN session ON $table.session_id = session.id
   WHERE $role_predicate
-    AND json_extract($table.data, '\$.time.completed') IS NULL
+    AND CASE WHEN json_valid($table.data) THEN json_extract($table.data, '\$.time.completed') IS NULL ELSE 0 END
     AND session.workspace_id IS NOT NULL;
 SQL
 }
 
-# Marks stuck rows: time.completed=now, finish='interrupted-by-restart',
-# AND error={name: "MessageAbortedError", data: {message: ...}}. The
-# error.name field is what opencode's UI checks (the
-# `MessageAbortedError` branch in
-# packages/app/src/pages/session/message-timeline.data.ts) to render
-# the interrupted badge -- finish alone is informational and doesn't
-# drive rendering. Idempotency: `time.completed IS NULL` ALREADY
-# scopes the update to unhealed rows + the explicit
-# `error.name IS NOT 'MessageAbortedError'` predicate makes
-# re-running heal on already-marked rows a no-op (matches the same
-# guard on heal_process_pty_v1). Echoes row-count touched.
+# Mark stuck rows as interrupted. UI rendering keys on
+# error.name=MessageAbortedError, not finish; see opencode
+# packages/app/src/pages/session/message-timeline.data.ts. The completed-time
+# and error-name predicates make reruns no-ops. Echoes rows touched.
 heal_update() {
   local table=$1 role_predicate=$2
   "${SQLITE[@]}" "$DB" <<SQL
@@ -82,74 +70,49 @@ SET data = json_set(
   json('{"name":"MessageAbortedError","data":{"message":"opencode-serve restarted; turn interrupted mid-flight"}}')
 )
 WHERE $role_predicate
-  AND json_extract(data, '\$.time.completed') IS NULL
-  AND json_extract(data, '\$.error.name') IS NOT 'MessageAbortedError';
+  AND CASE WHEN json_valid(data) THEN json_extract(data, '\$.time.completed') IS NULL ELSE 0 END
+  AND CASE WHEN json_valid(data) THEN json_extract(data, '\$.error.name') IS NOT 'MessageAbortedError' ELSE 0 END;
 SELECT changes();
 SQL
 }
 
-# Abandoned-PTY detection (kfactory-specific): when opencode-serve
-# restarts, opencode-pty's in-memory `sessions: Map<id, Session>`
-# vanishes; PTY processes die with their parent. The agent's spawn
-# turn was `time.completed=set` (the tool returned normally) so heal's
-# stuck-turn predicate doesn't match. Without this pass the task is
-# silently dropped: no recovery prompt, no UI signal.
+# Abandoned PTYs: opencode-pty keeps lifecycle state in memory, so a restart
+# can kill a notifyOnExit PTY without the `<pty_exited>` message that resumes
+# the agent. Until kfactory has a durable PTY ledger, mirror the transcript
+# contract from plugins/ntfy/src/pty-lifecycle.ts; docs/spec.md owns the risk.
 #
-# Strategy: build a TEMP TABLE of (message_id, session_id, workspace_id,
-# spawn_time, pty_id) for every pty_spawn(notifyOnExit=true) tool part,
-# then DELETE entries that DO have a matching exit message (user-role
-# text part containing </pty_exited> AND the specific pty_id from this
-# spawn). What survives is the set of abandoned PTYs. The temp table
-# is consumed by a UPDATE (marks containing messages with
-# error.name=MessageAbortedError for UI affordance) and a SELECT
-# (emits workspace_ids for the recovery queue).
-#
-# pty_id extraction: opencode-pty's pty_spawn returns
-# `<pty_spawned>\nID: pty_<8 hex chars>\n...` (per
-# node_modules/opencode-pty/dist/src/plugin/pty/session-lifecycle.js:5,
-# SESSION_ID_BYTE_LENGTH = 4 -> 8 hex chars -> `pty_` + 8 = 12 chars).
-# `substr(output, instr(output, 'ID: pty_')+4, 12)` extracts exactly
-# the id. Brittle if upstream changes the byte length -- documented
-# in docs/spec.md as a known third-party-format coupling.
-#
-# Anchoring on the specific pty_id (not just '</pty_exited>') closes
-# the multi-PTY false-negative class: if pty_A exited and pty_B is
-# still pending, a string-only match on '</pty_exited>' would consider
-# both resolved by pty_A's exit message. The role=user filter alone
-# isn't enough -- an operator could quote the literal closing tag in
-# a prompt and false-resolve every prior spawn in the session.
-#
-# v1-only today: v2 doesn't yet store assistant message parts in this
-# version of opencode (the v1 message table is still the active one
-# for assistant rows). A v2 skeleton is the obvious next addition.
-#
-# Single sqlite3 invocation -- temp tables don't persist across
-# separate `${SQLITE[@]} "$DB"` calls. Emits one workspace_id per
-# line; caller counts rows with `wc -l`. Idempotency: UPDATEs guard
-# on `error.name IS NOT 'MessageAbortedError'` so re-runs are no-ops.
+# v1-only for now. Single sqlite3 invocation because temp tables are scoped to
+# one connection. Emits one workspace_id per abandoned PTY workspace.
 heal_process_pty_v1() {
   "${SQLITE[@]}" "$DB" <<'SQL' || true
 DROP TABLE IF EXISTS temp.abandoned_pty;
 CREATE TEMP TABLE abandoned_pty AS
-SELECT
-  p.message_id,
-  p.session_id,
-  s.workspace_id,
-  p.time_created AS spawn_time,
-  substr(
-    json_extract(p.data, '$.state.output'),
-    instr(json_extract(p.data, '$.state.output'), 'ID: pty_') + 4,
-    12
-  ) AS pty_id
-FROM part p
-JOIN message m ON p.message_id = m.id
-JOIN session s ON m.session_id = s.id
-WHERE json_extract(p.data, '$.type') = 'tool'
-  AND json_extract(p.data, '$.tool') = 'pty_spawn'
-  AND json_extract(p.data, '$.state.input.notifyOnExit') = 1
-  AND s.workspace_id IS NOT NULL
-  AND json_extract(p.data, '$.state.output') IS NOT NULL
-  AND instr(json_extract(p.data, '$.state.output'), 'ID: pty_') > 0;
+SELECT message_id, session_id, workspace_id, spawn_time, pty_id
+FROM (
+  SELECT
+    p.message_id,
+    p.session_id,
+    s.workspace_id,
+    p.time_created AS spawn_time,
+    json_extract(p.data, '$.state.output') AS output,
+    substr(
+      json_extract(p.data, '$.state.output'),
+      instr(json_extract(p.data, '$.state.output'), 'ID: pty_') + 4,
+      12
+    ) AS pty_id
+  FROM part p
+  JOIN message m ON p.message_id = m.id
+  JOIN session s ON m.session_id = s.id
+  WHERE CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.type') = 'tool' ELSE 0 END
+    AND CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.tool') = 'pty_spawn' ELSE 0 END
+    AND CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.state.input.notifyOnExit') = 1 ELSE 0 END
+    AND s.workspace_id IS NOT NULL
+    AND CASE WHEN json_valid(m.data) THEN json_extract(m.data, '$.error.name') IS NOT 'MessageAbortedError' ELSE 0 END
+)
+WHERE output IS NOT NULL
+  AND instr(output, 'ID: pty_') > 0
+  AND pty_id GLOB 'pty_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+  AND output LIKE '%<pty_spawned>' || char(10) || 'ID: ' || pty_id || char(10) || '%</pty_spawned>%';
 
 DELETE FROM abandoned_pty WHERE rowid IN (
   SELECT a.rowid FROM abandoned_pty a
@@ -158,10 +121,9 @@ DELETE FROM abandoned_pty WHERE rowid IN (
     JOIN message m2 ON p2.message_id = m2.id
     WHERE p2.session_id = a.session_id
       AND p2.time_created > a.spawn_time
-      AND json_extract(p2.data, '$.type') = 'text'
-      AND json_extract(p2.data, '$.text') LIKE '%</pty_exited>%'
-      AND json_extract(p2.data, '$.text') LIKE '%' || a.pty_id || '%'
-      AND json_extract(m2.data, '$.role') = 'user'
+      AND CASE WHEN json_valid(p2.data) THEN json_extract(p2.data, '$.type') = 'text' ELSE 0 END
+      AND CASE WHEN json_valid(p2.data) THEN json_extract(p2.data, '$.text') LIKE '%<pty_exited>' || char(10) || 'ID: ' || a.pty_id || char(10) || '%</pty_exited>%' ELSE 0 END
+      AND CASE WHEN json_valid(m2.data) THEN json_extract(m2.data, '$.role') = 'user' ELSE 0 END
   )
 );
 
@@ -188,13 +150,9 @@ updated_v2=0
 updated_pty_v1=0
 
 if v1_exists; then
-  affected_v1=$(heal_collect message "json_extract(message.data, '\$.role') = 'assistant'")
-  updated_v1=$(heal_update message "json_extract(data, '\$.role') = 'assistant'")
-  # heal_process_pty_v1 emits one workspace_id per line. Count
-  # non-empty lines for the JSON log; the count's sole purpose is
-  # operator visibility (every workspace also lands in the queue
-  # below). Both grep paths use `|| true` because grep exits 1 on
-  # zero matches and the script runs under `set -e`.
+  affected_v1=$(heal_collect message "CASE WHEN json_valid(message.data) THEN json_extract(message.data, '\$.role') = 'assistant' ELSE 0 END")
+  updated_v1=$(heal_update message "CASE WHEN json_valid(data) THEN json_extract(data, '\$.role') = 'assistant' ELSE 0 END")
+  # Count non-empty PTY hits for operator-visible JSON; `grep -c` exits 1 on zero.
   affected_pty_v1=$(heal_process_pty_v1)
   updated_pty_v1=$(printf '%s\n' "$affected_pty_v1" | grep -c . || true)
   updated_pty_v1=${updated_pty_v1:-0}
@@ -218,11 +176,7 @@ else
   affected_count=$(printf '%s\n' "$ids" | wc -l)
 fi
 
-# JSON log line so monitoring / scripted consumers parse a stable
-# schema (the prior space-separated `k=v` shape was position-fragile
-# -- adding `abandoned_pty` between `v2_session_message` and
-# `affected_workspaces` silently shifted columns for anyone field-
-# splitting on it). Human-readable enough; `jq` already in PATH.
+# Stable single-line JSON log for monitoring/scripted consumers.
 heal_json=$(jq -nc \
   --argjson v1 "$updated_v1" \
   --argjson v2 "$updated_v2" \

@@ -63,9 +63,16 @@ _kfactory() {
           _arguments '*:workspace ref (id|slug|index):'
           ;;
         dispatch)
-          _arguments \
-            '1:repo url (any git-clone-able URL):' \
-            '*:prompt:'
+          if (( CURRENT > 3 )); then
+            case "$PREFIX" in
+              ./*|../*|/*|~/*) _files ;;
+              *) _message 'prompt text' ;;
+            esac
+          else
+            _arguments \
+              '1:repo url (any git-clone-able URL):' \
+              '*:prompt:'
+          fi
           ;;
       esac
       ;;

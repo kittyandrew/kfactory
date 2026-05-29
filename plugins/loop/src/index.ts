@@ -6,8 +6,8 @@
 // ralph-wiggum pattern; reduced to one slash command (/loop) + two
 // tools (loop-start, loop-stop). Default sentinel
 // `<promise>EXHAUSTIVELY COMPLETED</promise>` is intentionally verbose
-// to avoid speculative emission. No coupling to subscribers.changed;
-// runs on session.idle alone; operator stops via /loop-stop.
+// to avoid speculative emission. Runs on session.status idle; operator
+// stops via /loop-stop.
 //
 // State at $XDG_STATE_HOME/kfactory-loop/<sha256(dir)>.json -- outside
 // the workspace tree to prevent accidental `git add .`. Slash-command
@@ -15,7 +15,7 @@
 // into opencode's command dir explicitly (README example).
 
 import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -35,7 +35,7 @@ const MAX_CONSECUTIVE_FAILURES = 3
 
 // Bump + migrate on incompatible LoopState changes; readState rejects
 // unknown versions rather than parse garbage.
-const STATE_SCHEMA_VERSION = 1
+const STATE_SCHEMA_VERSION = 2
 
 // ---- State file location ----
 
@@ -56,9 +56,13 @@ function stateFile(directory: string): string {
 
 // ---- State schema ----
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
 interface LoopState {
   schemaVersion: number
-  active: boolean
+  runID: string
   iteration: number
   maxIterations: number
   sentinel: string
@@ -70,34 +74,54 @@ interface LoopState {
 function readState(directory: string): LoopState | null {
   const p = stateFile(directory)
   if (!existsSync(p)) return null
+  const invalid = (reason: string): null => {
+    console.warn(`loop: invalid state file ${p}: ${reason}; clearing`)
+    try {
+      unlinkSync(p)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`loop: failed to clear invalid state file ${p}: ${msg}`)
+    }
+    return null
+  }
   try {
     const parsed: unknown = JSON.parse(readFileSync(p, "utf-8"))
-    if (typeof parsed !== "object" || parsed === null) return null
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return invalid("expected object")
     const obj = parsed as Record<string, unknown>
-    // Older plugin + newer state file -> refuse to parse fields it
-    // doesn't understand. Missing/zero treated as "no state".
-    if (obj.schemaVersion !== STATE_SCHEMA_VERSION) {
-      console.warn(
-        `loop: state file ${p} has schemaVersion=${String(obj.schemaVersion)} ` +
-          `(supported: ${STATE_SCHEMA_VERSION}); ignoring`,
-      )
-      return null
+    const allowed = new Set(["schemaVersion", "runID", "iteration", "maxIterations", "sentinel", "sessionID", "task", "consecutiveFailures"])
+    for (const key of Object.keys(obj)) {
+      if (!allowed.has(key)) return invalid(`unknown field ${key}`)
     }
-    if (obj.active !== true) return null
+    if (obj.schemaVersion !== STATE_SCHEMA_VERSION) return invalid(`schemaVersion=${String(obj.schemaVersion)}`)
+    const runID = obj.runID
+    const iteration = obj.iteration
+    const maxIterations = obj.maxIterations
+    const sentinel = obj.sentinel
+    const sessionID = obj.sessionID
+    const task = obj.task
+    const consecutiveFailures = obj.consecutiveFailures
+    if (typeof runID !== "string" || runID.length === 0) return invalid("runID must be a non-empty string")
+    if (typeof iteration !== "number" || !Number.isInteger(iteration) || iteration < 0) return invalid("iteration must be a non-negative integer")
+    if (typeof maxIterations !== "number" || !Number.isInteger(maxIterations) || maxIterations < MIN_MAX_ITERATIONS || maxIterations > MAX_MAX_ITERATIONS) {
+      return invalid(`maxIterations must be an integer in [${MIN_MAX_ITERATIONS}, ${MAX_MAX_ITERATIONS}]`)
+    }
+    if (!validSentinel(sentinel)) return invalid("sentinel must be non-empty, single-line, and must not have leading/trailing whitespace")
+    if (typeof sessionID !== "string" || sessionID.length === 0) return invalid("sessionID must be a non-empty string")
+    if (typeof task !== "string" || task.trim().length === 0) return invalid("task must be a non-empty string")
+    if (typeof consecutiveFailures !== "number" || !Number.isInteger(consecutiveFailures) || consecutiveFailures < 0) return invalid("consecutiveFailures must be a non-negative integer")
     return {
       schemaVersion: STATE_SCHEMA_VERSION,
-      active: true,
-      iteration: typeof obj.iteration === "number" ? obj.iteration : 0,
-      maxIterations:
-        typeof obj.maxIterations === "number" ? obj.maxIterations : DEFAULT_MAX_ITERATIONS,
-      sentinel: typeof obj.sentinel === "string" ? obj.sentinel : DEFAULT_SENTINEL,
-      sessionID: typeof obj.sessionID === "string" ? obj.sessionID : "",
-      task: typeof obj.task === "string" ? obj.task : "",
-      consecutiveFailures:
-        typeof obj.consecutiveFailures === "number" ? obj.consecutiveFailures : 0,
+      runID,
+      iteration,
+      maxIterations,
+      sentinel,
+      sessionID,
+      task,
+      consecutiveFailures,
     }
-  } catch {
-    return null
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return invalid(msg)
   }
 }
 
@@ -137,20 +161,43 @@ function tryClearState(directory: string): void {
   }
 }
 
+type SessionKind = "root" | "subagent" | "missing" | "unknown"
+
+function isNotFoundError(err: unknown): boolean {
+  if (!isRecord(err)) return false
+  const direct = err.status ?? err.statusCode
+  if (direct === 404) return true
+  const response = isRecord(err.response) ? err.response : undefined
+  if (response?.status === 404) return true
+  const error = isRecord(err.error) ? err.error : undefined
+  return error?.status === 404 || error?.statusCode === 404
+}
+
 // Non-empty parentID = subagent (child of operator's session). Firing
 // continuations on subagent idles would hijack the wrong session and
 // spam the parent. Fail-CLOSED on lookup error: false-positive
 // injection mid-task corrupts work the operator cares about; missed
 // suppression retries next idle.
-async function isSubagentSession(client: OpencodeClient, sessionID: string): Promise<boolean> {
+async function sessionKind(client: OpencodeClient, sessionID: string): Promise<SessionKind> {
   try {
     const resp = await client.session.get({ path: { id: sessionID } })
-    return Boolean(resp.data?.parentID)
+    return resp.data?.parentID ? "subagent" : "root"
   } catch (err) {
+    if (isNotFoundError(err)) return "missing"
     const msg = err instanceof Error ? err.message : String(err)
-    console.warn(`loop: isSubagentSession(${sessionID}) lookup failed, treating as subagent: ${msg}`)
-    return true
+    console.warn(`loop: session.get(${sessionID}) lookup failed, skipping injection: ${msg}`)
+    return "unknown"
   }
+}
+
+function validSentinel(sentinel: unknown): sentinel is string {
+  return (
+    typeof sentinel === "string" &&
+    sentinel.trim().length > 0 &&
+    sentinel === sentinel.trim() &&
+    !sentinel.includes("\n") &&
+    !sentinel.includes("\r")
+  )
 }
 
 // ---- Completion detection ----
@@ -213,7 +260,7 @@ function buildContinuation(state: LoopState, nextIteration: number): string {
     `the trailing line is checked.`,
     ``,
     `Original task:`,
-    state.task || "(none recorded)",
+    state.task,
   ].join("\n")
 }
 
@@ -234,11 +281,11 @@ const LoopPlugin: Plugin = async (input) => {
   // Race guard: handleIdle reads state then awaits HTTP; during the
   // await /loop-stop can clearState. Without re-reading, writeStateTo
   // would resurrect the stopped loop from the stale local. Also
-  // catches the operator stopping + starting in a different session
-  // in the same workspace.
-  function stateStillOurs(originalSessionID: string): boolean {
+  // catches the operator stopping + starting in the same session: runID
+  // changes on every loop-start.
+  function stateStillOurs(original: LoopState): boolean {
     const current = readState(directory)
-    return current !== null && current.sessionID === originalSessionID
+    return current !== null && current.sessionID === original.sessionID && current.runID === original.runID
   }
 
   async function handleIdle(sessionID: string): Promise<void> {
@@ -246,7 +293,13 @@ const LoopPlugin: Plugin = async (input) => {
     if (!state) return
     if (state.sessionID !== sessionID) return
 
-    if (await isSubagentSession(client, sessionID)) return
+    const kind = await sessionKind(client, sessionID)
+    if (kind === "missing") {
+      console.warn(`loop: session ${sessionID} no longer exists, clearing loop state`)
+      tryClearState(directory)
+      return
+    }
+    if (kind !== "root") return
 
     let text: string | null
     try {
@@ -293,7 +346,7 @@ const LoopPlugin: Plugin = async (input) => {
     // stays advanced. Operator sees iter=K with K-1 actual model
     // turns. Better than the alternative (silent iteration stall).
     const next = state.iteration + 1
-    if (!stateStillOurs(sessionID)) {
+    if (!stateStillOurs(state)) {
       console.info(`loop: state cleared during handler, skipping pre-inject bump`)
       return
     }
@@ -317,6 +370,26 @@ const LoopPlugin: Plugin = async (input) => {
     }
   }
 
+  async function processIdle(sessionID: string): Promise<void> {
+    // Single-flight + at-most-one re-run. See inFlight comment above.
+    const existing = inFlight.get(sessionID)
+    if (existing !== undefined) {
+      existing.pending = true
+      return
+    }
+    const tracker = { pending: false }
+    inFlight.set(sessionID, tracker)
+    try {
+      await handleIdle(sessionID)
+      if (tracker.pending) {
+        tracker.pending = false
+        await handleIdle(sessionID)
+      }
+    } finally {
+      inFlight.delete(sessionID)
+    }
+  }
+
   function onFailure(state: LoopState, err: unknown, op: string): void {
     const failures = state.consecutiveFailures + 1
     const msg = err instanceof Error ? err.message : String(err)
@@ -328,12 +401,42 @@ const LoopPlugin: Plugin = async (input) => {
       return
     }
     console.warn(`loop: ${op} failed (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${msg}`)
-    if (!stateStillOurs(state.sessionID)) {
+    if (!stateStillOurs(state)) {
       console.info(`loop: state cleared during handler, skipping failure write-back`)
       return
     }
     writeStateTo(directory, { ...state, consecutiveFailures: failures })
   }
+
+  async function processCurrentStatus(): Promise<void> {
+    const state = readState(directory)
+    if (!state) return
+    try {
+      const session = client.session as unknown as {
+        status?: (args: { query: { directory: string }; throwOnError: true }) => Promise<{ data?: Record<string, unknown> }>
+      }
+      if (typeof session.status !== "function") {
+        console.warn("loop: client.session.status unavailable; waiting for next session.status event")
+        return
+      }
+      const resp = await session.status({ query: { directory }, throwOnError: true })
+      const status = resp.data?.[state.sessionID]
+      if (status === undefined) {
+        await processIdle(state.sessionID)
+        return
+      }
+      if (!isRecord(status)) {
+        console.warn(`loop: session.status for ${state.sessionID} was malformed; waiting for next event`)
+        return
+      }
+      if (status.type === "idle") await processIdle(state.sessionID)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`loop: session.status init check failed: ${msg}`)
+    }
+  }
+
+  void processCurrentStatus()
 
   return {
     tool: {
@@ -343,15 +446,20 @@ const LoopPlugin: Plugin = async (input) => {
         args: {
           task: tool.schema
             .string()
+            .min(1)
             .describe("The task to keep working on until the sentinel appears."),
           sentinel: tool.schema
             .string()
+            .min(1)
             .default(DEFAULT_SENTINEL)
             .describe(
               "String (case-sensitive) the assistant must emit as the LAST line of its response (trimmed, exact equality) to terminate the loop. Mid-response mentions do NOT terminate.",
             ),
           maxIterations: tool.schema
             .number()
+            .int()
+            .min(MIN_MAX_ITERATIONS)
+            .max(MAX_MAX_ITERATIONS)
             .default(DEFAULT_MAX_ITERATIONS)
             .describe(
               `Safety cap; loop stops after this many continuations (must be integer in [${MIN_MAX_ITERATIONS}, ${MAX_MAX_ITERATIONS}]).`,
@@ -364,8 +472,8 @@ const LoopPlugin: Plugin = async (input) => {
           if (task.trim().length === 0) {
             return "loop-start: refusing empty task. Provide a non-empty task string."
           }
-          if (sentinel.length === 0) {
-            return "loop-start: refusing empty sentinel. Provide a non-empty completion string."
+          if (!validSentinel(sentinel)) {
+            return "loop-start: refusing invalid sentinel. Provide a non-empty single-line completion string with no leading or trailing whitespace."
           }
           if (
             !Number.isInteger(maxIterations) ||
@@ -387,11 +495,21 @@ const LoopPlugin: Plugin = async (input) => {
               `Run /loop-stop${sameSession ? "" : " in that session"} first, then re-run /loop-start.`
             )
           }
+          const kind = await sessionKind(client, ctx.sessionID)
+          if (kind !== "root") {
+            if (kind === "subagent") {
+              return `loop-start: refused -- session ${ctx.sessionID} is a child/subagent session. Start the loop from the parent operator session.`
+            }
+            if (kind === "missing") {
+              return `loop-start: refused -- session ${ctx.sessionID} does not exist.`
+            }
+            return `loop-start: refused -- could not verify session ${ctx.sessionID} is a root operator session.`
+          }
           // ctx.sessionID is the invoking session (per ToolContext);
-          // persisted so session.idle matches exactly.
+          // persisted so session.status idle matches exactly.
           const state: LoopState = {
             schemaVersion: STATE_SCHEMA_VERSION,
-            active: true,
+            runID: randomUUID(),
             iteration: 0,
             maxIterations,
             sentinel,
@@ -450,32 +568,17 @@ const LoopPlugin: Plugin = async (input) => {
         }
         return
       }
-      if (evt.type !== "session.idle") return
+      if (evt.type === "session.idle") return
+      if (evt.type !== "session.status") return
 
       const props = evt.properties
-      const sessionID =
-        props && typeof props === "object" && "sessionID" in props && typeof props.sessionID === "string"
-          ? props.sessionID
-          : undefined
+      if (!isRecord(props)) return
+      const status = isRecord(props.status) ? props.status : undefined
+      if (status?.type !== "idle") return
+      const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
       if (!sessionID) return
 
-      // Single-flight + at-most-one re-run. See inFlight comment above.
-      const existing = inFlight.get(sessionID)
-      if (existing !== undefined) {
-        existing.pending = true
-        return
-      }
-      const tracker = { pending: false }
-      inFlight.set(sessionID, tracker)
-      try {
-        await handleIdle(sessionID)
-        if (tracker.pending) {
-          tracker.pending = false
-          await handleIdle(sessionID)
-        }
-      } finally {
-        inFlight.delete(sessionID)
-      }
+      await processIdle(sessionID)
     },
   }
 }

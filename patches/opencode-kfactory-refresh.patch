@@ -1,63 +1,63 @@
 kfactory subprocess-delegated token refresh (deployment glue).
 
-Layered on top of the upstreamable bearer/workspace/routing patch.
+Layered on top of the static Bearer and workspace-routing patches.
 NOT upstreamable: this contains kfactory-specific paths, exit-code
 conventions, and a shared file-cache schema between Go (kfactory) and
 TypeScript (opencode TUI). See docs/spec.md in the kfactory repo for
 the wider design.
 
 What this adds:
-  - `OPENCODE_SERVER_BEARER_CACHE_PATH` env (core/flag/flag.ts) +
-    `bearerFromCache()` in server/auth.ts. When set, server-side
-    `ServerAuth.header()` reads the access token from the cache file
-    if neither `credentials.bearer` nor `OPENCODE_SERVER_BEARER` is
+  - OPENCODE_SERVER_BEARER_CACHE_PATH env (core/flag/flag.ts) +
+    bearerFromCache() in server/auth.ts. When set, server-side
+    ServerAuth.header() reads the access token from the cache file
+    if neither credentials.bearer nor OPENCODE_SERVER_BEARER is
     supplied -- matters because kfactory rotates the token between
-    the launcher's exec and the SDK's first request.
-  - `createBearerRefreshFetch` in cli/cmd/tui/attach.ts: a custom fetch
+    the launcher exec and the SDK first request.
+  - createBearerRefreshFetch in cli/cmd/tui/attach.ts: a custom fetch
     that reads the cache file on every request and spawns
-    `kfactory auth refresh` (subprocess) when the access token is
+    kfactory auth refresh (subprocess) when the access token is
     near expiry. kfactory owns the lockfile + IdP HTTP + atomic
     rename; the TUI just reads the resulting file.
   - Exit-code contract with the Go side: 0 = ok, 1 = not_logged_in,
     2 = other error. See KFACTORY_EXIT_* consts inline + the
-    authoritative definitions in kfactory's cmd/kfactory/exit.go.
+    authoritative definitions in kfactory cmd/kfactory/exit.go.
   - Schema-versioned auth.json read: TUI asserts schema_version on
     every refresh.
-  - `onBearerRefreshHint` channel + a toast subscription in app.tsx
-    that surfaces a one-time hint to the operator (`not_logged_in` /
-    `spawn_error` / `other_error`).
+  - onBearerRefreshHint channel + a toast subscription in app.tsx
+    that surfaces a one-time hint to the operator (not_logged_in /
+    spawn_error / other_error).
 
-kfactory must be on the operator's PATH for the subprocess refresh to
+kfactory must be on the operator PATH for the subprocess refresh to
 work. Same-machine, same-UID, same-auth.json.
 
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
-index 00b95fa..7738ea1 100644
+index a730775..e5304cd 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
-@@ -28,6 +28,7 @@ export const Flag = {
+@@ -32,6 +32,7 @@ export const Flag = {
    OPENCODE_SERVER_PASSWORD: process.env["OPENCODE_SERVER_PASSWORD"],
    OPENCODE_SERVER_USERNAME: process.env["OPENCODE_SERVER_USERNAME"],
    OPENCODE_SERVER_BEARER: process.env["OPENCODE_SERVER_BEARER"],
 +  OPENCODE_SERVER_BEARER_CACHE_PATH: process.env["OPENCODE_SERVER_BEARER_CACHE_PATH"],
- 
+
    // Experimental
    OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
 diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index 5dd6579..bdc49d0 100644
+index aa861db..db1a35e 100644
 --- a/packages/opencode/src/cli/cmd/tui/app.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/app.tsx
 @@ -20,6 +20,7 @@ import {
  } from "solid-js"
- import { win32DisableProcessedInput, win32InstallCtrlCGuard } from "./win32"
+ import { win32DisableProcessedInput, win32FlushInputBuffer, win32InstallCtrlCGuard } from "./win32"
  import { Flag } from "@opencode-ai/core/flag/flag"
 +import { onBearerRefreshHint } from "./attach"
  import semver from "semver"
  import { DialogProvider, useDialog } from "@tui/ui/dialog"
  import { DialogProvider as DialogProviderList } from "@tui/component/dialog-provider"
-@@ -399,6 +400,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+@@ -497,6 +498,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
      })
    })
- 
+
 +  onMount(() => {
 +    return onBearerRefreshHint(({ kind, detail }) => {
 +      const message =
@@ -78,10 +78,10 @@ index 5dd6579..bdc49d0 100644
    createEffect(() => {
      // When using -c, session list is loaded in blocking phase, so we can navigate at "partial"
 diff --git a/packages/opencode/src/cli/cmd/tui/attach.ts b/packages/opencode/src/cli/cmd/tui/attach.ts
-index 6f64955..94c4c74 100644
+index 0889944..7b12294 100644
 --- a/packages/opencode/src/cli/cmd/tui/attach.ts
 +++ b/packages/opencode/src/cli/cmd/tui/attach.ts
-@@ -5,6 +5,197 @@ import { TuiConfig } from "@/cli/cmd/tui/config/tui"
+@@ -5,6 +5,199 @@ import { TuiConfig } from "@/cli/cmd/tui/config/tui"
  import { errorMessage } from "@/util/error"
  import { validateSession } from "./validate-session"
  import { ServerAuth } from "@/server/auth"
@@ -127,7 +127,7 @@ index 6f64955..94c4c74 100644
 +// than a silent field-misread. See docs/spec.md §4 for the contract.
 +const AUTH_FILE_SCHEMA_VERSION = 1
 +interface AuthFile {
-+  schema_version?: number
++  schema_version: number
 +  access_token: string
 +  expires_at: string // RFC3339
 +}
@@ -137,12 +137,17 @@ index 6f64955..94c4c74 100644
 +
 +function readAuthFile(p: string): AuthFile {
 +  const parsed = JSON.parse(readFileSync(p, "utf8")) as AuthFile
-+  const v = parsed.schema_version ?? AUTH_FILE_SCHEMA_VERSION
-+  if (v !== AUTH_FILE_SCHEMA_VERSION) {
++  if (parsed.schema_version !== AUTH_FILE_SCHEMA_VERSION) {
 +    throw new Error(
-+      `auth.json schema_version ${v} != supported ${AUTH_FILE_SCHEMA_VERSION}; ` +
++      `auth.json schema_version ${String(parsed.schema_version)} != supported ${AUTH_FILE_SCHEMA_VERSION}; ` +
 +        `update kfactory or opencode together`,
 +    )
++  }
++  if (typeof parsed.access_token !== "string" || parsed.access_token === "") {
++    throw new Error("auth.json access_token is missing")
++  }
++  if (!Number.isFinite(new Date(parsed.expires_at).getTime())) {
++    throw new Error("auth.json expires_at is invalid")
 +  }
 +  return parsed
 +}
@@ -230,21 +235,18 @@ index 6f64955..94c4c74 100644
 +    refreshing = (async () => {
 +      try {
 +        const outcome = await spawnKfactoryRefresh()
-+        if (outcome.status !== "ok" && !logged[outcome.status]) {
-+          logged[outcome.status] = true
-+          const detail = stripVTControlCharacters(outcome.stderr)
-+          for (const cb of refreshHintSubscribers) {
-+            cb({ kind: outcome.status, detail })
++        if (outcome.status !== "ok") {
++          if (!logged[outcome.status]) {
++            logged[outcome.status] = true
++            const detail = stripVTControlCharacters(outcome.stderr)
++            for (const cb of refreshHintSubscribers) {
++              cb({ kind: outcome.status, detail })
++            }
 +          }
++          throw new Error(`kfactory auth refresh failed: ${outcome.status}`)
 +        }
-+        // Re-read regardless of outcome: ok = fresh tokens, anything
-+        // else = stale tokens, and the SDK's 401 path is the right
-+        // signal for the operator to reattach.
 +        const refreshed = readAuthFile(cachePath)
 +        currentBearer = refreshed.access_token
-+      } catch {
-+        // Filesystem error reading auth.json -- leave currentBearer
-+        // alone. Next request will retry.
 +      } finally {
 +        refreshing = null
 +      }
@@ -276,7 +278,7 @@ index 6f64955..94c4c74 100644
 +    return fetch(input, { ...init, headers: merged })
 +  }) as unknown as typeof fetch
 +}
- 
+
  export const AttachCommand = cmd({
    command: "attach <url>",
 @@ -80,6 +271,14 @@ export const AttachCommand = cmd({
@@ -292,9 +294,9 @@ index 6f64955..94c4c74 100644
 +        refreshFetch = createBearerRefreshFetch(Flag.OPENCODE_SERVER_BEARER_CACHE_PATH)
 +      }
        const config = await TuiConfig.get()
-       const { tui } = await import("./app")
- 
-@@ -90,6 +289,7 @@ export const AttachCommand = cmd({
+
+       try {
+@@ -89,6 +288,7 @@ export const AttachCommand = cmd({
            directory,
            workspace: args.workspace,
            headers,
@@ -302,14 +304,14 @@ index 6f64955..94c4c74 100644
          })
        } catch (error) {
          UI.error(errorMessage(error))
-@@ -108,6 +308,7 @@ export const AttachCommand = cmd({
+@@ -110,6 +310,7 @@ export const AttachCommand = cmd({
          directory,
          workspace: args.workspace,
          headers,
 +        fetch: refreshFetch,
        })
+       await handle.done
      } finally {
-       unguard?.()
 diff --git a/packages/opencode/src/server/auth.ts b/packages/opencode/src/server/auth.ts
 index 5e979d9..e096510 100644
 --- a/packages/opencode/src/server/auth.ts
@@ -319,13 +321,13 @@ index 5e979d9..e096510 100644
  import { Flag } from "@opencode-ai/core/flag/flag"
  import { Config as EffectConfig, Context, Option, Redacted } from "effect"
 +import { readFileSync } from "fs"
- 
+
  export type Credentials = {
    password?: string
-@@ -10,6 +11,36 @@ export type Credentials = {
+@@ -10,6 +11,45 @@ export type Credentials = {
    bearer?: string
  }
- 
+
 +// kfactory: read the access token from the shared launcher cache when
 +// no explicit bearer / env var is provided. Single source of truth is
 +// `~/.config/kfactory/auth.json` (path passed via
@@ -338,12 +340,21 @@ index 5e979d9..e096510 100644
 +// again) BOTH surface. Server-lifetime "warn once and never again" was
 +// the original shape and made transient cache breaks invisible to
 +// operators (a TUI restart was the only signal).
++const KFACTORY_AUTH_FILE_SCHEMA_VERSION = 1
 +const bearerFromCacheWarnedMessages = new Set<string>()
 +function bearerFromCache(): string | undefined {
 +  const p = Flag.OPENCODE_SERVER_BEARER_CACHE_PATH
 +  if (!p) return undefined
 +  try {
-+    const json = JSON.parse(readFileSync(p, "utf8")) as { access_token?: string }
++    const json = JSON.parse(readFileSync(p, "utf8")) as { schema_version?: number; access_token?: string }
++    if (json.schema_version !== KFACTORY_AUTH_FILE_SCHEMA_VERSION) {
++      throw new Error(
++        `auth.json schema_version ${String(json.schema_version)} != supported ${KFACTORY_AUTH_FILE_SCHEMA_VERSION}`,
++      )
++    }
++    if (typeof json.access_token !== "string" || json.access_token === "") {
++      throw new Error("auth.json access_token is missing")
++    }
 +    bearerFromCacheWarnedMessages.clear()
 +    return json.access_token
 +  } catch (err) {
@@ -352,7 +363,7 @@ index 5e979d9..e096510 100644
 +      bearerFromCacheWarnedMessages.add(key)
 +      console.warn(`bearerFromCache: parse failed at ${p}: ${err}`)
 +    }
-+    return undefined
++    throw err
 +  }
 +}
 +
@@ -361,10 +372,10 @@ index 5e979d9..e096510 100644
    readonly password: Redacted.Redacted
 @@ -35,7 +66,7 @@ export function authorized(credentials: DecodedCredentials, config: Info) {
  }
- 
+
  export function header(credentials?: Credentials) {
 -  const bearer = credentials?.bearer ?? Flag.OPENCODE_SERVER_BEARER
 +  const bearer = credentials?.bearer ?? Flag.OPENCODE_SERVER_BEARER ?? bearerFromCache()
    if (bearer) return `Bearer ${bearer}`
- 
+
    const password = credentials?.password ?? Flag.OPENCODE_SERVER_PASSWORD

@@ -1,0 +1,100 @@
+name: ci
+
+# Token-free quality gates run on every PR and push. The secret-bearing Attic
+# cache warmer is a separate default-branch job behind the `cache` environment.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v13
+        with:
+          use-flakehub: disabled
+
+      - name: GitHub Actions lint (actionlint)
+        run: nix develop -c actionlint
+
+      - name: GitHub Actions security audit (zizmor)
+        run: nix develop -c zizmor .github/workflows
+
+      - name: Nix format (alejandra)
+        run: nix develop -c alejandra -c .
+
+      - name: Nix lint (deadnix)
+        run: nix develop -c deadnix .
+
+      - name: Go format (gofmt)
+        run: |
+          unformatted=$(nix develop -c gofmt -l cmd/)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            nix develop -c gofmt -d cmd/
+            exit 1
+          fi
+
+      - name: Go lint (golangci-lint)
+        run: nix develop -c golangci-lint run --timeout 5m ./...
+
+      - name: Go test
+        run: nix develop -c go test ./...
+
+      # `dir .` scans the merge state on PRs (= what ships if merged);
+      # allowlist (regression-tests fake bearer tokens) in .betterleaks.toml.
+      - name: Secrets scan (betterleaks)
+        run: nix develop -c betterleaks dir . --no-banner --redact
+
+      - name: Flake check (builds all packages + checks)
+        run: nix flake check --print-build-logs
+
+  cache:
+    name: attic cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: quality
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: cache
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Setup Attic cache
+        uses: ryanccn/attic-action@5635a15ef0c5462194ffbd05d1daeddc74625c3a # v0.5.0
+        with:
+          endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          cache: general
+          token: ${{ secrets.ATTIC_GENERAL_PUSH_TOKEN }}
+
+      - name: Build cache roots
+        run: |
+          nix build --no-link --print-build-logs \
+            .#kfactory \
+            .#oauth2-proxy-kfactory \
+            .#checks.x86_64-linux.factory-opencode-kfactory \
+            .#checks.x86_64-linux.opencode-pty \
+            .#checks.x86_64-linux.factory-e2e-opencode-image \
+            .#checks.x86_64-linux.factory-e2e-kfactory-client-image

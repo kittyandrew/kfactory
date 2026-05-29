@@ -1,0 +1,81 @@
+[
+  {
+    "name": "valid-spawn-remains-pending",
+    "spawnOutput": "<pty_spawned>\nID: pty_1234abcd\nNotifyOnExit: true\n</pty_spawned>\n",
+    "exits": [],
+    "pending": ["pty_1234abcd"]
+  },
+  {
+    "name": "matching-user-exit-clears",
+    "spawnOutput": "<pty_spawned>\nID: pty_1234abcd\nNotifyOnExit: true\n</pty_spawned>\n",
+    "exits": [
+      {
+        "role": "user",
+        "order": "after",
+        "text": "<pty_exited>\nID: pty_1234abcd\nExit Code: 0\n</pty_exited>"
+      }
+    ],
+    "pending": []
+  },
+  {
+    "name": "inline-user-prose-does-not-clear",
+    "spawnOutput": "<pty_spawned>\nID: pty_1234abcd\nNotifyOnExit: true\n</pty_spawned>\n",
+    "exits": [
+      {
+        "role": "user",
+        "order": "after",
+        "text": "The operator mentioned <pty_exited> ID: pty_1234abcd </pty_exited> inline; this is prose, not a lifecycle block."
+      }
+    ],
+    "pending": ["pty_1234abcd"]
+  },
+  {
+    "name": "wrong-user-exit-does-not-clear",
+    "spawnOutput": "<pty_spawned>\nID: pty_1234abcd\nNotifyOnExit: true\n</pty_spawned>\n",
+    "exits": [
+      {
+        "role": "user",
+        "order": "after",
+        "text": "<pty_exited>\nID: pty_deadbeef\nExit Code: 0\n</pty_exited>"
+      }
+    ],
+    "pending": ["pty_1234abcd"]
+  },
+  {
+    "name": "earlier-user-exit-does-not-clear",
+    "spawnOutput": "<pty_spawned>\nID: pty_1234abcd\nNotifyOnExit: true\n</pty_spawned>\n",
+    "exits": [
+      {
+        "role": "user",
+        "order": "before",
+        "text": "<pty_exited>\nID: pty_1234abcd\nExit Code: 0\n</pty_exited>"
+      }
+    ],
+    "pending": ["pty_1234abcd"]
+  },
+  {
+    "name": "assistant-exit-block-does-not-clear",
+    "spawnOutput": "<pty_spawned>\nID: pty_1234abcd\nNotifyOnExit: true\n</pty_spawned>\n",
+    "exits": [
+      {
+        "role": "assistant",
+        "order": "after",
+        "text": "<pty_exited>\nID: pty_1234abcd\nExit Code: 0\n</pty_exited>"
+      }
+    ],
+    "pending": ["pty_1234abcd"]
+  },
+  {
+    "name": "invalid-spawn-id-is-ignored",
+    "spawnOutput": "<pty_spawned>\nID: pty_nothexzz\nNotifyOnExit: true\n</pty_spawned>\n",
+    "exits": [],
+    "pending": []
+  },
+  {
+    "name": "notify-false-is-ignored",
+    "notifyOnExit": false,
+    "spawnOutput": "<pty_spawned>\nID: pty_1234abcd\nNotifyOnExit: false\n</pty_spawned>\n",
+    "exits": [],
+    "pending": []
+  }
+]

@@ -5,10 +5,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func runDispatch(args []string) {
@@ -16,9 +19,9 @@ func runDispatch(args []string) {
 		fail("dispatch: usage: kfactory dispatch <repo-url> <prompt...>")
 	}
 	repoURL := args[0]
-	prompt := strings.TrimSpace(strings.Join(args[1:], " "))
-	if prompt == "" {
-		fail("dispatch: prompt is required (got empty after trim)")
+	prompt, err := resolveDispatchPrompt(args[1:])
+	if err != nil {
+		fail("dispatch: %v", err)
 	}
 
 	// 3min budget mostly for the clone step (~5-10s for a fresh repo).
@@ -58,4 +61,63 @@ func runDispatch(args []string) {
 
 	fmt.Fprintf(os.Stderr, "kfactory: dispatched. attach with: kfactory attach %s\n", ws.ID)
 	fmt.Println(ws.ID) // stdout = workspace id (pipeable)
+}
+
+func resolveDispatchPrompt(args []string) (string, error) {
+	if len(args) == 1 && isDispatchPromptPath(args[0]) {
+		path, err := expandPromptPath(args[0])
+		if err != nil {
+			return "", err
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		info, err := os.Stat(abs)
+		switch {
+		case err == nil && info.IsDir():
+			return "", fmt.Errorf("prompt path is a directory: %s", abs)
+		case err == nil:
+			body, err := os.ReadFile(abs)
+			if err != nil {
+				return "", fmt.Errorf("read prompt file %s: %w", abs, err)
+			}
+			prompt := strings.TrimSpace(string(body))
+			if prompt == "" {
+				return "", fmt.Errorf("prompt is required (file %s is empty after trim)", abs)
+			}
+			return prompt, nil
+		case errors.Is(err, os.ErrNotExist):
+			return "", fmt.Errorf("no such file: %s. was that supposed to be a prompt?", abs)
+		default:
+			return "", fmt.Errorf("stat prompt file %s: %w", abs, err)
+		}
+	}
+
+	prompt := strings.TrimSpace(strings.Join(args, " "))
+	if prompt == "" {
+		return "", fmt.Errorf("prompt is required (got empty after trim)")
+	}
+	return prompt, nil
+}
+
+func isDispatchPromptPath(arg string) bool {
+	if strings.ContainsFunc(arg, unicode.IsSpace) {
+		return false
+	}
+	return strings.HasPrefix(arg, "./") ||
+		strings.HasPrefix(arg, "../") ||
+		strings.HasPrefix(arg, "/") ||
+		strings.HasPrefix(arg, "~/")
+}
+
+func expandPromptPath(path string) (string, error) {
+	if !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand %s: %w", path, err)
+	}
+	return filepath.Join(home, path[2:]), nil
 }

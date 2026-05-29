@@ -1,6 +1,4 @@
-// HTTP client for the factory's /experimental/workspace + /session APIs.
-// All methods carry a bearer token from the persisted token file (auto-
-// refreshing 30s before expiry via ensureFresh).
+// HTTP helpers for kfactory's opencode-facing workspace/session APIs.
 package main
 
 import (
@@ -11,34 +9,32 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Base URL from persisted auth.json, falling back to baked default.
 func serverFor(t *tokenFile) string {
 	if t != nil && t.Server != "" {
 		return strings.TrimRight(t.Server, "/")
 	}
-	return defaultServer
+	return os.Getenv("KFACTORY_SERVER")
 }
 
-// `Branch` + `Dirty` enriched server-side per
-// opencode-workspace-branch patch: fresh `.git/HEAD` read for Branch
-// (empty = no .git, broken clone) and `git status --porcelain` for
-// Dirty (nil = couldn't determine, treat as dirty per fail-closed
-// convention; *true / *false otherwise).
 type Workspace struct {
 	ID        string `json:"id"`
 	Type      string `json:"type"`
 	Name      string `json:"name"`
 	Branch    string `json:"branch"`
 	Directory string `json:"directory"`
-	Dirty     *bool  `json:"dirty,omitempty"`
 	ProjectID string `json:"projectID"`
 	TimeUsed  int64  `json:"timeUsed"`
+}
+
+type vcsInfo struct {
+	Branch string `json:"branch"`
 }
 
 // Builds an HTTP request with optional bearer (nil/empty AccessToken
@@ -103,24 +99,84 @@ func listWorkspaces(ctx context.Context, t *tokenFile, server string) ([]Workspa
 	return ws, nil
 }
 
-// `type: "kfactory"` selects the kfactory-adapter (plugins/kfactory-
-// adapter registers under that key). Empty slugSuffix = random 4hex
-// (kfactory dispatch); non-empty pins for `kfactory tick` scheduled
-// workspaces.
-func createWorkspace(ctx context.Context, t *tokenFile, server, repoURL string) (*Workspace, error) {
-	return createWorkspaceWithSuffix(ctx, t, server, repoURL, "")
+func workspaceBranch(ctx context.Context, t *tokenFile, server, workspaceID string) (string, error) {
+	path := "/vcs?workspace=" + url.QueryEscape(workspaceID)
+	req, err := newRequest(ctx, t, server, http.MethodGet, path, nil)
+	if err != nil {
+		return "", err
+	}
+	var info vcsInfo
+	if err := doJSON(req, &info); err != nil {
+		return "", err
+	}
+	return info.Branch, nil
 }
 
-func createWorkspaceWithSuffix(ctx context.Context, t *tokenFile, server, repoURL, slugSuffix string) (*Workspace, error) {
-	extra := map[string]any{
-		"repoUrl": repoURL,
+func enrichWorkspaceBranches(ctx context.Context, t *tokenFile, server string, ws []Workspace) {
+	for i := range ws {
+		branch, err := workspaceBranch(ctx, t, server, ws[i].ID)
+		if err == nil && branch != "" {
+			ws[i].Branch = branch
+		}
 	}
-	if slugSuffix != "" {
-		extra["slugSuffix"] = slugSuffix
+}
+
+func workspaceDirty(ctx context.Context, t *tokenFile, server, workspaceID string) (bool, error) {
+	path := "/vcs/status?workspace=" + url.QueryEscape(workspaceID)
+	req, err := newRequest(ctx, t, server, http.MethodGet, path, nil)
+	if err != nil {
+		return false, err
 	}
-	payload := map[string]any{
-		"type":  "kfactory",
-		"extra": extra,
+	var status []json.RawMessage
+	if err := doJSON(req, &status); err != nil {
+		return false, err
+	}
+	return len(status) > 0, nil
+}
+
+// `type: "kfactory"` selects the kfactory-adapter (plugins/kfactory-
+// adapter registers under that key).
+func createWorkspace(ctx context.Context, t *tokenFile, server, repoURL string) (*Workspace, error) {
+	return createWorkspaceWithStableID(ctx, t, server, repoURL, "")
+}
+
+func scheduledWorkspaceID(taskID string) string {
+	return "wrk_kfactory_" + taskID
+}
+
+type createWorkspaceExtra struct {
+	RepoURL    string `json:"repoUrl"`
+	SlugSuffix string `json:"slugSuffix,omitempty"`
+}
+
+type createWorkspaceRequest struct {
+	ID    string               `json:"id,omitempty"`
+	Type  string               `json:"type"`
+	Extra createWorkspaceExtra `json:"extra"`
+}
+
+func newCreateWorkspaceRequest(repoURL, taskID string) (createWorkspaceRequest, error) {
+	payload := createWorkspaceRequest{
+		Type: "kfactory",
+		Extra: createWorkspaceExtra{
+			RepoURL: repoURL,
+		},
+	}
+	if taskID == "" {
+		return payload, nil
+	}
+	if !taskIDPattern.MatchString(taskID) {
+		return createWorkspaceRequest{}, fmt.Errorf("invalid scheduled task id %q", taskID)
+	}
+	payload.ID = scheduledWorkspaceID(taskID)
+	payload.Extra.SlugSuffix = taskID
+	return payload, nil
+}
+
+func createWorkspaceWithStableID(ctx context.Context, t *tokenFile, server, repoURL, taskID string) (*Workspace, error) {
+	payload, err := newCreateWorkspaceRequest(repoURL, taskID)
+	if err != nil {
+		return nil, err
 	}
 	req, err := newRequest(ctx, t, server, http.MethodPost, "/experimental/workspace", payload)
 	if err != nil {
@@ -171,6 +227,16 @@ type SessionInfo struct {
 	} `json:"time"`
 }
 
+type SessionMessage struct {
+	Info struct {
+		Role string `json:"role"`
+	} `json:"info"`
+	Parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"parts"`
+}
+
 // Most-recent ROOT session (parentID == ""); subagent sessions excluded
 // since we never want to inject the continuation prompt into a child
 // agent's context. Matches opencode's `--continue` semantics.
@@ -194,6 +260,29 @@ func findMostRecentSession(ctx context.Context, t *tokenFile, server, workspaceI
 		}
 	}
 	return best, nil
+}
+
+func listSessionMessages(ctx context.Context, t *tokenFile, server, workspaceID, sessionID string) ([]SessionMessage, error) {
+	path := "/session/" + url.PathEscape(sessionID) + "/message?workspace=" + url.QueryEscape(workspaceID)
+	req, err := newRequest(ctx, t, server, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var messages []SessionMessage
+	if err := doJSON(req, &messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func sessionMessageText(msg SessionMessage) string {
+	var parts []string
+	for _, part := range msg.Parts {
+		if part.Type == "text" {
+			parts = append(parts, part.Text)
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 // Returns immediately; server starts the model loop in the background.
@@ -221,18 +310,9 @@ func resolveWorkspace(ctx context.Context, t *tokenFile, server, ref string) (*W
 	return findWorkspace(ws, ref)
 }
 
-// Resolution order, most-specific first:
-//   - exact ID (`wrk_e3d1...`)
-//   - exact slug (`acme--widget--1144`)
-//   - 1-based index (same order as `kfactory list`)
-//   - unique slug prefix (`acme`, `acme--widget`)
-//   - unique ID prefix (with or without `wrk_`)
-//
-// Ambiguous prefix = error listing candidates.
-//
-// @NOTE: digit-prefixed slugs are unreachable by prefix when the
-// prefix parses as a valid index (e.g. slug starting with "12"
-// shadowed by index 12 if it exists). Use full slug or id.
+// Resolution order: exact ID, exact slug, 1-2 digit list index, unique slug
+// prefix, unique ID prefix, then 3+ digit index fallback. Ambiguous prefixes
+// report candidates.
 func findWorkspace(ws []Workspace, ref string) (*Workspace, error) {
 	// Exact id.
 	for i := range ws {
@@ -246,12 +326,35 @@ func findWorkspace(ws []Workspace, ref string) (*Workspace, error) {
 			return &ws[i], nil
 		}
 	}
-	if n, err := strconv.Atoi(ref); err == nil {
-		if n >= 1 && n <= len(ws) {
-			return &ws[n-1], nil
+	// Keep the ergonomic common case: `kfactory attach 1` means the
+	// printed list index, not every workspace whose ID happens to start
+	// with "1". Longer numeric refs are plausible copied ID prefixes,
+	// so let prefix resolution run before falling back to index parsing.
+	shortNumericIndex := len(ref) < 3
+	if shortNumericIndex {
+		if n, err := strconv.Atoi(ref); err == nil {
+			if n >= 1 && n <= len(ws) {
+				return &ws[n-1], nil
+			}
+			return nil, fmt.Errorf("index %d out of range (have %d workspace%s)", n, len(ws), plural(len(ws)))
 		}
-		return nil, fmt.Errorf("index %d out of range (have %d workspace%s)", n, len(ws), plural(len(ws)))
 	}
+	resolved, err := findWorkspacePrefix(ws, ref)
+	if resolved != nil || err != nil {
+		return resolved, err
+	}
+	if !shortNumericIndex {
+		if n, err := strconv.Atoi(ref); err == nil {
+			if n >= 1 && n <= len(ws) {
+				return &ws[n-1], nil
+			}
+			return nil, fmt.Errorf("index %d out of range (have %d workspace%s)", n, len(ws), plural(len(ws)))
+		}
+	}
+	return nil, fmt.Errorf("no workspace matches %q (try `kfactory list`)", ref)
+}
+
+func findWorkspacePrefix(ws []Workspace, ref string) (*Workspace, error) {
 	// Slug prefix first, then id prefix.
 	var hits []*Workspace
 	for i := range ws {
@@ -269,7 +372,7 @@ func findWorkspace(ws []Workspace, ref string) (*Workspace, error) {
 	}
 	switch len(hits) {
 	case 0:
-		return nil, fmt.Errorf("no workspace matches %q (try `kfactory list`)", ref)
+		return nil, nil
 	case 1:
 		return hits[0], nil
 	default:

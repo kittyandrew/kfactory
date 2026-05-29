@@ -1,14 +1,6 @@
-# NixOS module: kfactory scheduled tasks.
-#
-# Generates one systemd timer + service pair per declared task.
-# Schedule entries write their config to /etc/kfactory/scheduled/<id>.json
-# (consumed by `kfactory tick <id>` at fire time -- schema defined in
-# cmd/kfactory/tick.go's scheduledTaskConfig struct).
-#
-# This is the only NixOS module kfactory ships. Its existence is the
-# exception to the "no NixOS module" stance: per-task systemd unit
-# generation is intrinsically NixOS-shaped and the operator-facing
-# attribute schema is the natural fit. See docs/spec.md decisions log.
+# Generates per-task systemd timers whose JSON config is consumed by
+# `kfactory tick`. Schema authority: cmd/kfactory/tick.go; rationale:
+# docs/spec.md scheduled-task decisions.
 {
   config,
   lib,
@@ -27,15 +19,13 @@
       continuation_prompt = task.continuationPrompt;
     };
 
-  # Validate task-id matches the 4-hex slug-suffix shape enforced by
-  # both the kfactory-adapter (SLUG_RE) and the CLI (taskIDPattern in
-  # tick.go). The same shape is what random ad-hoc dispatches mint, so
-  # scheduled-task workspaces are indistinguishable from random ones
-  # at the slug level -- one structural invariant everywhere. Caught
-  # at eval time so the error blames the operator's NixOS config, not
-  # a runtime tick failure.
+  # Same 4-hex slug-suffix invariant as kfactory-adapter and tick.go;
+  # validate at eval time so bad task IDs blame the NixOS config.
   validTaskID = id:
     builtins.match "[a-f0-9]{4}" id != null;
+
+  nonBlank = value:
+    builtins.match ".*[^ \t\n\r].*" value != null;
 
   taskOpts = {
     options = {
@@ -56,11 +46,8 @@
         type = lib.types.enum ["skip-if-exists" "skip-if-dirty" "continue"];
         default = "skip-if-dirty";
         description = ''
-          All three modes CREATE the workspace + fire initialPrompt
-          when no workspace with this task-id exists. The mode only
-          decides what happens when one already does -- in every
-          dispatching mode the continuation lands in the EXISTING
-          root session (no new sessions, no orphan workspaces):
+          Missing workspaces create and receive initialPrompt; incomplete
+          first runs are repaired before mode-specific continuation behavior:
 
             skip-if-exists - no-op. Useful for "set up once, leave
                              alone" tasks.
@@ -70,6 +57,10 @@
                              so the agent's in-flight work isn't
                              clobbered. Default + safest.
             continue       - unconditional dispatch. No safety net.
+
+          `kfactory tick` serializes overlapping fires with a per-task
+          mutex; first-run completion is derived from opencode state, not
+          cache file contents.
         '';
       };
       initialPrompt = lib.mkOption {
@@ -114,9 +105,11 @@ in {
     package = lib.mkOption {
       type = lib.types.package;
       description = ''
-        kfactory CLI package used in generated systemd units. Operators
-        typically wire `pkgs.kfactory` (overridden with their endpoint
-        defaults via ldflags); the module doesn't bake in a default.
+        kfactory runtime package used in generated systemd units. Endpoint
+        defaults are runtime environment (`KFACTORY_SERVER`,
+        `KFACTORY_OIDC_ISSUER`, `KFACTORY_OIDC_CLIENT_ID`,
+        `KFACTORY_OIDC_AUDIENCE`) or persisted auth state; the module
+        doesn't bake in a default.
       '';
       example = lib.literalExpression "pkgs.kfactory";
     };
@@ -129,7 +122,7 @@ in {
         kfactory/auth.json exists. Multi-user deployments use one
         scheduledTasks instance per user.
       '';
-      example = "kittyandrew";
+      example = "opencode";
     };
 
     tasks = lib.mkOption {
@@ -163,21 +156,29 @@ in {
 
   config = lib.mkIf cfg.enable {
     # Eval-time guards: catch obvious mistakes before systemd-rebuild.
-    assertions =
-      lib.mapAttrsToList (id: _task: {
-        assertion = validTaskID id;
-        message = ''
-          services.kfactory.scheduledTasks.tasks.${id}: task id must
-          match `[a-f0-9]{4}` exactly (4 lowercase hex chars). This is
-          the same shape as a random workspace slug suffix, so
-          scheduled-task workspaces are indistinguishable from random
-          ones at the slug level. Pick a stable 4-hex identifier per
-          task (e.g. "0001", "7a3f"); document the mapping in your
-          NixOS module so operators can grep config for "what is task
-          7a3f".
-        '';
-      })
-      cfg.tasks;
+    assertions = lib.concatLists (lib.mapAttrsToList (id: task: [
+        {
+          assertion = validTaskID id;
+          message = ''
+            services.kfactory.scheduledTasks.tasks.${id}: task id must
+            match `[a-f0-9]{4}` exactly; pick a stable 4-hex identifier
+            and document its human meaning next to the task.
+          '';
+        }
+        {
+          assertion = nonBlank task.repo;
+          message = "services.kfactory.scheduledTasks.tasks.${id}.repo must not be empty or whitespace-only";
+        }
+        {
+          assertion = nonBlank task.initialPrompt;
+          message = "services.kfactory.scheduledTasks.tasks.${id}.initialPrompt must not be empty or whitespace-only";
+        }
+        {
+          assertion = task.continuationPrompt == "" || nonBlank task.continuationPrompt;
+          message = "services.kfactory.scheduledTasks.tasks.${id}.continuationPrompt must be empty or non-whitespace";
+        }
+      ])
+      cfg.tasks);
 
     environment.etc = lib.mapAttrs' (id: task:
       lib.nameValuePair "kfactory/scheduled/${id}.json" {
@@ -193,13 +194,13 @@ in {
         serviceConfig = {
           Type = "oneshot";
           User = cfg.user;
-          # XDG_CONFIG_HOME locates kfactory/auth.json. Resolve via
-          # `users.users.<name>.home` -- non-/home deployments (e.g.
-          # `/var/lib/factory/<user>`) place auth.json outside `/home/`.
-          Environment = "XDG_CONFIG_HOME=${config.users.users.${cfg.user}.home}/.config";
-          # Restart=no: failed ticks logged (journalctl), not retried
-          # within the unit -- the next scheduled fire re-attempts;
-          # transient failures self-heal at cron tempo.
+          # Resolve config/lock paths from the user's actual home; deployments
+          # may not live under /home.
+          Environment = [
+            "XDG_CONFIG_HOME=${config.users.users.${cfg.user}.home}/.config"
+            "KFACTORY_LOCK_DIR=${config.users.users.${cfg.user}.home}/.cache/kfactory/locks"
+          ];
+          # Do not retry within the unit; the next timer fire is the retry boundary.
           Restart = "no";
         };
         script = "${cfg.package}/bin/kfactory tick ${id}";
