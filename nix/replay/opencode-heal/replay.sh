@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-FIXTURES="$SCRIPT_DIR/fixtures/v1.15.11"
+FIXTURES="$SCRIPT_DIR/fixtures/v1.17.4"
 SCHEMA="$FIXTURES/schema.sql"
 : "${OPENCODE_HEAL:=opencode-heal}"
 

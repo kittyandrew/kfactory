@@ -1,37 +1,41 @@
 kfactory subprocess-delegated token refresh (deployment glue).
 
 Layered on top of the static Bearer and workspace-routing patches.
-NOT upstreamable: this contains kfactory-specific paths, exit-code
-conventions, and a shared file-cache schema between Go (kfactory) and
-TypeScript (opencode TUI). See docs/spec.md in the kfactory repo for
-the wider design.
+NOT upstreamable: kfactory-specific paths, exit codes, and a shared
+file-cache schema between Go (kfactory) and TS (opencode TUI). Design
+rationale + the auth.json schema contract: docs/spec.md §4 in the
+kfactory repo; exit codes: cmd/kfactory/exit.go.
 
 What this adds:
+  - NEW module packages/core/src/kfactory-bearer-refresh.ts: the shared
+    auth.json reader, createBearerRefreshFetch (refresh-aware fetch that
+    spawns `kfactory auth refresh` near expiry), and the
+    onBearerRefreshHint pub/sub (placement rationale in the module
+    header).
+  - A toast subscription in packages/tui/src/app.tsx consuming the
+    refresh-hint pub/sub (one error toast per failure mode per TUI
+    session).
   - OPENCODE_SERVER_BEARER_CACHE_PATH env (core/flag/flag.ts) +
-    bearerFromCache() in server/auth.ts. When set, server-side
-    ServerAuth.header() reads the access token from the cache file
-    if neither credentials.bearer nor OPENCODE_SERVER_BEARER is
-    supplied -- matters because kfactory rotates the token between
-    the launcher exec and the SDK first request.
-  - createBearerRefreshFetch in cli/cmd/tui/attach.ts: a custom fetch
-    that reads the cache file on every request and spawns
-    kfactory auth refresh (subprocess) when the access token is
-    near expiry. kfactory owns the lockfile + IdP HTTP + atomic
-    rename; the TUI just reads the resulting file.
-  - Exit-code contract with the Go side: 0 = ok, 1 = not_logged_in,
-    2 = other error. See KFACTORY_EXIT_* consts inline + the
-    authoritative definitions in kfactory cmd/kfactory/exit.go.
-  - Schema-versioned auth.json read: TUI asserts schema_version on
-    every refresh.
-  - onBearerRefreshHint channel + a toast subscription in app.tsx
-    that surfaces a one-time hint to the operator (not_logged_in /
-    spawn_error / other_error).
+    bearerFromCache() in packages/opencode/src/server/auth.ts so
+    ServerAuth.header() picks up a token rotated between the launcher
+    exec and the SDK's first request. Fails closed on a broken cache.
+    @WARNING: ServerAuth.header() callers at v1.17.4 (re-enumerate on
+    every bump; a broken cache makes bearerFromCache throw at all of
+    them if the env is set): cli/cmd/attach.ts (the intended one),
+    plugin/index.ts inside `opencode serve` (the dangerous one -- a
+    globally exported env + broken cache file would fail plugin boot),
+    cli/cmd/acp.ts, cli/cmd/run.ts, cli/tui/worker.ts (per RPC fetch).
+    The env must only be set by `kfactory attach`, never exported
+    globally. NOTE the SEPARATE unpatched ServerAuth fork at
+    packages/server/src/auth.ts (consumed by packages/cli's daemon.ts
+    + server middleware) -- re-check whether upstream migrates the
+    opencode binary's paths onto it on every bump.
 
-kfactory must be on the operator PATH for the subprocess refresh to
-work. Same-machine, same-UID, same-auth.json.
+kfactory must be on the operator PATH for the subprocess refresh.
+Same-machine, same-UID, same-auth.json.
 
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
-index a730775..e5304cd 100644
+index 5455bc4..7c18f5b 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
 @@ -32,6 +32,7 @@ export const Flag = {
@@ -39,62 +43,44 @@ index a730775..e5304cd 100644
    OPENCODE_SERVER_USERNAME: process.env["OPENCODE_SERVER_USERNAME"],
    OPENCODE_SERVER_BEARER: process.env["OPENCODE_SERVER_BEARER"],
 +  OPENCODE_SERVER_BEARER_CACHE_PATH: process.env["OPENCODE_SERVER_BEARER_CACHE_PATH"],
-
+   OPENCODE_DISABLE_FFF: fff === undefined ? process.platform === "win32" : truthy("OPENCODE_DISABLE_FFF"),
+ 
    // Experimental
-   OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
-diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index aa861db..db1a35e 100644
---- a/packages/opencode/src/cli/cmd/tui/app.tsx
-+++ b/packages/opencode/src/cli/cmd/tui/app.tsx
-@@ -20,6 +20,7 @@ import {
- } from "solid-js"
- import { win32DisableProcessedInput, win32FlushInputBuffer, win32InstallCtrlCGuard } from "./win32"
- import { Flag } from "@opencode-ai/core/flag/flag"
-+import { onBearerRefreshHint } from "./attach"
- import semver from "semver"
- import { DialogProvider, useDialog } from "@tui/ui/dialog"
- import { DialogProvider as DialogProviderList } from "@tui/component/dialog-provider"
-@@ -497,6 +498,22 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
-     })
-   })
-
-+  onMount(() => {
-+    return onBearerRefreshHint(({ kind, detail }) => {
-+      const message =
-+        kind === "not_logged_in"
-+          ? "Session expired -- exit TUI and run `kfactory auth login`"
-+          : kind === "spawn_error"
-+            ? "kfactory binary not reachable -- refresh disabled until reattach"
-+            : "kfactory auth refresh failed -- next request will 401"
-+      toast.show({
-+        variant: "error",
-+        message: detail ? `${message}\n${detail}` : message,
-+        duration: 8000,
-+      })
-+    })
-+  })
-+
-   let continued = false
-   createEffect(() => {
-     // When using -c, session list is loaded in blocking phase, so we can navigate at "partial"
-diff --git a/packages/opencode/src/cli/cmd/tui/attach.ts b/packages/opencode/src/cli/cmd/tui/attach.ts
-index 0889944..7b12294 100644
---- a/packages/opencode/src/cli/cmd/tui/attach.ts
-+++ b/packages/opencode/src/cli/cmd/tui/attach.ts
-@@ -5,6 +5,199 @@ import { TuiConfig } from "@/cli/cmd/tui/config/tui"
- import { errorMessage } from "@/util/error"
- import { validateSession } from "./validate-session"
- import { ServerAuth } from "@/server/auth"
-+import { Flag } from "@opencode-ai/core/flag/flag"
+diff --git a/packages/core/src/kfactory-bearer-refresh.ts b/packages/core/src/kfactory-bearer-refresh.ts
+new file mode 100644
+index 0000000..8fb7fa3
+--- /dev/null
++++ b/packages/core/src/kfactory-bearer-refresh.ts
+@@ -0,0 +1,185 @@
++// kfactory: refresh-aware fetch wrapper + refresh-hint pub/sub.
++//
++// Lives in @opencode-ai/core because BOTH sides of the seam need it and
++// they no longer share a package: `opencode attach`
++// (packages/opencode/src/cli/cmd/attach.ts) constructs the fetch
++// wrapper, while the TUI App (packages/tui/src/app.tsx) subscribes to
++// refresh hints for its error toast -- and packages/tui does not depend
++// on packages/opencode. core's wildcard `"./*"` export makes this
++// importable from both as `@opencode-ai/core/kfactory-bearer-refresh`.
++//
++// Token refresh is delegated to the launcher (`kfactory`) via
++// subprocess; this module just reads `~/.config/kfactory/auth.json`
++// (path passed in OPENCODE_SERVER_BEARER_CACHE_PATH) and spawns
++// `kfactory auth refresh` when the access token is near expiry.
++// kfactory owns the lockfile + IdP HTTP + atomic-rename + AuthFile
++// schema -- see cmd/kfactory/auth.go:runAuthRefresh.
++//
++// Why delegate instead of refreshing in-TS: docs/spec.md's
++// "Subprocess-delegated token refresh" decision entry (kfactory repo).
 +import { readFileSync } from "fs"
 +import { spawn } from "child_process"
 +import { stripVTControlCharacters } from "util"
 +
 +// Subscription channel for refresh outcomes. The fetch wrapper runs
-+// outside React context (SDK calls it with a Request object); to surface
-+// a hint to the TUI we publish into this channel and the TUI subscribes
-+// from inside its component tree (see ../app.tsx).
-+type RefreshHint = { kind: "not_logged_in" | "spawn_error" | "other_error"; detail: string }
++// outside the TUI component tree (the SDK calls it with a Request
++// object); to surface a hint to the operator we publish into this
++// channel and the TUI subscribes from inside its component tree (see
++// packages/tui/src/app.tsx).
++export type RefreshHint = { kind: "not_logged_in" | "spawn_error" | "other_error"; detail: string }
 +const refreshHintSubscribers = new Set<(hint: RefreshHint) => void>()
 +export function onBearerRefreshHint(cb: (hint: RefreshHint) => void): () => void {
 +  refreshHintSubscribers.add(cb)
@@ -103,22 +89,6 @@ index 0889944..7b12294 100644
 +  }
 +}
 +
-+// kfactory: refresh-aware fetch wrapper. Token refresh is
-+// delegated to the launcher (`kfactory`) via subprocess; this file just
-+// reads `~/.config/kfactory/auth.json` (path passed in
-+// OPENCODE_SERVER_BEARER_CACHE_PATH) and spawns `kfactory auth refresh`
-+// when the access token is near expiry. kfactory owns the lockfile +
-+// Zitadel HTTP + atomic-rename + AuthFile schema -- see
-+// cmd/kfactory/auth.go:runAuthRefresh.
-+//
-+// Why delegate instead of refreshing in-TS:
-+//   - Single source of truth: refresh logic lives in one place (Go),
-+//     used by both `kfactory list/dispatch/attach` and the TUI here.
-+//   - Cross-process safety: kfactory's ensureFresh already locks the
-+//     auth.json so concurrent TUIs / kfactory CLI invocations don't
-+//     race the refresh_token rotation.
-+//   - Smaller patch surface: no HTTP, no flock, no schema dup in TS.
-+//
 +// Shared schema (authoritative def: tokenFile struct in
 +// cmd/kfactory/auth.go). We only consume schema_version + access_token
 +// + expires_at on this side; other fields are opaque. The version is
@@ -135,7 +105,7 @@ index 0889944..7b12294 100644
 +const REFRESH_SKEW_MS = 30_000
 +const REFRESH_TIMEOUT_MS = 30_000
 +
-+function readAuthFile(p: string): AuthFile {
++export function readAuthFile(p: string): AuthFile {
 +  const parsed = JSON.parse(readFileSync(p, "utf8")) as AuthFile
 +  if (parsed.schema_version !== AUTH_FILE_SCHEMA_VERSION) {
 +    throw new Error(
@@ -181,19 +151,13 @@ index 0889944..7b12294 100644
 +const KFACTORY_EXIT_NOT_LOGGED_IN = 1
 +function spawnKfactoryRefresh(): Promise<RefreshOutcome> {
 +  return new Promise((resolve) => {
-+    let child
-+    try {
-+      child = spawn("kfactory", ["auth", "refresh"], {
-+        stdio: ["ignore", "ignore", "pipe"],
-+      })
-+    } catch (err) {
-+      resolve({ status: "spawn_error", stderr: String(err) })
-+      return
-+    }
++    const child = spawn("kfactory", ["auth", "refresh"], {
++      stdio: ["ignore", "ignore", "pipe"],
++    })
 +    const chunks: Buffer[] = []
 +    child.stderr?.on("data", (chunk: Buffer) => chunks.push(chunk))
 +    const timer = setTimeout(() => {
-+      child!.kill("SIGTERM")
++      child.kill("SIGTERM")
 +    }, REFRESH_TIMEOUT_MS)
 +    child.on("exit", (code) => {
 +      clearTimeout(timer)
@@ -209,18 +173,13 @@ index 0889944..7b12294 100644
 +  })
 +}
 +
-+function createBearerRefreshFetch(cachePath: string): typeof fetch {
++export function createBearerRefreshFetch(cachePath: string): typeof fetch {
 +  let currentBearer = readAuthFile(cachePath).access_token
 +  let refreshing: Promise<void> | null = null
-+  // Log a given failure mode at most once per TUI session so the
++  // Surface a given failure mode at most once per TUI session so the
 +  // alternate screen isn't spammed on every request when kfactory is
 +  // broken or the refresh_token is dead.
-+  const logged: Record<RefreshOutcome["status"], boolean> = {
-+    ok: true,
-+    not_logged_in: false,
-+    spawn_error: false,
-+    other_error: false,
-+  }
++  const warned = new Set<RefreshHint["kind"]>()
 +
 +  async function ensureFresh() {
 +    if (refreshing) {
@@ -236,8 +195,8 @@ index 0889944..7b12294 100644
 +      try {
 +        const outcome = await spawnKfactoryRefresh()
 +        if (outcome.status !== "ok") {
-+          if (!logged[outcome.status]) {
-+            logged[outcome.status] = true
++          if (!warned.has(outcome.status)) {
++            warned.add(outcome.status)
 +            const detail = stripVTControlCharacters(outcome.stderr)
 +            for (const cb of refreshHintSubscribers) {
 +              cb({ kind: outcome.status, detail })
@@ -278,104 +237,122 @@ index 0889944..7b12294 100644
 +    return fetch(input, { ...init, headers: merged })
 +  }) as unknown as typeof fetch
 +}
-
+diff --git a/packages/opencode/src/cli/cmd/attach.ts b/packages/opencode/src/cli/cmd/attach.ts
+index 94cb785..b020e0b 100644
+--- a/packages/opencode/src/cli/cmd/attach.ts
++++ b/packages/opencode/src/cli/cmd/attach.ts
+@@ -3,6 +3,8 @@ import { UI } from "@/cli/ui"
+ import { errorMessage } from "@opencode-ai/tui/util/error"
+ import { validateSession } from "../tui/validate-session"
+ import { ServerAuth } from "@/server/auth"
++import { Flag } from "@opencode-ai/core/flag/flag"
++import { createBearerRefreshFetch } from "@opencode-ai/core/kfactory-bearer-refresh"
+ 
  export const AttachCommand = cmd({
    command: "attach <url>",
-@@ -80,6 +271,14 @@ export const AttachCommand = cmd({
-         username: args.username,
-         bearer: args.bearer,
-       })
-+      // If the launcher pointed us at a shared token cache, swap the
-+      // static `headers` for a custom `fetch` that refreshes tokens
-+      // against the file (under a cross-process lockfile) when stale.
-+      // See createBearerRefreshFetch above.
-+      let refreshFetch: typeof fetch | undefined
-+      if (Flag.OPENCODE_SERVER_BEARER_CACHE_PATH) {
-+        refreshFetch = createBearerRefreshFetch(Flag.OPENCODE_SERVER_BEARER_CACHE_PATH)
-+      }
-       const config = await TuiConfig.get()
-
-       try {
-@@ -89,6 +288,7 @@ export const AttachCommand = cmd({
-           directory,
-           workspace: args.workspace,
-           headers,
-+          fetch: refreshFetch,
-         })
-       } catch (error) {
-         UI.error(errorMessage(error))
-@@ -110,6 +310,7 @@ export const AttachCommand = cmd({
+@@ -66,6 +68,14 @@ export const AttachCommand = cmd({
+       }
+     })()
+     const headers = ServerAuth.headers({ password: args.password, username: args.username })
++    // If the launcher pointed us at a shared token cache, swap the
++    // static `headers` for a custom `fetch` that refreshes tokens
++    // against the file (under a cross-process lockfile) when stale.
++    // See createBearerRefreshFetch in @opencode-ai/core.
++    let refreshFetch: typeof fetch | undefined
++    if (Flag.OPENCODE_SERVER_BEARER_CACHE_PATH) {
++      refreshFetch = createBearerRefreshFetch(Flag.OPENCODE_SERVER_BEARER_CACHE_PATH)
++    }
+     const config = await TuiConfig.get()
+ 
+     try {
+@@ -75,6 +85,7 @@ export const AttachCommand = cmd({
          directory,
          workspace: args.workspace,
          headers,
 +        fetch: refreshFetch,
        })
-       await handle.done
-     } finally {
+     } catch (error) {
+       UI.error(errorMessage(error))
+@@ -98,6 +109,7 @@ export const AttachCommand = cmd({
+         directory,
+         workspace: args.workspace,
+         headers,
++        fetch: refreshFetch,
+       }),
+     )
+   },
 diff --git a/packages/opencode/src/server/auth.ts b/packages/opencode/src/server/auth.ts
-index 5e979d9..e096510 100644
+index fe8be05..ea6c098 100644
 --- a/packages/opencode/src/server/auth.ts
 +++ b/packages/opencode/src/server/auth.ts
-@@ -3,6 +3,7 @@ export * as ServerAuth from "./auth"
+@@ -3,12 +3,24 @@ export * as ServerAuth from "./auth"
  import { ConfigService } from "@/effect/config-service"
  import { Flag } from "@opencode-ai/core/flag/flag"
  import { Config as EffectConfig, Context, Option, Redacted } from "effect"
-+import { readFileSync } from "fs"
-
++import { readAuthFile } from "@opencode-ai/core/kfactory-bearer-refresh"
+ 
  export type Credentials = {
    password?: string
-@@ -10,6 +11,45 @@ export type Credentials = {
-   bearer?: string
+   username?: string
  }
-
-+// kfactory: read the access token from the shared launcher cache when
-+// no explicit bearer / env var is provided. Single source of truth is
-+// `~/.config/kfactory/auth.json` (path passed via
-+// OPENCODE_SERVER_BEARER_CACHE_PATH). Catches the case where kfactory
-+// rotated the token between the launcher's exec and the SDK's first
-+// request.
-+//
-+// Warn-throttling is keyed on the actual failure message: a recovered
-+// state (cache file fixed) then a fresh failure (cache file broken
-+// again) BOTH surface. Server-lifetime "warn once and never again" was
-+// the original shape and made transient cache breaks invisible to
-+// operators (a TUI restart was the only signal).
-+const KFACTORY_AUTH_FILE_SCHEMA_VERSION = 1
-+const bearerFromCacheWarnedMessages = new Set<string>()
+ 
++// kfactory: read the access token from the shared launcher cache when no
++// env bearer is provided -- covers kfactory rotating the token between
++// the launcher exec and the SDK's first request. Fails closed
++// (readAuthFile throws) on a broken cache; `kfactory attach` surfaces
++// that once at startup via UI.error.
 +function bearerFromCache(): string | undefined {
 +  const p = Flag.OPENCODE_SERVER_BEARER_CACHE_PATH
 +  if (!p) return undefined
-+  try {
-+    const json = JSON.parse(readFileSync(p, "utf8")) as { schema_version?: number; access_token?: string }
-+    if (json.schema_version !== KFACTORY_AUTH_FILE_SCHEMA_VERSION) {
-+      throw new Error(
-+        `auth.json schema_version ${String(json.schema_version)} != supported ${KFACTORY_AUTH_FILE_SCHEMA_VERSION}`,
-+      )
-+    }
-+    if (typeof json.access_token !== "string" || json.access_token === "") {
-+      throw new Error("auth.json access_token is missing")
-+    }
-+    bearerFromCacheWarnedMessages.clear()
-+    return json.access_token
-+  } catch (err) {
-+    const key = String(err)
-+    if (!bearerFromCacheWarnedMessages.has(key)) {
-+      bearerFromCacheWarnedMessages.add(key)
-+      console.warn(`bearerFromCache: parse failed at ${p}: ${err}`)
-+    }
-+    throw err
-+  }
++  return readAuthFile(p).access_token
 +}
 +
  export type DecodedCredentials = {
    readonly username: string
    readonly password: Redacted.Redacted
-@@ -35,7 +66,7 @@ export function authorized(credentials: DecodedCredentials, config: Info) {
+@@ -34,7 +46,7 @@ export function authorized(credentials: DecodedCredentials, config: Info) {
  }
-
+ 
  export function header(credentials?: Credentials) {
--  const bearer = credentials?.bearer ?? Flag.OPENCODE_SERVER_BEARER
-+  const bearer = credentials?.bearer ?? Flag.OPENCODE_SERVER_BEARER ?? bearerFromCache()
+-  const bearer = Flag.OPENCODE_SERVER_BEARER
++  const bearer = Flag.OPENCODE_SERVER_BEARER ?? bearerFromCache()
    if (bearer) return `Bearer ${bearer}`
-
+ 
    const password = credentials?.password ?? Flag.OPENCODE_SERVER_PASSWORD
+diff --git a/packages/tui/src/app.tsx b/packages/tui/src/app.tsx
+index df24b6c..61cec47 100644
+--- a/packages/tui/src/app.tsx
++++ b/packages/tui/src/app.tsx
+@@ -3,6 +3,7 @@ import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
+ import { Deferred, Effect } from "effect"
+ import { Global } from "@opencode-ai/core/global"
+ import { Flag } from "@opencode-ai/core/flag/flag"
++import { onBearerRefreshHint } from "@opencode-ai/core/kfactory-bearer-refresh"
+ import { InstallationVersion } from "@opencode-ai/core/installation/version"
+ import { ClipboardProvider, useClipboard } from "./context/clipboard"
+ import { ExitProvider, useExit } from "./context/exit"
+@@ -486,6 +487,24 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
+     })
+   })
+ 
++  onMount(() => {
++    onCleanup(
++      onBearerRefreshHint(({ kind, detail }) => {
++        const message =
++          kind === "not_logged_in"
++            ? "Session expired -- exit TUI and run `kfactory auth login`"
++            : kind === "spawn_error"
++              ? "kfactory binary not reachable -- refresh disabled until reattach"
++              : "kfactory auth refresh failed -- next request will 401"
++        toast.show({
++          variant: "error",
++          message: detail ? `${message}\n${detail}` : message,
++          duration: 8000,
++        })
++      }),
++    )
++  })
++
+   let continued = false
+   createEffect(() => {
+     // When using -c, session list is loaded in blocking phase, so we can navigate at "partial"

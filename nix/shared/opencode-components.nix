@@ -6,21 +6,16 @@
 }: let
   mkOpencodeNodeModulesConfigurePhase = import ./opencode-node-modules.nix;
 
-  opencodePatched =
-    (opencode.packages.${system}.default.override {
-      node_modules = opencode.packages.${system}.node_modules_updater.override {
-        hash = "sha256-FT8N4SBP7OmVu73OwNyPJvBoxFd2+IXzNnFubB8y6J0=";
-      };
-    }).overrideAttrs (old: {
-      # @WARNING (patch order): DO NOT REORDER. kfactory-refresh is line-pinned
-      # against static-bearer + workspace-routing post-apply hashes; see
-      # .claude/rules/020-patches.md and 021-patches-rediff.md.
-      patches = (old.patches or []) ++ opencodePatchStack;
-      configurePhase = mkOpencodeNodeModulesConfigurePhase {
-        nodeModules = old.node_modules;
-      };
-      disallowedReferences = (old.disallowedReferences or []) ++ [old.node_modules];
-    });
+  opencodePatched = opencode.packages.${system}.default.overrideAttrs (old: {
+    # @WARNING (patch order): DO NOT REORDER. kfactory-refresh is line-pinned
+    # against static-bearer + workspace-routing post-apply hashes; see
+    # .claude/rules/020-patches.md and 021-patches-rediff.md.
+    patches = (old.patches or []) ++ opencodePatchStack;
+    configurePhase = mkOpencodeNodeModulesConfigurePhase {
+      nodeModules = old.node_modules;
+    };
+    disallowedReferences = (old.disallowedReferences or []) ++ [old.node_modules];
+  });
 
   opencodeHeal = pkgs.writeShellApplication {
     name = "opencode-heal";

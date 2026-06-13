@@ -3,7 +3,7 @@
   opencodeVersion,
   opencodeHeal,
 }: let
-  fixtureVersion = "v1.15.11";
+  fixtureVersion = "v1.17.4";
   ptyLifecycleContract =
     pkgs.runCommand "factory-pty-lifecycle-contract" {
       src = ./pty-lifecycle-contract;
@@ -14,7 +14,7 @@
     } ''
       export NTFY_SRC=${../../plugins/ntfy}
       export OPENCODE_HEAL=${opencodeHeal}/bin/opencode-heal
-      export OPENCODE_SCHEMA=${./opencode-heal/fixtures/v1.15.11/schema.sql}
+      export OPENCODE_SCHEMA=${./opencode-heal/fixtures/v1.17.4/schema.sql}
       export PTY_LIFECYCLE_CASES=$src/cases.json
       bun $src/check.ts
       touch $out

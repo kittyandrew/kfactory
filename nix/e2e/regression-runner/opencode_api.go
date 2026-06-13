@@ -2,27 +2,29 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 )
 
-func (r *runner) projectWorktree(workspaceID string) (string, error) {
-	var rows []struct {
-		VCS      string `json:"vcs"`
-		Worktree string `json:"worktree"`
-	}
-	if err := r.apiJSON(workspaceID, "/project", &rows); err != nil {
+// Resolve a workspace's clone directory from its /experimental/workspace
+// row. Since opencode v1.17.x every clone of the same repo shares one
+// worktree-hashed project row, so deriving the directory from /project
+// ("first git project's worktree") returns whichever workspace
+// materialized the project first -- the workspace row is the only
+// per-workspace source of truth.
+func (r *runner) workspaceDirectory(workspaceID string) (string, error) {
+	rows, err := r.workspaces()
+	if err != nil {
 		return "", err
 	}
 	for _, row := range rows {
-		if row.VCS == "git" {
-			return row.Worktree, nil
+		if row.ID == workspaceID && row.Directory != "" {
+			return row.Directory, nil
 		}
 	}
-	return "", fmt.Errorf("no git project for %s", workspaceID)
+	return "", fmt.Errorf("no workspace directory for %s", workspaceID)
 }
 
 func (r *runner) sessionWorkspaceIDs(workspaceID, path string) ([]string, error) {
@@ -161,29 +163,6 @@ func (r *runner) workspaceBranch(id string) (string, error) {
 		return "", err
 	}
 	return info.Branch, nil
-}
-
-func (r *runner) createEmptySession(workspaceID string) (string, error) {
-	out, err := r.cli("curl", "-sf", "-X", "POST", "-H", "Authorization: Bearer "+r.token, "-H", "Content-Type: application/json", "-d", "{}", r.opencodeBase+"/session?workspace="+workspaceID)
-	if err != nil {
-		return "", err
-	}
-	var resp struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		return "", err
-	}
-	if resp.ID == "" {
-		return "", errors.New("empty session ID")
-	}
-	return resp.ID, nil
-}
-
-func (r *runner) sendPrompt(workspaceID, sessionID, prompt string) error {
-	body, _ := json.Marshal(map[string]any{"parts": []map[string]string{{"type": "text", "text": prompt}}})
-	_, err := r.cli("curl", "-sf", "-X", "POST", "-H", "Authorization: Bearer "+r.token, "-H", "Content-Type: application/json", "-d", string(body), r.opencodeBase+"/session/"+sessionID+"/message?workspace="+workspaceID)
-	return err
 }
 
 func (r *runner) ntfyPoll(since int64) ([]ntfyMessage, string, error) {

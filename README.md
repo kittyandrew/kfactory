@@ -64,13 +64,15 @@ You bring:
   `kfactory auth login`.
 
 kfactory does NOT ship a Caddyfile, docker-compose, agent prompts,
-model selection, or secrets management. kfactory DOES ship two narrow
-NixOS modules -- `scheduledTasks` (timer-driven `kfactory tick`) and
+model selection, or secrets management. kfactory DOES ship three opt-in
+NixOS modules -- `scheduledTasks` (timer-driven `kfactory tick`),
 `recovery` (opencode-serve restart lifecycle: opencode-heal +
-opencode-sync-kick + recovery-sweep) -- because the systemd unit
-generation those describe is intrinsically NixOS-shaped and the
-operator-facing schema is the natural fit. Everything else stays
-module-free.
+opencode-sync-kick + recovery-sweep), and `factoryGuest` (the
+opencode-serve unit + worker user + state layout + recovery, the
+reusable guest core; see "Local dev VM" below) -- because the systemd
+unit generation they describe is intrinsically NixOS-shaped and the
+operator-facing schema is the natural fit. The proxy/ingress, secrets,
+host networking, and persona layer above the guest stays module-free.
 
 ## Consuming
 
@@ -253,6 +255,29 @@ drop-in:
 fires (`wrk_kfactory_<task-id>`, mode-driven branching) and ad-hoc
 nudges (workspace ID or 4-hex slug suffix + `--prompt`). Unlike
 `attach` and `delete`, `tick` never resolves by list index.
+
+## Local dev VM
+
+An interactive microvm for local testing -- the same `factoryGuest`
+guest profile production deployments import, plus an in-guest Keycloak
+(real OIDC device flow), bootable rootless (qemu user-mode networking,
+loopback port-forwards, persistent `dev-vm.img` in the working dir):
+
+```bash
+nix run .#dev-vm           # boot; first run builds the guest system
+nix run .#dev-vm-login     # real device-flow login against the in-guest IdP
+kfactory dispatch file:///srv/test-repo.git "say hi"   # KFACTORY_SERVER=http://127.0.0.1:4096
+kfactory attach 1          # TUI against the VM
+$BROWSER http://127.0.0.1:4096   # opencode web UI
+# Keycloak admin: http://127.0.0.1:8080 (admin / admin-password1234)
+# Guest shell:    ssh -p 2222 root@127.0.0.1 (password: dev)
+```
+
+Port plan + design notes: `nix/dev-vm/default.nix`. The reusable guest
+profile is `nixosModules.factoryGuest` (`modules/factory-guest.nix`):
+the opencode-serve unit, worker user, state layout, and recovery
+lifecycle behind options -- production hosts import it and add their
+own hypervisor/network/secrets/persona config on top.
 
 ## CI
 

@@ -188,9 +188,17 @@ test("opencode attach talks to real serve with workspace-scoped requests", async
     const clientHome = path.join(root, "client-home")
     const child = spawnAttach(proxyUrl, workspaceID, clientHome, { OPENCODE_SERVER_BEARER: "test-token" })
     try {
+      // POST /sync/start arrives with x-opencode-workspace as a HEADER
+      // (empty query: the SDK only rewrites header -> query for GET/HEAD),
+      // so this asserts the non-GET header-fallback middleware end to end.
+      // GET /session?workspace= is the --continue session-list scoping.
+      // (The /global/event SSE stream is not asserted: under the headless
+      // `script` PTY the v1.17.4 TUI tears the stream down on stdin EOF
+      // before the proxy can observe it; /sync/start fires from the same
+      // post-event-subscription code path in packages/tui/src/context/sdk.tsx.)
       await waitFor("workspace-scoped real TUI bootstrap requests", () =>
-        seen.some((r) => r.path === "/global/event" && r.workspace === workspaceID) &&
-        seen.some((r) => r.workspace === workspaceID),
+        seen.some((r) => r.method === "POST" && r.path === "/sync/start" && r.search === "" && r.workspace === workspaceID) &&
+        seen.some((r) => r.method === "GET" && r.path === "/session" && r.workspace === workspaceID),
       )
       expect(seen.some((r) => r.authorization === "Bearer test-token")).toBe(true)
     } catch (error) {

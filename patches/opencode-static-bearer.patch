@@ -1,15 +1,14 @@
-Static Bearer attach header plumbing.
+Static Bearer header plumbing (env-only).
 
-Adds generic client-side Bearer header support for opencode attach:
-
-  - OPENCODE_SERVER_BEARER env in core flags.
-  - ServerAuth.header() prefers credentials.bearer / OPENCODE_SERVER_BEARER over Basic auth.
-  - opencode attach --bearer passes a Bearer token into SDK request headers.
-
-Server-side opencode does NOT validate the Bearer. This patch only lets clients send it, for deployments where a reverse proxy validates JWTs before forwarding to opencode.
+Adds OPENCODE_SERVER_BEARER: when set, client-side ServerAuth.header()
+emits `Bearer <token>` instead of Basic auth. Server-side opencode does
+NOT validate the Bearer; deployments pair this with a JWT-validating
+reverse proxy. kfactory itself uses the cache-file flow layered on top
+by opencode-kfactory-refresh.patch; the env var is the minimal generic
+seam (and the test seam for nix/unit/opencode/tui-attach-smoke.test.ts).
 
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
-index 504e156..a730775 100644
+index a0eb78a..5455bc4 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
 @@ -31,6 +31,7 @@ export const Flag = {
@@ -17,56 +16,20 @@ index 504e156..a730775 100644
    OPENCODE_SERVER_PASSWORD: process.env["OPENCODE_SERVER_PASSWORD"],
    OPENCODE_SERVER_USERNAME: process.env["OPENCODE_SERVER_USERNAME"],
 +  OPENCODE_SERVER_BEARER: process.env["OPENCODE_SERVER_BEARER"],
-
+   OPENCODE_DISABLE_FFF: fff === undefined ? process.platform === "win32" : truthy("OPENCODE_DISABLE_FFF"),
+ 
    // Experimental
-   OPENCODE_EXPERIMENTAL_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_FILEWATCHER").pipe(
-diff --git a/packages/opencode/src/cli/cmd/tui/attach.ts b/packages/opencode/src/cli/cmd/tui/attach.ts
-index b908887..5e0eb36 100644
---- a/packages/opencode/src/cli/cmd/tui/attach.ts
-+++ b/packages/opencode/src/cli/cmd/tui/attach.ts
-@@ -43,6 +43,11 @@ export const AttachCommand = cmd({
-         alias: ["u"],
-         type: "string",
-         describe: "basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')",
-+      })
-+      .option("bearer", {
-+        alias: ["b"],
-+        type: "string",
-+        describe: "bearer token (defaults to OPENCODE_SERVER_BEARER); overrides password/username",
-       }),
-   handler: async (args) => {
-     const unguard = win32InstallCtrlCGuard()
-@@ -65,7 +70,11 @@ export const AttachCommand = cmd({
-           return args.dir
-         }
-       })()
--      const headers = ServerAuth.headers({ password: args.password, username: args.username })
-+      const headers = ServerAuth.headers({
-+        password: args.password,
-+        username: args.username,
-+        bearer: args.bearer,
-+      })
-       const config = await TuiConfig.get()
-
-       try {
 diff --git a/packages/opencode/src/server/auth.ts b/packages/opencode/src/server/auth.ts
-index 9630ddb..5e979d9 100644
+index 9630ddb..fe8be05 100644
 --- a/packages/opencode/src/server/auth.ts
 +++ b/packages/opencode/src/server/auth.ts
-@@ -7,6 +7,7 @@ import { Config as EffectConfig, Context, Option, Redacted } from "effect"
- export type Credentials = {
-   password?: string
-   username?: string
-+  bearer?: string
+@@ -34,6 +34,9 @@ export function authorized(credentials: DecodedCredentials, config: Info) {
  }
-
- export type DecodedCredentials = {
-@@ -34,6 +35,9 @@ export function authorized(credentials: DecodedCredentials, config: Info) {
- }
-
+ 
  export function header(credentials?: Credentials) {
-+  const bearer = credentials?.bearer ?? Flag.OPENCODE_SERVER_BEARER
++  const bearer = Flag.OPENCODE_SERVER_BEARER
 +  if (bearer) return `Bearer ${bearer}`
 +
    const password = credentials?.password ?? Flag.OPENCODE_SERVER_PASSWORD
    if (!password) return undefined
+ 

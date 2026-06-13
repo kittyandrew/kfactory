@@ -22,8 +22,13 @@ patches/                     opencode + oauth2-proxy source patches (line-pinned
 modules/                     NixOS modules: scheduled-tasks.nix (timer-driven
                              `kfactory tick`) + recovery.nix (opencode-serve
                              lifecycle: heal ExecStartPre + sync-kick & recovery-
-                             sweep ExecStartPost). Exposed via flake.nix
-                             `nixosModules = { scheduledTasks; recovery; };`
+                             sweep ExecStartPost) + factory-guest.nix (the
+                             opencode-serve unit + worker user + state layout +
+                             recovery; the reusable guest core). Exposed via
+                             flake.nix `nixosModules = { scheduledTasks; recovery;
+                             factoryGuest; };`
+nix/dev-vm/                  interactive microvm (factoryGuest + in-guest Keycloak),
+                             bootable via `nix run .#dev-vm`; see its header
 nix/e2e/                     Docker-based e2e images/configs + Go behavioral runner
 nix/scripts/                 interactive dev apps (`nix run .#dev-*`)
 docs/spec.md                 architecture intent + decisions log (portable; no kittyos refs)

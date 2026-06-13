@@ -9,7 +9,13 @@
     # Follow top-level nixpkgs so the CLI, patched opencode, and checks share
     # one nixpkgs pin.
     opencode = {
-      url = "github:anomalyco/opencode/v1.15.11";
+      url = "github:anomalyco/opencode/v1.17.4";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    # Backs nixosModules.factoryGuest + the bundled dev VM (nix/dev-vm).
+    microvm = {
+      url = "github:astro/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -18,6 +24,7 @@
     self,
     nixpkgs,
     opencode,
+    microvm,
   }: let
     forAllSystems = nixpkgs.lib.genAttrs ["x86_64-linux" "aarch64-linux"];
     sharedSources = import ./nix/shared/sources.nix;
@@ -74,14 +81,33 @@
       dev-down = mkApp scripts.dev-down "dev-down";
       dev-clean = mkApp scripts.dev-clean "dev-clean";
       dev-test = mkApp scripts.dev-test "dev-test";
-      dev-test-ntfy = mkApp scripts.dev-test-ntfy "dev-test-ntfy";
+
+      # Interactive microvm (x86_64 guest; see nix/dev-vm/default.nix).
+      dev-vm = {
+        type = "app";
+        program = "${self.nixosConfigurations.dev-vm.config.microvm.declaredRunner}/bin/microvm-run";
+      };
+      dev-vm-login = mkApp (pkgs.writeShellApplication {
+        name = "dev-vm-login";
+        runtimeInputs = [components.unified];
+        text = ''
+          # Keycloak rejects Zitadel's audience-scope URN; empty template =
+          # issuer default (same shape the Keycloak flake check uses).
+          export KFACTORY_OIDC_AUDIENCE_SCOPE_TEMPLATE=""
+          exec kfactory auth login \
+            --server http://127.0.0.1:4096 \
+            --issuer http://127.0.0.1:8080/realms/kfactory-test \
+            --client-id kfactory \
+            --audience kfactory
+        '';
+      }) "dev-vm-login";
     });
 
     # NixOS modules for the kfactory pieces that are intrinsically
-    # NixOS-shaped (per-task systemd timers, opencode-serve lifecycle
-    # hooks). The rest of kfactory stays module-free. Both modules
-    # default `package` to `self.packages.${system}.kfactory` for
-    # zero-config use. Endpoint defaults are runtime env vars.
+    # NixOS-shaped (per-task timers, opencode-serve lifecycle hooks, the
+    # serve-unit guest profile). The proxy/secrets/host layer above stays
+    # module-free. Each defaults `package` to packages.${system}.kfactory
+    # for zero-config use; endpoint defaults are runtime env vars.
     nixosModules = {
       scheduledTasks = {pkgs, ...}: {
         imports = [./modules/scheduled-tasks.nix];
@@ -93,6 +119,29 @@
         services.kfactory.recovery.package =
           nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.kfactory;
       };
+      # Reusable guest core (serve unit + worker user + state layout +
+      # recovery + scheduledTasks); see modules/factory-guest.nix.
+      factoryGuest = {pkgs, ...}: {
+        imports = [./modules/factory-guest.nix ./modules/recovery.nix ./modules/scheduled-tasks.nix];
+        services.kfactory.guest.package =
+          nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.kfactory;
+        services.kfactory.scheduledTasks.package =
+          nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.kfactory;
+      };
+    };
+
+    # Interactive dev VM (x86_64; port plan + quickstart in
+    # nix/dev-vm/default.nix and the README).
+    nixosConfigurations.dev-vm = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        microvm.nixosModules.microvm
+        self.nixosModules.factoryGuest
+        (import ./nix/dev-vm {
+          testRepo = nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/e2e/test-repo.nix {};
+          realmFile = ./nix/e2e/kfactory-test-realm.json;
+        })
+      ];
     };
 
     # CI gate registry: package/plugin attrs auto-promote to checks; bespoke

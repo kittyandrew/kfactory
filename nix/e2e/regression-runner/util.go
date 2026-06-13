@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -45,9 +43,4 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
-}
-
-func atoi(s string) int {
-	n, _ := strconv.Atoi(strings.TrimSpace(s))
-	return n
 }

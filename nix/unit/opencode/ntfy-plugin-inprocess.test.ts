@@ -3,14 +3,16 @@ import { $ } from "bun"
 import * as Http from "node:http"
 import * as fs from "node:fs/promises"
 import path from "node:path"
-import * as Log from "@opencode-ai/core/util/log"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
-import { Bus } from "../../src/bus"
-import { BusEvent } from "../../src/bus/bus-event"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { SessionStatus } from "../../src/session/status"
+import { Permission } from "../../src/permission"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { SessionID } from "../../src/session/schema"
 import { Config } from "../../src/config/config"
 import { Env } from "../../src/env"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
@@ -22,22 +24,12 @@ import { AccountTest } from "../fake/account"
 import { AuthTest } from "../fake/auth"
 import { NpmTest } from "../fake/npm"
 
-void Log.init({ print: false })
-
-const SessionStatus = BusEvent.define(
-  "session.status",
-  Schema.Struct({
-    sessionID: Schema.String,
-    status: Schema.Struct({ type: Schema.Literal("idle") }),
-  }),
-)
-
-const configLayer = Config.layer.pipe(Layer.provide(EffectFlock.defaultLayer), Layer.provide(AppFileSystem.defaultLayer), Layer.provide(Env.defaultLayer), Layer.provide(AuthTest.empty), Layer.provide(AccountTest.empty), Layer.provide(NpmTest.noop), Layer.provide(FetchHttpClient.layer))
+const configLayer = Config.layer.pipe(Layer.provide(EffectFlock.defaultLayer), Layer.provide(FSUtil.defaultLayer), Layer.provide(Env.defaultLayer), Layer.provide(AuthTest.empty), Layer.provide(AccountTest.empty), Layer.provide(NpmTest.noop), Layer.provide(FetchHttpClient.layer))
 
 const it = testEffectShared(
   Layer.mergeAll(
     Plugin.layer.pipe(
-      Layer.provideMerge(Bus.layer),
+      Layer.provideMerge(EventV2Bridge.defaultLayer),
       Layer.provideMerge(configLayer),
       Layer.provideMerge(RuntimeFlags.layer({ disableDefaultPlugins: true })),
     ),
@@ -200,7 +192,9 @@ describe("kfactory ntfy plugin inside opencode", () => {
             yield* Effect.promise(() => $`git commit --allow-empty -m test`.cwd(directory).quiet().nothrow())
             const sessionID = yield* Effect.promise(() => createSession(directory))
 
-            yield* Bus.use.publish(SessionStatus, { sessionID, status: { type: "idle" } })
+            yield* EventV2Bridge.Service.use((events) =>
+              events.publish(SessionStatus.Event.Status, { sessionID: SessionID.make(sessionID), status: { type: "idle" } }),
+            )
             yield* Effect.promise(() => collector.waitForCount(1, 1000))
             expect(collector.messages[0].headers.title).toBe("Agent Idle")
             expect(collector.messages[0].body).toContain(path.basename(directory))
@@ -210,7 +204,9 @@ describe("kfactory ntfy plugin inside opencode", () => {
               (reader) => Effect.promise(() => reader.cancel().catch(() => undefined)),
             )
 
-            yield* Bus.use.publish(SessionStatus, { sessionID, status: { type: "idle" } })
+            yield* EventV2Bridge.Service.use((events) =>
+              events.publish(SessionStatus.Event.Status, { sessionID: SessionID.make(sessionID), status: { type: "idle" } }),
+            )
             yield* Effect.promise(() => collector.waitForCount(2, 1000))
 
             yield* Effect.acquireRelease(
@@ -218,7 +214,9 @@ describe("kfactory ntfy plugin inside opencode", () => {
               (reader) => Effect.promise(() => reader.cancel().catch(() => undefined)),
             )
 
-            yield* Bus.use.publish(SessionStatus, { sessionID, status: { type: "idle" } })
+            yield* EventV2Bridge.Service.use((events) =>
+              events.publish(SessionStatus.Event.Status, { sessionID: SessionID.make(sessionID), status: { type: "idle" } }),
+            )
             yield* Effect.promise(() => collector.waitForCount(3, 1000))
           }),
         ),
@@ -234,7 +232,9 @@ describe("kfactory ntfy plugin inside opencode", () => {
             yield* Effect.promise(() => $`git commit --allow-empty -m test`.cwd(directory).quiet().nothrow())
             const sessionID = yield* Effect.promise(() => createSession(directory))
 
-            yield* Bus.use.publish(SessionStatus, { sessionID, status: { type: "idle" } })
+            yield* EventV2Bridge.Service.use((events) =>
+              events.publish(SessionStatus.Event.Status, { sessionID: SessionID.make(sessionID), status: { type: "idle" } }),
+            )
             yield* Effect.acquireRelease(
               Effect.promise(() => openEventStream(directory)),
               (reader) => Effect.promise(() => reader.cancel().catch(() => undefined)),
@@ -245,4 +245,31 @@ describe("kfactory ntfy plugin inside opencode", () => {
       ),
     ),
   )
+  it.live("sends permission.asked with the permission type in the body", () =>
+    Effect.acquireRelease(Effect.promise(makeCollector), (collector) => Effect.promise(() => collector.close())).pipe(
+      Effect.flatMap((collector) =>
+        withNtfyProject(collector, (directory) =>
+          Effect.gen(function* () {
+            yield* Effect.promise(() => $`git commit --allow-empty -m test`.cwd(directory).quiet().nothrow())
+            const sessionID = yield* Effect.promise(() => createSession(directory))
+
+            yield* EventV2Bridge.Service.use((events) =>
+              events.publish(Permission.Event.Asked, {
+                id: PermissionV1.ID.ascending(),
+                sessionID: SessionID.make(sessionID),
+                permission: "webfetch",
+                patterns: ["https://example.com"],
+                metadata: {},
+                always: [],
+              }),
+            )
+            yield* Effect.promise(() => collector.waitForCount(1, 1000))
+            expect(collector.messages[0].headers.title).toBe("Permission Asked")
+            expect(collector.messages[0].body).toContain("webfetch")
+          }),
+        ),
+      ),
+    ),
+  )
+
 })

@@ -80,10 +80,18 @@ func (r *runner) phaseListBranch() error {
 		return err
 	}
 	ws3 = rowByID(rows, r.ws3)
-	if ws3 == nil || (ws3.Branch != "" && ws3.Branch != "-") {
-		return fmt.Errorf("WS3 has no .git but branch column is %q", valueOrEmpty(ws3, func(r listRow) string { return r.Branch }))
+	if ws3 == nil {
+		return fmt.Errorf("workspace %s missing from list after .git removal", r.ws3)
 	}
-	fmt.Println("      ✓ WS3 without .git shows no branch")
+	// Since opencode v1.17.x the /vcs branch is per-instance cached state
+	// refreshed by HEAD file-watcher events, not a live `git` probe -- an
+	// out-of-band `rm -rf .git` leaves the last-known branch in place until
+	// the instance restarts. The kfactory contract here is graceful
+	// degradation: `kfactory list` must still succeed and keep the row;
+	// a stale or empty branch column are both acceptable. (`kfactory tick
+	// skip-if-dirty` is unaffected: /vcs/status remains a live probe.)
+	fmt.Printf("      ✓ WS3 without .git still lists (branch column %q, cached-or-empty per opencode >=1.17)\n",
+		valueOrEmpty(ws3, func(r listRow) string { return r.Branch }))
 	return nil
 }
 
@@ -106,11 +114,11 @@ func (r *runner) phaseAttachResolve() error {
 }
 
 func (r *runner) phaseSessionIsolation() error {
-	ws1Dir, err := r.projectWorktree(r.ws1)
+	ws1Dir, err := r.workspaceDirectory(r.ws1)
 	if err != nil {
 		return err
 	}
-	ws2Dir, err := r.projectWorktree(r.ws2)
+	ws2Dir, err := r.workspaceDirectory(r.ws2)
 	if err != nil {
 		return err
 	}

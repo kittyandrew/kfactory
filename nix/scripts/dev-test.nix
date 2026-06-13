@@ -10,6 +10,6 @@ in
       export OPENCODE_CONTAINER=${env.opencodeContainer}
       export NTFY_PORT=${toString env.ports.ntfy}
       export NTFY_TOPIC=${env.ntfyTopic}
-      exec ${runner}/bin/runner --mode full
+      exec ${runner}/bin/regression-runner
     '';
   }

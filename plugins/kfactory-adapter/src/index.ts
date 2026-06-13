@@ -50,11 +50,14 @@ function workspacesDir(): string {
 
 // Slug shape: `<owner>--<repo>--<4hex>`. Suffix is either random
 // (`randomBytes(2)`, 16-bit space) or a caller-supplied 4-hex naming
-// hint from `extra.slugSuffix`. Segments are [A-Za-z0-9._] only (no
-// hyphens -- `--` is the delimiter). isValidSlug is the load-bearing
-// defense against path traversal; asserted at every boundary that
-// concatenates the slug into a path (configure, create, target, remove).
-const SLUG_RE = /^[A-Za-z0-9._]+--[A-Za-z0-9._]+--[a-f0-9]{4}$/
+// hint from `extra.slugSuffix`. Segments use the git-forge name alphabet
+// [A-Za-z0-9._] plus single hyphens, but a literal `--` inside a segment
+// is rejected (assertSlugSafeSegment) so `--` is exclusively the
+// delimiter -- which keeps both the grammar injective and the identity
+// check exact. isValidSlug is the load-bearing path-traversal defense
+// (no `/` in the alphabet => a slug is always one path component);
+// rationale + decision in docs/spec.md's slug entry.
+const SLUG_RE = /^[A-Za-z0-9._-]+--[A-Za-z0-9._-]+--[a-f0-9]{4}$/
 
 function isValidSlug(name: string): boolean {
   return SLUG_RE.test(name)
@@ -62,9 +65,7 @@ function isValidSlug(name: string): boolean {
 
 // Parse owner + repo from a git URL. Handles https://, git@host:, and
 // file:// forms. Hosted URLs must be exactly /owner/repo(.git); file://
-// test fixtures use the final two path segments. Segments must already
-// match the slug grammar, otherwise distinct repos can collapse to the
-// same slug prefix.
+// test fixtures use the final two path segments.
 function parseOwnerRepo(repoUrl: string): {owner: string; repo: string} {
   const isFileURL = /^file:\/\//i.test(repoUrl)
   const rawPath = repoUrl
@@ -83,33 +84,29 @@ function parseOwnerRepo(repoUrl: string): {owner: string; repo: string} {
     throw new Error(`kfactory: repo URL path must be exactly owner/repo: ${repoUrl}`)
   }
   const [owner, repo] = segments.slice(-2)
-  assertLosslessSlugSegment(owner!, "owner", repoUrl)
-  assertLosslessSlugSegment(repo!, "repo", repoUrl)
+  assertSlugSafeSegment(owner!, "owner", repoUrl)
+  assertSlugSafeSegment(repo!, "repo", repoUrl)
   return {owner, repo}
 }
 
-function assertLosslessSlugSegment(segment: string, label: "owner" | "repo", repoUrl: string): void {
-  if (!/^[A-Za-z0-9._]+$/.test(segment)) {
+function assertSlugSafeSegment(segment: string, label: "owner" | "repo", repoUrl: string): void {
+  // Single hyphens are fine; a literal `--` would alias the delimiter
+  // and break the injective `<owner>--<repo>--<4hex>` decomposition.
+  if (!/^[A-Za-z0-9._-]+$/.test(segment) || segment.includes("--")) {
     throw new Error(
-      `kfactory: ${label} segment cannot be represented losslessly in workspace slug: ${repoUrl}`,
+      `kfactory: ${label} segment not representable in the slug grammar [A-Za-z0-9._-], no '--': ${repoUrl}`,
     )
   }
 }
 
-function parseSlug(slug: string): {owner: string; repo: string; suffix: string} {
-  if (!isValidSlug(slug)) {
-    throw new Error(`kfactory: invalid workspace slug: ${slug}`)
-  }
-  const parts = slug.split("--")
-  return {owner: parts[0]!, repo: parts[1]!, suffix: parts[2]!}
-}
-
 function assertSlugMatchesRepo(slug: string, repoUrl: string): void {
-  const expected = parseOwnerRepo(repoUrl)
-  const actual = parseSlug(slug)
-  if (actual.owner !== expected.owner || actual.repo !== expected.repo) {
+  const {owner, repo} = parseOwnerRepo(repoUrl)
+  // Exact because segments carry no `--`: the prefix is unambiguous and
+  // the trailing 4-hex is the mint suffix.
+  const prefix = `${owner}--${repo}--`
+  if (!slug.startsWith(prefix) || !/^[a-f0-9]{4}$/.test(slug.slice(prefix.length))) {
     throw new Error(
-      `kfactory: workspace slug ${slug} does not match repo owner/repo ${expected.owner}/${expected.repo}`,
+      `kfactory: workspace slug ${slug} does not match repo owner/repo ${owner}/${repo}`,
     )
   }
 }
@@ -148,8 +145,10 @@ function workspaceDir(slug: string): string {
 }
 
 function expectedWorkspaceDir(info: Pick<WorkspaceInfo, "name" | "directory">): string {
-  const {owner, repo, suffix} = parseSlug(info.name)
-  const expected = workspaceDir(`${owner}--${repo}--${suffix}`)
+  if (!isValidSlug(info.name)) {
+    throw new Error(`kfactory: invalid workspace slug: ${info.name}`)
+  }
+  const expected = workspaceDir(info.name)
   if (info.directory !== expected) {
     throw new Error(
       `kfactory: workspace directory mismatch for ${info.name}: ${info.directory} != ${expected}`,

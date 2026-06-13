@@ -13,7 +13,7 @@
     "src"
   ],
   "devDependencies": {
-    "@opencode-ai/plugin": "1.15.11",
+    "@opencode-ai/plugin": "1.17.4",
     "@types/node": "24.12.2",
     "fast-check": "^4.8.0",
     "typescript": "5.8.2"

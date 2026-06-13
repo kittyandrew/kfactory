@@ -37,7 +37,7 @@ the adapter is ~185 LOC of glue".
 - **`workspace-routing.ts` dispatch** -- opencode's per-request middleware
   picks the workspace from `x-opencode-workspace` HTTP header OR
   `?workspace=` query string, looks up `target()`, and either dispatches
-  in-process (`local`) or proxies (`remote`). The bearer-auth patch
+  in-process (`local`) or proxies (`remote`). The workspace-routing patch
   widens this to read the header on non-GET requests too (the SDK only
   rewrites header -> query for GET/HEAD; POST/PUT/DELETE keep the
   header verbatim).
@@ -192,7 +192,8 @@ they understand it before using the contents.
 Authoritative definition: the `tokenFile` Go struct in
 `cmd/kfactory/auth.go` (and the `authFileSchemaVersion` constant next
 to it). The TS reader in `patches/opencode-kfactory-refresh.patch`
-(`AuthFile` interface in the attach.ts hunk) mirrors a SUBSET of the
+(`AuthFile` interface in the patch-added
+`packages/core/src/kfactory-bearer-refresh.ts`) mirrors a SUBSET of the
 fields it actually consumes (`schema_version`, `access_token`,
 `expires_at`); the rest are opaque to TS.
 
@@ -216,13 +217,15 @@ TUI built against the new schema.
 **Asymmetric reader caveat**: there are TWO readers of `auth.json`
 inside the patched opencode process:
 
-  1. `createBearerRefreshFetch` (in `attach.ts`) -- asserts
+  1. `createBearerRefreshFetch` (patch-added
+     `packages/core/src/kfactory-bearer-refresh.ts`, wired in
+     `packages/opencode/src/cli/cmd/attach.ts`) -- asserts
      `schema_version === AUTH_FILE_SCHEMA_VERSION` and throws on
      mismatch. Used to build the dynamic refresh-fetch wrapper.
-  2. `bearerFromCache` (in `server/auth.ts`, called from
-     `ServerAuth.header()`) -- asserts the same schema and token fields.
-     Used to construct the static `Authorization` header at attach setup
-     before the refresh wrapper is wired in.
+  2. `bearerFromCache` (in `packages/opencode/src/server/auth.ts`,
+     called from `ServerAuth.header()`) -- asserts the same schema and
+     token fields. Used to construct the static `Authorization` header
+     at attach setup before the refresh wrapper is wired in.
 
 Both readers fail closed when `OPENCODE_SERVER_BEARER_CACHE_PATH` is
 configured and the cache is missing required fields, malformed, or
@@ -249,6 +252,10 @@ that slug during `configure()` from `extra.repoUrl` plus optional valid
 `extra.slugSuffix`; it does not preserve caller-supplied names as a second
 identity surface. There are NO adapter-side state files -- v1 maintained a
 parallel JSON index; v2 deleted it entirely. The DB row IS the state.
+
+Exception: upstream may reset its experimental workspace tables in a
+migration (v1.16.0 did) -- a documented operator transition, never a
+kfactory patch; see the v1.17.4 bump entry in the decisions log.
 
 `remove()` deletes the on-disk clone. Adapter cleanup must succeed before
 opencode deletes the WorkspaceTable row or related session/sync state. A
@@ -341,6 +348,45 @@ v2 (current) decisions are kept here; the v1 design's
 process-per-workspace architecture is gone and its history isn't
 relevant to a consumer.
 
+- **opencode v1.17.4 bump (2026-06): durable decisions.**
+  - The v2 API (`GET /api/session?workspace=`) natively filters
+    sessions by workspace_id and is a future migration target for
+    `findMostRecentSession`, but NOT a drop-in (orders by
+    time_created, cursor envelope, no roots filter); deferred.
+  - Plugin event delivery is location-filtered upstream
+    (`event.location?.directory === ctx.directory`); the gates for
+    this on every bump are the `[5] ntfy idle` Docker regression phase
+    plus the in-process unit tests
+    (`nix/unit/opencode/ntfy-plugin-inprocess.test.ts` publishes the
+    REAL upstream event definitions through `EventV2Bridge`, so the
+    location filter is on the tested path).
+  - Upstream's native PTY (handlers/pty.ts) is the desktop terminal
+    pane: no LLM tools, no notifyOnExit wakeup, in-memory lifecycle
+    state destroyed on exit. NOT a replacement for @josxa/opencode-pty
+    or the transcript-parsing heal/ntfy passes. The pty.created/exited
+    EventV2 events + SDK /pty endpoints are useful inputs for the
+    planned kfactory PTY bridge (separate workstream).
+  - Upstream migration 20260604172448 (first shipped in v1.16.0) wipes
+    workspace rows + session.workspace_id -- upstream's reset of its
+    experimental surface. kfactory ACCEPTS the reset rather than
+    carrying a migration carve-out patch: workspace rows are
+    re-creatable state, and forking upstream's migration history is
+    worse than a one-time transition. This is the standing policy for
+    destructive upstream migrations (rules 020/022 point here).
+    **Operator action when upgrading a pre-v1.16 deployment:** clones
+    survive on disk while their DB rows vanish, so before the first
+    scheduled tick fires, remove the stale clone dirs under the
+    workspaces root (or at minimum the `*--<task-id>` ones -- a
+    re-created stable workspace collides on the surviving dir
+    otherwise), then re-dispatch ad-hoc workspaces as needed.
+    Pre-upgrade sessions keep their content but lose workspace scoping.
+  - Subagent permission semantics changed upstream (subagents use
+    their own permission set rather than inheriting parent denies,
+    anomalyco/opencode 3ad6923c6) -- the checked-in permission ruleset
+    in `nix/shared/opencode-kfactory-base.jsonc` applies per-agent, so
+    the supervision pause points hold; noted for operators authoring
+    custom agent definitions.
+
 - **Single `opencode serve` per host (the pivot).** opencode already
   multi-tenants via `InstanceStore.provide`. Spawning a process per
   workspace duplicates that machinery and brings every cost of process
@@ -374,11 +420,11 @@ relevant to a consumer.
   tick --prompt` stay inline text. The zsh completion offers file paths only
   after the dispatch prompt argument already looks path-shaped.
 
-- **Four-patch opencode stack.** Upstream opencode v1.15.x's
-  `opencode attach` only knows HTTP Basic auth and its workspace routing
-  defaults to project scope. Four patches, applied in order:
+- **Four-patch opencode stack.** Upstream opencode's `opencode attach`
+  only knows HTTP Basic auth and its workspace routing defaults to
+  project scope. Four patches, applied in order:
   - `opencode-bun-version-relax.patch` -- bun-version build workaround. opencode
-    v1.15.5+ pins `packageManager: "bun@1.3.14"` and the build script
+    pins `packageManager: "bun@1.3.14"` and the build script
     enforces `^${version}`. nixpkgs currently ships bun 1.3.13 because
     bun 1.3.14 produces segfaulting binaries when used to build
     downstream packages (see nixpkgs PR #519796, in DRAFT). opencode's
@@ -386,32 +432,47 @@ relevant to a consumer.
     calls in the runtime path, just a future-proofing pin against the
     upcoming Rust-rewrite Bun 2.x line. This patch relaxes the range
     to `>=1.3.13` so the build accepts the bun nixpkgs has. Drop the
-    patch when nixpkgs ships bun 1.3.14+.
-  - `opencode-static-bearer.patch` -- generic client-side Bearer header
-    plumbing: `--bearer` / `OPENCODE_SERVER_BEARER` for Bearer attach.
-    Server-side opencode still does not validate Bearer; deployments use
-    this with a JWT-validating reverse proxy.
+    patch when nixpkgs ships bun 1.3.14+. Re-verified at v1.17.4
+    (packages/script/src/index.ts unchanged; still no new bun-API usage).
+  - `opencode-static-bearer.patch` -- env-only client-side Bearer header
+    plumbing: `OPENCODE_SERVER_BEARER` makes ServerAuth.header() emit
+    Bearer instead of Basic. Server-side opencode still does not validate
+    Bearer; deployments use this with a JWT-validating reverse proxy.
   - `opencode-workspace-routing.patch` -- upstreamable workspace
-    correctness subset: `--workspace` flag plumbed through `tui()` into `SDKProvider`,
-    `ProjectProvider`, AND `validateSession` (so the pre-attach probe
-    runs against the requested workspace); workspace-routing header
-    fallback for non-GET requests (the SDK only rewrites header ->
-    query for GET/HEAD); `Session.listGlobal` filter by workspace_id
-    so `--continue` and session-list scope to the attached workspace
-    (sidesteps upstream's project_id-based scoping, which collapsed
-    when multiple workspaces shared a project_id); plugin-adapter
-    registration scoped to `ProjectID.global` rather than the boot
-    instance's `ctx.project.id` (so per-request workspaces can find
-    the adapter regardless of which project the plugin loader ran in).
+    correctness subset: `--workspace` flag plumbed through the attach
+    command into the standalone TUI package's `SDKProvider`,
+    `ProjectProvider` (`packages/tui/src/`), AND `validateSession` (so
+    the pre-attach probe runs against the requested workspace);
+    workspace-routing header fallback for non-GET requests (the SDK
+    only rewrites header -> query for GET/HEAD); `Session.list` +
+    service `listGlobal` filter by workspace_id so `--continue` and
+    session-list scope to the attached workspace (sidesteps upstream's
+    project_id-based scoping, which collapsed when multiple workspaces
+    shared a project_id); `/sync/start?workspace=` targeting;
+    plugin-adapter registration scoped to `ProjectV2.ID.global` rather
+    than the boot instance's `ctx.project.id` (so per-request
+    workspaces can find the adapter regardless of which project the
+    plugin loader ran in); and workspace lifecycle correctness
+    (create-failure deletes the just-inserted row; remove() runs the
+    adapter fail-closed BEFORE deleting sessions/metadata).
   - `opencode-kfactory-refresh.patch` -- kfactory-specific deployment
     glue, applied on top: `OPENCODE_SERVER_BEARER_CACHE_PATH` env +
     `bearerFromCache()`; subprocess `kfactory auth refresh` spawn via
     `createBearerRefreshFetch`; shared auth.json schema with
     `schema_version` assertion; toast subscription for refresh hints.
+    The fetch wrapper + hint channel live in a patch-added module
+    `packages/core/src/kfactory-bearer-refresh.ts` -- placement
+    rationale in the module header (the wiring and toast sides only
+    share `@opencode-ai/core` after upstream's TUI extraction).
   Maintained locally until the upstreamable workspace-routing work lands
   upstream. Verified on every opencode bump by the
   `factory-opencode-patch-applies` flake check (all re-diffable patches
-  must apply cleanly in order).
+  must apply cleanly in order). The v1.15.11 -> v1.17.4 bump was a
+  full re-port (TUI extraction moved five patched files; `WorkspaceID`/
+  `ProjectID` schemas became `WorkspaceV2.ID`/`ProjectV2.ID`; session
+  listGlobal moved from a module generator into the service layer) --
+  but zero hunks were absorbed upstream; every gap kfactory patches
+  still exists at v1.17.4.
 
 - **Subprocess-delegated token refresh (kfactory owns; TUI spawns).**
   kfactory (Go) is the single source of truth for OIDC token refresh:
@@ -425,16 +486,17 @@ relevant to a consumer.
   Ink alternate-screen mid-render), and branches on the exit code
   (`exitOK`/`exitNotLoggedIn`/`exitOther` per `cmd/kfactory/exit.go`).
   Refresh outcomes feed into an in-process pub/sub channel
-  (`refreshHintSubscribers`); an `onMount` subscription in `app.tsx`
-  surfaces a single error toast (`toast.show({variant: "error",
-  duration: 8000, ...})`) per failure mode per TUI session for
-  `not_logged_in` / `spawn_error` / `other_error`. Concurrent
-  attaches against the same operator desktop are serialized by
-  kfactory's flock regardless of which process initiated the refresh.
-  This keeps refresh logic in one place (Go, with its own tests) and
-  shrinks the TS patch vs an alternative file-cache-in-TS design. See
-  `cmd/kfactory/auth.go:runAuthRefresh` and the TS fetch wrapper at
-  `packages/opencode/src/cli/cmd/tui/attach.ts:createBearerRefreshFetch`
+  (`refreshHintSubscribers`); an `onMount` subscription in
+  `packages/tui/src/app.tsx` surfaces a single error toast
+  (`toast.show({variant: "error", duration: 8000, ...})`) per failure
+  mode per TUI session for `not_logged_in` / `spawn_error` /
+  `other_error`. Concurrent attaches against the same operator desktop
+  are serialized by kfactory's flock regardless of which process
+  initiated the refresh. This keeps refresh logic in one place (Go,
+  with its own tests) and shrinks the TS patch vs an alternative
+  file-cache-in-TS design. See `cmd/kfactory/auth.go:runAuthRefresh`
+  and the TS fetch wrapper in the patch-added
+  `packages/core/src/kfactory-bearer-refresh.ts`
   in `patches/opencode-kfactory-refresh.patch`.
 
 - **Real IdP auth integration owns expired-token refresh coverage.**
@@ -454,17 +516,28 @@ relevant to a consumer.
 - **Bearer token is env-only / cache-file-only (never on argv).**
   kfactory passes `OPENCODE_SERVER_BEARER_CACHE_PATH` to the TUI; the
   TUI reads the current access token from that file via
-  `bearerFromCache` in the patched `server/auth.ts`. No CLI flag, no
-  `OPENCODE_SERVER_BEARER` env (the patch's `--bearer` flag still
-  exists for non-cache-file users but kfactory doesn't use it). Token
-  never appears in `/proc/<pid>/cmdline`, and the cache-file path
-  means the SDK's first request after a refresh always sees the
-  freshest token.
+  `bearerFromCache` in the patched `server/auth.ts`. There is no CLI
+  flag at all (a `--bearer` flag existed in earlier patch revisions and
+  was cut as dead surface; `OPENCODE_SERVER_BEARER` remains as the
+  minimal generic seam + test seam). Token never appears in
+  `/proc/<pid>/cmdline`, and the cache-file path means the SDK's first
+  request after a refresh always sees the freshest token.
 
-- **Slug = `<owner>--<repo>--<4hex>`.** 4hex random suffix gives
-  65536 slug-space per repo; birthday paradox at ~256 workspaces but
-  irrelevant at single-operator scale. Decouples slug from git state
-  (branch can change after clone). Round-trips via `info.name`.
+- **Slug = `<owner>--<repo>--<4hex>`, never decomposed.** 4hex random
+  suffix gives 65536 slug-space per repo; birthday paradox at ~256
+  workspaces but irrelevant at single-operator scale. Decouples slug
+  from git state (branch can change after clone). Round-trips via
+  `info.name`. Segments use the git-forge name alphabet
+  `[A-Za-z0-9._-]` -- hyphens included, so real-world repos like
+  `acme/my-cool-repo` dispatch fine. That makes `--` an unreliable
+  split point (a repo named `a--b` is legal), so the slug is treated
+  as opaque: the adapter validates the whole-slug shape and
+  reconstructs the expected `<owner>--<repo>--` prefix from the repo
+  URL for identity checks instead of parsing the slug back apart. The
+  4-hex suffix stays unambiguous (always the trailing `--<4hex>`),
+  which is what `kfactory tick`'s suffix matching and scheduled-task
+  naming anchor on. The e2e fixture repo is named `test-repo`
+  deliberately so hyphen support stays behaviorally gated.
 
 - **SQLite heal on boot for orphan assistant messages.** Process
   restart / OOM / SIGKILL skips opencode's graceful `time.completed`
@@ -503,7 +576,7 @@ relevant to a consumer.
      `x-opencode-workspace` header.
 
   Sessions get scoped by the workspace they actually belong to,
-  independent of project_id. ~30 LOC TS in the bearer-auth patch.
+  independent of project_id. ~30 LOC TS in the workspace-routing patch.
   Upstream-PR-worthy.
 
   Verification trail:
@@ -514,7 +587,7 @@ relevant to a consumer.
     which goes through `listGlobal`. The TUI goes through `listByProject`.
     The first deployment hit this gap (same session on every
     `kfactory attach`) and the harness regression now covers both
-    paths in step `[4b/6]` of `dev-test.nix`. The adversarial probe
+    paths in the Go regression runner (phase `[4b] session isolation`). The adversarial probe
     (mismatched x-opencode-workspace header + directory) confirms the
     workspace header wins.
 
@@ -714,7 +787,7 @@ relevant to a consumer.
     drives enumeration.
   - `?workspace=<id>` query and `x-opencode-workspace` header routing
     semantics in workspace-routing.ts (the SDK only rewrites the
-    header to a query string on GET/HEAD; the bearer-auth patch makes
+    header to a query string on GET/HEAD; the workspace-routing patch makes
     the server read both for all methods).
   - `WorkspaceAdapter.remove` caller set. The plugin's `remove()`
     does `rm -rf` of the workspace directory, trusting opencode to
@@ -723,6 +796,12 @@ relevant to a consumer.
     calls `remove()` from a different path (orphan GC, rollback after
     failed create, etc.) would silently wipe clones contrary to the
     persistence contract (§5). Audit the call sites on every bump.
+  - v1 `message` rows as projections. At v1.17.4 the `event` table is
+    authoritative for the v2 system and `message`/`session_message`
+    are write-time projections with no boot-time rebuild -- heal's
+    direct row stamps (`time.completed`, `MessageAbortedError`) hold.
+    A future upstream projection REBUILD would silently revert healed
+    rows; check for re-projection paths on every bump.
 
 - **No slash commands; permission rules ARE the supervision
   mechanism.** Earlier designs had `/commit` and `/yield` slash
@@ -778,6 +857,17 @@ relevant to a consumer.
   kfactory does not list workspaces after a generic create error and infer
   success from a matching row.
 
+  Since opencode v1.17.x, `POST /session/<id>/prompt_async` admits input
+  through an event-sourced queue (anomalyco/opencode#30785), so the user
+  message is no longer synchronously readable when the request returns.
+  The lock holder therefore confirms its own first-run prompt is visible
+  in opencode state (`confirmFirstRunVisible` in `cmd/kfactory/tick.go`,
+  bounded poll) BEFORE releasing the per-task lock -- restoring the
+  invariant "lock released => first-run completion observable" that flock
+  waiters depend on. Verified by the `[8b] scheduled tick concurrent
+  first-run` regression phase (8 concurrent fires converge to exactly one
+  initial prompt).
+
 - **Tests are checks-first.** `nix flake check` is the primary verification
   surface. Durable harnesses should be exposed as flake checks, either
   individual checks or grouped aggregate checks; local helper apps may
@@ -802,13 +892,33 @@ relevant to a consumer.
   "what's stuck", recovery answers "what to do about it", neither
   half is useful alone.
 
-- **`scheduledTasks` + `recovery` as the only NixOS modules.** Two
+- **`factoryGuest` NixOS module + bundled microvm dev VM.** The
+  opencode-serve unit shape proven in production (system PATH for the
+  adapter's/LLM's spawns, journald stderr, WorkingDirectory pinned to
+  the worker home for stable adapter project-scoping, cold-boot retry
+  budget, RequiresMountsFor on the state dir, optional EnvironmentFile
+  secrets) is extracted into `modules/factory-guest.nix` behind options
+  (user/group/state layout/bind/port/extra env + unit deps), with the
+  recovery lifecycle wired by default and the directory layout owned by
+  tmpfiles (a prestart cannot bootstrap its own WorkingDirectory --
+  systemd applies it to ExecStartPre too). Deployments import
+  `nixosModules.factoryGuest` and add hypervisor/network/secrets/persona
+  on top; the bundled `nix/dev-vm/` composes the same module with
+  microvm.nix's qemu user-mode networking (rootless, loopback
+  port-forwards on identical port numbers so the in-guest Keycloak's
+  issuer URL validates from both sides) for interactive web + TUI
+  testing. Boot-verified: `/global/health` and the workspace API
+  respond through the forwards; `nix run .#dev-vm-login` exercises the
+  real device flow against the same realm fixture as the Keycloak flake
+  check.
+
+- **`scheduledTasks` + `recovery` as the deployment-wiring modules.** Two
   pieces of the deployment surface are intrinsically NixOS-shaped:
   per-task systemd timer generation, and ExecStartPre/ExecStartPost
   drop-ins on the opencode-serve unit. Both surface
   attribute-schemas that read naturally as NixOS options. The CLI
   defines the JSON config schema; the module emits JSON the CLI
-  accepts. Everything else stays module-free -- operators wire the unified
+  accepts. The proxy/secrets/host layer above stays module-free -- operators wire the unified
   runtime and oauth2-proxy sibling into their own host/reverse-proxy configs
   (per the "no Caddyfile / no docker-compose" stance in the README).
 
@@ -819,7 +929,7 @@ relevant to a consumer.
   needs a postinstall-downloaded native binary that opencode's
   `bun install --ignore-scripts` skips). A baseline-diff filter
   excludes opencode-upstream noise (e.g. missing `@types/mime-types`
-  in `packages/core/src/filesystem.ts`); any new patch-induced type
+  in `packages/core/src/fs-util.ts`); any new patch-induced type
   error fails the check. Closes the type-semantic drift gap the
   original v1 of this spec listed as frontier work.
 
@@ -885,7 +995,8 @@ plugins/opencode-pty/               third-party carrier (manifest-only) for
                                     by the unified runtime (see rule 050)
   package.json + package-lock.json    declares @josxa/opencode-pty + locks transitive resolution
                                       (NO opencode-pty source in our tree; no src/)
-patches/                            opencode-static-bearer.patch
+patches/                            opencode-bun-version-relax.patch
+                                    + opencode-static-bearer.patch
                                     + opencode-workspace-routing.patch
                                     + opencode-kfactory-refresh.patch
                                     + oauth2-proxy-pkce-no-secret.patch

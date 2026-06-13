@@ -1,5 +1,26 @@
 {
   "nodes": {
+    "microvm": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "spectrum": "spectrum"
+      },
+      "locked": {
+        "lastModified": 1780588968,
+        "narHash": "sha256-zQk+GqLO+T9taIl1UUt3swvaOksWJxL7PL8K0+Fc/Hs=",
+        "owner": "astro",
+        "repo": "microvm.nix",
+        "rev": "4d3fb17437944ea57eef2b9e6108ca777b1209ca",
+        "type": "github"
+      },
+      "original": {
+        "owner": "astro",
+        "repo": "microvm.nix",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1779560665,
@@ -23,24 +44,41 @@
         ]
       },
       "locked": {
-        "lastModified": 1779854459,
-        "narHash": "sha256-SIRE+x1YCSAX1L89237RN9owJkC4hgCIy1Q93Iy9GzM=",
+        "lastModified": 1781230767,
+        "narHash": "sha256-ppWpyi1iGmL5UF6FuERf7tnN9kRkphaiyN3IoHcFY6A=",
         "owner": "anomalyco",
         "repo": "opencode",
-        "rev": "d2bd7eaad54bf39de04bf6e279d5953bd1666574",
+        "rev": "abda3515f444c4d28a98953d153c5a3e1892d3d4",
         "type": "github"
       },
       "original": {
         "owner": "anomalyco",
-        "ref": "v1.15.11",
+        "ref": "v1.17.4",
         "repo": "opencode",
         "type": "github"
       }
     },
     "root": {
       "inputs": {
+        "microvm": "microvm",
         "nixpkgs": "nixpkgs",
         "opencode": "opencode"
+      }
+    },
+    "spectrum": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1778940603,
+        "narHash": "sha256-voSM8dZNlaOWN3kbYFky+FNY6fFQOEw0xF+ZMpZKkCQ=",
+        "ref": "refs/heads/main",
+        "rev": "367dd227f539267eae2b62770b4c17b88ac8c1f1",
+        "revCount": 1265,
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
       }
     }
   },

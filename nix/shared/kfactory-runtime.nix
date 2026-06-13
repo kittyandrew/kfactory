@@ -53,7 +53,6 @@
     paths = [kfactoryCli wrappedOpencode];
     passthru = {
       opencode = wrappedOpencode;
-      opencodeConfig = bundledConfig;
       configFile = bundledConfig;
       inherit plugins thirdPartyPlugins opencodeHeal opencodeSyncKick;
     };

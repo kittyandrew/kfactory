@@ -2,50 +2,31 @@ Workspace attach/routing/session/sync correctness plus global plugin adapters.
 
 Adds the workspace correctness slice needed by kfactory:
 
-  - opencode attach --workspace propagates through tui() into SDKProvider and ProjectProvider.
+  - opencode attach --workspace propagates through the attach command into
+    packages/tui's SDKProvider and ProjectProvider.
   - validateSession honors the selected workspace.
-  - workspace-routing middleware reads x-opencode-workspace for all methods, not only ?workspace=.
-  - Session.list and Session.listGlobal use workspace_id as the primary scope when workspaceID is explicit.
-  - /experimental/session forwards ?workspace= into Session.listGlobal.
+  - workspace-routing middleware reads x-opencode-workspace for all methods,
+    not only ?workspace= (one selector serves the v1 and /api/ paths).
+  - Session.list and the service listGlobal use workspace_id as the primary
+    scope when a workspace is explicit.
+  - /experimental/session forwards ?workspace= into listGlobal.
   - /sync/start?workspace= targets the exact workspace after restart.
-  - plugin workspace adapters register globally and lookup falls back to ProjectID.global while preserving project-specific overrides.
+  - plugin workspace adapters register globally and lookup falls back to
+    ProjectV2.ID.global while preserving project-specific overrides.
+  - workspace lifecycle correctness: create-failure deletes the
+    just-inserted row; remove() runs the adapter fail-closed FIRST.
 
-This patch intentionally does not include Bearer auth plumbing; see opencode-static-bearer.patch. The local stack applies that patch first, so the attach.ts option-chain hunk is stack-positioned after `--bearer`. This patch also does not include kfactory auth-cache refresh glue; see opencode-kfactory-refresh.patch.
+This patch contains no kfactory-specific glue; see
+opencode-kfactory-refresh.patch for the auth-cache layer applied on top.
 
-diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index b61ee80..aa861db 100644
---- a/packages/opencode/src/cli/cmd/tui/app.tsx
-+++ b/packages/opencode/src/cli/cmd/tui/app.tsx
-@@ -162,6 +162,7 @@ type TuiInput = {
-   config: TuiConfig.Resolved
-   renderer: CliRenderer
-   onSnapshot?: () => Promise<string[]>
-+  workspace?: string
-   directory?: string
-   fetch?: typeof fetch
-   headers?: RequestInit["headers"]
-@@ -244,11 +245,12 @@ async function mountTui(input: TuiInput & { keymap: ReturnType<typeof createDefa
-                       <SDKProvider
-                         url={input.url}
-                         directory={input.directory}
-+                        workspace={input.workspace}
-                         fetch={input.fetch}
-                         headers={input.headers}
-                         events={input.events}
-                       >
--                        <ProjectProvider>
-+                        <ProjectProvider workspace={input.workspace}>
-                           <SyncProvider>
-                             <SyncProviderV2>
-                               <ThemeProvider mode={mode}>
-diff --git a/packages/opencode/src/cli/cmd/tui/attach.ts b/packages/opencode/src/cli/cmd/tui/attach.ts
-index 5e0eb36..0889944 100644
---- a/packages/opencode/src/cli/cmd/tui/attach.ts
-+++ b/packages/opencode/src/cli/cmd/tui/attach.ts
-@@ -48,6 +48,11 @@
-         alias: ["b"],
+diff --git a/packages/opencode/src/cli/cmd/attach.ts b/packages/opencode/src/cli/cmd/attach.ts
+index 278cee8..94cb785 100644
+--- a/packages/opencode/src/cli/cmd/attach.ts
++++ b/packages/opencode/src/cli/cmd/attach.ts
+@@ -41,6 +41,11 @@ export const AttachCommand = cmd({
+         alias: ["u"],
          type: "string",
-         describe: "bearer token (defaults to OPENCODE_SERVER_BEARER); overrides password/username",
+         describe: "basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')",
 +      })
 +      .option("workspace", {
 +        alias: ["w"],
@@ -53,69 +34,27 @@ index 5e0eb36..0889944 100644
 +        describe: "experimental workspace ID for /experimental/workspace dispatch (x-opencode-workspace header)",
        }),
    handler: async (args) => {
-     const unguard = win32InstallCtrlCGuard()
-@@ -82,6 +87,7 @@
-           url: args.url,
-           sessionID: args.session,
-           directory,
-+          workspace: args.workspace,
-           headers,
-         })
-       } catch (error) {
-@@ -102,6 +108,7 @@
+     const { TuiConfig } = await import("@/config/tui")
+@@ -68,6 +73,7 @@ export const AttachCommand = cmd({
+         url: args.url,
+         sessionID: args.session,
+         directory,
++        workspace: args.workspace,
+         headers,
+       })
+     } catch (error) {
+@@ -90,6 +96,7 @@ export const AttachCommand = cmd({
            fork: args.fork,
          },
          directory,
 +        workspace: args.workspace,
          headers,
-       })
-       await handle.done
-diff --git a/packages/opencode/src/cli/cmd/tui/context/project.tsx b/packages/opencode/src/cli/cmd/tui/context/project.tsx
-index 22dd94b..f4aa162 100644
---- a/packages/opencode/src/cli/cmd/tui/context/project.tsx
-+++ b/packages/opencode/src/cli/cmd/tui/context/project.tsx
-@@ -8,7 +8,7 @@ type WorkspaceStatus = "connected" | "connecting" | "disconnected" | "error"
-
- export const { use: useProject, provider: ProjectProvider } = createSimpleContext({
-   name: "Project",
--  init: () => {
-+  init: (props: { workspace?: string } = {}) => {
-     const sdk = useSDK()
-
-     const defaultPath = {
-@@ -27,7 +27,7 @@ export const { use: useProject, provider: ProjectProvider } = createSimpleContex
-         path: defaultPath,
-       },
-       workspace: {
--        current: undefined as string | undefined,
-+        current: props.workspace,
-         list: [] as Workspace[],
-         status: {} as Record<string, WorkspaceStatus>,
-       },
-diff --git a/packages/opencode/src/cli/cmd/tui/context/sdk.tsx b/packages/opencode/src/cli/cmd/tui/context/sdk.tsx
-index 96fa544..31c0e0b 100644
---- a/packages/opencode/src/cli/cmd/tui/context/sdk.tsx
-+++ b/packages/opencode/src/cli/cmd/tui/context/sdk.tsx
-@@ -13,6 +13,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
-   name: "SDK",
-   init: (props: {
-     url: string
-+    workspace?: string
-     directory?: string
-     fetch?: typeof fetch
-     headers?: RequestInit["headers"]
-@@ -26,6 +27,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
-         baseUrl: props.url,
-         signal: abort.signal,
-         directory: props.directory,
-+        experimental_workspaceID: props.workspace,
-         fetch: props.fetch,
-         headers: props.headers,
-       })
-diff --git a/packages/opencode/src/cli/cmd/tui/validate-session.ts b/packages/opencode/src/cli/cmd/tui/validate-session.ts
+       }),
+     )
+diff --git a/packages/opencode/src/cli/tui/validate-session.ts b/packages/opencode/src/cli/tui/validate-session.ts
 index 31329a6..7edd37c 100644
---- a/packages/opencode/src/cli/cmd/tui/validate-session.ts
-+++ b/packages/opencode/src/cli/cmd/tui/validate-session.ts
+--- a/packages/opencode/src/cli/tui/validate-session.ts
++++ b/packages/opencode/src/cli/tui/validate-session.ts
 @@ -7,6 +7,7 @@ const decodeSessionID = Schema.decodeUnknownSync(SessionID)
  export async function validateSession(input: {
    url: string
@@ -133,164 +72,163 @@ index 31329a6..7edd37c 100644
      headers: input.headers,
    }).session.get({ sessionID }, { throwOnError: true })
 diff --git a/packages/opencode/src/control-plane/adapters/index.ts b/packages/opencode/src/control-plane/adapters/index.ts
-index e5fa137..48ddcc4 100644
+index 0b052f5..f3f9503 100644
 --- a/packages/opencode/src/control-plane/adapters/index.ts
 +++ b/packages/opencode/src/control-plane/adapters/index.ts
 @@ -1,4 +1,4 @@
--import type { ProjectID } from "@/project/schema"
-+import { ProjectID } from "@/project/schema"
+-import type { ProjectV2 } from "@opencode-ai/core/project"
++import { ProjectV2 } from "@opencode-ai/core/project"
  import type { WorkspaceAdapter, WorkspaceAdapterEntry } from "../types"
  import { WorktreeAdapter } from "./worktree"
-
-@@ -9,7 +9,12 @@ const BUILTIN: Record<string, WorkspaceAdapter> = {
- const state = new Map<ProjectID, Map<string, WorkspaceAdapter>>()
-
- export function getAdapter(projectID: ProjectID, type: string): WorkspaceAdapter {
+ 
+@@ -9,7 +9,10 @@ const BUILTIN: Record<string, WorkspaceAdapter> = {
+ const state = new Map<ProjectV2.ID, Map<string, WorkspaceAdapter>>()
+ 
+ export function getAdapter(projectID: ProjectV2.ID, type: string): WorkspaceAdapter {
 -  const custom = state.get(projectID)?.get(type)
 +  // Prefer a project-specific registration; fall back to globally-
 +  // scoped adapters (the canonical scope plugins use, since plugin
 +  // loaders run once per opencode-instance and serve many projects).
-+  // Matches the comment on `registerAdapter` below: "If you want to
-+  // install a global one pass `ProjectID.global`."
-+  const custom = state.get(projectID)?.get(type) ?? state.get(ProjectID.global)?.get(type)
++  const custom = state.get(projectID)?.get(type) ?? state.get(ProjectV2.ID.global)?.get(type)
    if (custom) return custom
-
+ 
    const builtin = BUILTIN[type]
-@@ -28,6 +33,7 @@ export function listAdapters(projectID: ProjectID): WorkspaceAdapterEntry[] {
-
- export function registeredAdapters(projectID: ProjectID): [string, WorkspaceAdapter][] {
+@@ -28,6 +31,7 @@ export function listAdapters(projectID: ProjectV2.ID): WorkspaceAdapterEntry[] {
+ 
+ export function registeredAdapters(projectID: ProjectV2.ID): [string, WorkspaceAdapter][] {
    const adapters = new Map(Object.entries(BUILTIN))
-+  for (const [type, adapter] of state.get(ProjectID.global)?.entries() ?? []) adapters.set(type, adapter)
++  for (const [type, adapter] of state.get(ProjectV2.ID.global)?.entries() ?? []) adapters.set(type, adapter)
    for (const [type, adapter] of state.get(projectID)?.entries() ?? []) adapters.set(type, adapter)
    return [...adapters.entries()]
  }
 diff --git a/packages/opencode/src/control-plane/workspace.ts b/packages/opencode/src/control-plane/workspace.ts
-index 9f44d22..42e37f4 100644
+index 76aab6e..3f42390 100644
 --- a/packages/opencode/src/control-plane/workspace.ts
 +++ b/packages/opencode/src/control-plane/workspace.ts
-@@ -163,7 +163,10 @@ export interface Interface {
+@@ -159,7 +159,10 @@ export interface Interface {
      signal?: AbortSignal,
      timeout?: number,
    ) => Effect.Effect<void, WaitForSyncError>
--  readonly startWorkspaceSyncing: (projectID: ProjectID) => Effect.Effect<void>
+-  readonly startWorkspaceSyncing: (projectID: ProjectV2.ID) => Effect.Effect<void>
 +  readonly startWorkspaceSyncing: (
-+    projectID: ProjectID,
-+    opts?: { workspaceID: WorkspaceID },
++    projectID: ProjectV2.ID,
++    opts?: { workspaceID: WorkspaceV2.ID },
 +  ) => Effect.Effect<void>
  }
-
+ 
  export class Service extends Context.Service<Service, Interface>()("@opencode/Workspace") {}
-@@ -575,7 +578,13 @@ export const layer = Layer.effect(
+@@ -551,7 +554,23 @@ export const layer = Layer.effect(
          OTEL_RESOURCE_ATTRIBUTES: process.env.OTEL_RESOURCE_ATTRIBUTES,
        }
-
+ 
 -      yield* WorkspaceAdapterRuntime.create(adapter, config, env)
++      // kfactory: a failed adapter create must not leave an orphaned
++      // WorkspaceTable row behind -- the row is inserted above before the
++      // adapter runs, and a stale row makes retries collide on the stable
++      // workspace ID (scheduled ticks) while pointing at a directory that
++      // was never cloned.
 +      yield* WorkspaceAdapterRuntime.create(adapter, config, env).pipe(
 +        Effect.catchCause((cause) =>
-+          db((db) => db.delete(WorkspaceTable).where(eq(WorkspaceTable.id, info.id)).run()).pipe(
-+            Effect.andThen(Effect.failCause(cause)),
-+          ),
++          db
++            .delete(WorkspaceTable)
++            .where(eq(WorkspaceTable.id, info.id))
++            .run()
++            .pipe(
++              Effect.orDie,
++              Effect.andThen(Effect.failCause(cause)),
++            ),
 +        ),
 +      )
        yield* Effect.all(
          [
            waitEvent({
-@@ -904,34 +913,26 @@ export const layer = Layer.effect(
-     const remove = Effect.fn("Workspace.remove")(function* (id: WorkspaceID) {
-+      const row = yield* db((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get())
+@@ -799,6 +818,17 @@ export const layer = Layer.effect(
+     })
+ 
+     const remove = Effect.fn("Workspace.remove")(function* (id: WorkspaceV2.ID) {
++      const row = yield* db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get().pipe(Effect.orDie)
 +      if (!row) return
 +
++      // kfactory: adapter cleanup runs FIRST and failures propagate (as
++      // defects) BEFORE any session/metadata deletion. opencode deletes
++      // the DB row only after remove() resolves; swallowing an adapter
++      // failure here would orphan the on-disk clone while dropping the
++      // row that identifies it (docs/spec.md §5 persistence contract).
 +      const info = fromRow(row)
 +      yield* WorkspaceAdapterRuntime.remove(info)
 +
-       const sessions = yield* db((db) =>
-         db
-           .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
-           .from(SessionTable)
-           .where(eq(SessionTable.workspace_id, id))
-           .all(),
-       )
-       const sessionIDs = new Set(sessions.map((sessionInfo) => sessionInfo.id))
-       yield* Effect.forEach(
-         sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID)),
-         (sessionInfo) =>
-           session.remove(sessionInfo.id).pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.void)),
+       const sessions = yield* db
+         .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
+         .from(SessionTable)
+@@ -813,19 +843,8 @@ export const layer = Layer.effect(
          { discard: true },
        )
-
--      const row = yield* db((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get())
+ 
+-      const row = yield* db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get().pipe(Effect.orDie)
 -      if (!row) return
 -
        yield* stopSync(id)
-
+ 
 -      const info = fromRow(row)
 -      yield* Effect.catchCause(
 -        Effect.gen(function* () {
 -          yield* WorkspaceAdapterRuntime.remove(info)
 -        }),
--        () =>
--          Effect.sync(() => {
--            log.error("adapter not available when removing workspace", { type: row.type })
--          }),
+-        () => Effect.logError("adapter not available when removing workspace", { type: row.type }),
 -      )
 -
-       yield* db((db) => db.delete(WorkspaceTable).where(eq(WorkspaceTable.id, id)).run())
+       yield* db.delete(WorkspaceTable).where(eq(WorkspaceTable.id, id)).run().pipe(Effect.orDie)
        return info
      })
-@@ -982,12 +983,33 @@ export const layer = Layer.effect(
+@@ -866,11 +885,28 @@ export const layer = Layer.effect(
        )
      })
-
--    const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (projectID: ProjectID) {
+ 
+-    const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (projectID: ProjectV2.ID) {
 +    const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (
-+      projectID: ProjectID,
-+      opts?: { workspaceID: WorkspaceID },
++      projectID: ProjectV2.ID,
++      opts?: { workspaceID: WorkspaceV2.ID },
 +    ) {
 +      // kfactory: when opts.workspaceID is set (caller routed the request
 +      // to a specific workspace via the workspace-routing middleware),
-+      // filter by workspace_id instead of project_id. Same shape as the
-+      // listByProject divergence: WorkspaceTable rows from kfactory-adapter
-+      // carry project_id="global" but the routed instance's project.id is
-+      // the worktree-hashed value -- a project_id query against that hash
-+      // matches 0 rows, the iteration below never runs, setStatus never
-+      // fires, and the in-memory connections Map (the source of
-+      // /experimental/workspace/status) stays unpopulated for that
-+      // workspace. Restart is the common trigger because the create-path's
-+      // implicit startSync seeds the Map at INSERT, but the underlying
-+      // query is broken for any caller of /sync/start?workspace= once the
-+      // workspace isn't already in the Map. Workspace_id is itself a
-+      // unique scope, so dropping project_id when it's set is safe.
-       const rows = yield* db((db) =>
-         db
-           .selectDistinct({ workspace: WorkspaceTable })
-           .from(WorkspaceTable)
--          .where(eq(WorkspaceTable.project_id, projectID))
-+          .where(
-+            opts?.workspaceID
-+              ? eq(WorkspaceTable.id, opts.workspaceID)
-+              : eq(WorkspaceTable.project_id, projectID),
-+          )
-           .all(),
-       )
-
++      // filter by workspace_id instead of project_id. kfactory-adapter
++      // rows carry project_id="global" while the routed instance's
++      // project.id is the worktree-hashed value -- a project_id query
++      // against that hash matches 0 rows, the iteration below never runs,
++      // setStatus never fires, and the in-memory connections Map (the
++      // source of /experimental/workspace/status) stays unpopulated for
++      // that workspace. Workspace_id is itself a unique scope, so dropping
++      // project_id when it is set is safe.
+       const rows = yield* db
+         .selectDistinct({ workspace: WorkspaceTable })
+         .from(WorkspaceTable)
+-        .where(eq(WorkspaceTable.project_id, projectID))
++        .where(
++          opts?.workspaceID
++            ? eq(WorkspaceTable.id, opts.workspaceID)
++            : eq(WorkspaceTable.project_id, projectID),
++        )
+         .all()
+         .pipe(Effect.orDie)
+ 
 diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
-index 793a072..bbe3bc2 100644
+index 4c4659d..fe2d9c7 100644
 --- a/packages/opencode/src/plugin/index.ts
 +++ b/packages/opencode/src/plugin/index.ts
-@@ -28,6 +28,7 @@ import { PluginLoader } from "./loader"
+@@ -24,6 +24,7 @@ import { EffectBridge } from "@/effect/bridge"
+ import { InstanceState } from "@/effect/instance-state"
+ import { errorMessage } from "@/util/error"
+ import { PluginLoader } from "./loader"
++import { ProjectV2 } from "@opencode-ai/core/project"
  import { parsePluginSpecifier, readPluginId, readV1Plugin, resolvePluginId } from "./shared"
  import { registerAdapter } from "@/control-plane/adapters"
  import type { WorkspaceAdapter } from "@/control-plane/types"
-+import { ProjectID } from "@/project/schema"
- import { RuntimeFlags } from "@/effect/runtime-flags"
-
- const log = Log.create({ service: "plugin" })
-@@ -141,7 +142,16 @@ export const layer = Layer.effect(
+@@ -150,7 +151,16 @@ export const layer = Layer.effect(
            directory: ctx.directory,
            experimental_workspace: {
              register(type: string, adapter: PluginWorkspaceAdapter) {
 -              registerAdapter(ctx.project.id, type, adapter as WorkspaceAdapter)
-+              // Register under ProjectID.global rather than the boot
++              // Register under ProjectV2.ID.global rather than the boot
 +              // instance's ctx.project.id. Plugins are loaded once per
 +              // opencode-instance but serve requests across many
 +              // projects (via per-request x-opencode-directory). A
@@ -299,60 +237,46 @@ index 793a072..bbe3bc2 100644
 +              // boot project -- including workspace-create requests
 +              // whose `projectID` is later re-resolved to the
 +              // workspace's actual git root.
-+              registerAdapter(ProjectID.global, type, adapter as WorkspaceAdapter)
++              registerAdapter(ProjectV2.ID.global, type, adapter as WorkspaceAdapter)
              },
            },
            get serverUrl(): URL {
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts
-index 4061bec..952464c 100644
+index 57d6464..9be6ffc 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/experimental.ts
-@@ -8,6 +8,7 @@ import { Session } from "@/session/session"
+@@ -11,6 +11,7 @@ import type { SessionID } from "@/session/schema"
  import { ToolJsonSchema } from "@/tool/json-schema"
  import { ToolRegistry } from "@/tool/registry"
  import { Worktree } from "@/worktree"
-+import { WorkspaceID } from "@/control-plane/schema"
++import { WorkspaceV2 } from "@opencode-ai/core/workspace"
  import { Effect, Option } from "effect"
  import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
  import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
-@@ -127,9 +128,14 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
-
+@@ -133,8 +134,13 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
+ 
      const session = Effect.fn("ExperimentalHttpApi.session")(function* (ctx: { query: typeof SessionListQuery.Type }) {
        const limit = ctx.query.limit ?? 100
 +      // kfactory: forward `?workspace=<id>` to listGlobal so the TUI's
 +      // `--continue` picks the most-recent session within THIS workspace
 +      // rather than the globally most-recent. Without this, attaching to
 +      // different workspaces always lands on the same session.
-       const sessions = Array.from(
-         Session.listGlobal({
-           directory: ctx.query.directory,
-+          workspaceID: ctx.query.workspace ? WorkspaceID.make(ctx.query.workspace) : undefined,
-           roots: ctx.query.roots,
-           start: ctx.query.start,
-           cursor: ctx.query.cursor,
+       const all = yield* sessions.listGlobal({
+         directory: ctx.query.directory,
++        workspaceID: ctx.query.workspace ? WorkspaceV2.ID.make(ctx.query.workspace) : undefined,
+         roots: ctx.query.roots,
+         start: ctx.query.start,
+         cursor: ctx.query.cursor,
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts
-index ffe8d0b..cf057f3 100644
+index 28fd245..2f05f55 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts
-@@ -25,8 +25,27 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
-     const sync = yield* SyncEvent.Service
-
+@@ -25,8 +25,14 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
+     const { db } = yield* Database.Service
+ 
      const start = Effect.fn("SyncHttpApi.start")(function* () {
-+      // kfactory: when the workspace-routing middleware has set
-+      // InstanceState.workspaceID (a request with ?workspace=<id>
-+      // or x-opencode-workspace header), thread it through so the
-+      // service can filter by workspace_id instead of project_id.
-+      // Mirrors the listByProject divergence fix: kfactory-adapter
-+      // stamps WorkspaceTable.project_id="global" for every row, but
-+      // the routed instance's ctx.project.id is the worktree-hashed
-+      // value -- a project_id-only query against that hash returns 0
-+      // and setStatus never fires, so /experimental/workspace/status
-+      // is empty for any workspace not previously seeded into the
-+      // in-memory `connections` Map (the create-path's implicit
-+      // startSync seeds at INSERT, but a server restart wipes the
-+      // Map -- and a future caller relying on /sync/start?workspace=
-+      // as the addressable repopulation operation would hit the
-+      // same dead query regardless of restart).
++      // kfactory: thread the routed workspace through so the service can
++      // filter by workspace_id -- rationale on startWorkspaceSyncing.
 +      const workspaceID = yield* InstanceState.workspaceID
        yield* workspace
 -        .startWorkspaceSyncing((yield* InstanceState.context).project.id)
@@ -364,63 +288,52 @@ index ffe8d0b..cf057f3 100644
        return true
      })
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
-index 8bffe59..367b2a5 100644
+index 873abd8..a1a614c 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
-@@ -66,19 +66,34 @@ function configuredWorkspaceID(): WorkspaceID | undefined {
-   return Flag.OPENCODE_WORKSPACE_ID ? WorkspaceID.make(Flag.OPENCODE_WORKSPACE_ID) : undefined
+@@ -66,19 +66,20 @@ function configuredWorkspaceID(): WorkspaceV2.ID | undefined {
+   return Flag.OPENCODE_WORKSPACE_ID ? WorkspaceV2.ID.make(Flag.OPENCODE_WORKSPACE_ID) : undefined
  }
-
--function selectedWorkspaceID(url: URL, sessionWorkspaceID?: WorkspaceID): WorkspaceID | undefined {
+ 
+-function selectedWorkspaceID(url: URL, sessionWorkspaceID?: WorkspaceV2.ID): WorkspaceV2.ID | undefined {
 -  const workspaceParam = url.searchParams.get("workspace")
--  return sessionWorkspaceID ?? (workspaceParam ? WorkspaceID.make(workspaceParam) : undefined)
+-  return sessionWorkspaceID ?? (workspaceParam ? WorkspaceV2.ID.make(workspaceParam) : undefined)
+-}
+-
+-function selectedV2WorkspaceID(
++// Serves both the v1 and /api/ (v2) paths -- the bodies converged once
++// both read the header. The SDK only rewrites `x-opencode-workspace`
++// header -> `?workspace=` query for GET/HEAD requests
++// (packages/sdk/js/src/v2/client.ts rewrite()); for POST/PUT/DELETE the header
++// stays and the query is absent, so read both.
 +function selectedWorkspaceID(
 +  request: HttpServerRequest.HttpServerRequest,
-+  url: URL,
-+  sessionWorkspaceID?: WorkspaceID,
-+): WorkspaceID | typeof InvalidWorkspaceID | undefined {
-+  // The SDK only rewrites `x-opencode-workspace` header -> `?workspace=`
-+  // query for GET/HEAD requests (sdk/js/src/v2/client.ts rewrite()). For
-+  // POST/PUT/DELETE the header stays, query is absent. Read both.
-+  if (sessionWorkspaceID) return sessionWorkspaceID
-+  const ref = url.searchParams.get("workspace") ?? request.headers["x-opencode-workspace"]
-+  if (!ref) return undefined
-+  const workspaceID = Schema.decodeUnknownOption(WorkspaceID)(ref)
-+  if (Option.isNone(workspaceID)) return InvalidWorkspaceID
-+  return workspaceID.value
- }
-
- function selectedV2WorkspaceID(
-+  request: HttpServerRequest.HttpServerRequest,
    url: URL,
-   sessionWorkspaceID?: WorkspaceID,
- ): WorkspaceID | typeof InvalidWorkspaceID | undefined {
+   sessionWorkspaceID?: WorkspaceV2.ID,
+ ): WorkspaceV2.ID | typeof InvalidWorkspaceID | undefined {
    if (sessionWorkspaceID) return sessionWorkspaceID
 -  const workspaceParam = url.searchParams.get("workspace")
 -  if (!workspaceParam) return undefined
--  const workspaceID = Schema.decodeUnknownOption(WorkspaceID)(workspaceParam)
-+  // The SDK only rewrites `x-opencode-workspace` header -> `?workspace=`
-+  // query for GET/HEAD requests. POST/PUT/DELETE keep the header; the
-+  // query is absent. Read both so non-GET v2 requests route correctly.
+-  const workspaceID = Schema.decodeUnknownOption(WorkspaceV2.ID)(workspaceParam)
 +  const ref = url.searchParams.get("workspace") ?? request.headers["x-opencode-workspace"]
 +  if (!ref) return undefined
-+  const workspaceID = Schema.decodeUnknownOption(WorkspaceID)(ref)
++  const workspaceID = Schema.decodeUnknownOption(WorkspaceV2.ID)(ref)
    if (Option.isNone(workspaceID)) return InvalidWorkspaceID
    return workspaceID.value
  }
-@@ -165,8 +180,8 @@ function planRequest(
+@@ -164,9 +165,7 @@ function planRequest(
+   return Effect.gen(function* () {
      const url = requestURL(request)
      const envWorkspaceID = configuredWorkspaceID()
-     const workspaceID = url.pathname.startsWith("/api/")
--      ? selectedV2WorkspaceID(url, sessionWorkspaceID)
--      : selectedWorkspaceID(url, sessionWorkspaceID)
-+      ? selectedV2WorkspaceID(request, url, sessionWorkspaceID)
-+      : selectedWorkspaceID(request, url, sessionWorkspaceID)
+-    const workspaceID = url.pathname.startsWith("/api/")
+-      ? selectedV2WorkspaceID(url, session?.workspaceID)
+-      : selectedWorkspaceID(url, session?.workspaceID)
++    const workspaceID = selectedWorkspaceID(request, url, session?.workspaceID)
      if (workspaceID === InvalidWorkspaceID) return RequestPlan.InvalidWorkspace()
      const workspace = yield* resolveWorkspace(workspaceID, envWorkspaceID)
-
+ 
 diff --git a/packages/opencode/src/server/shared/workspace-routing.ts b/packages/opencode/src/server/shared/workspace-routing.ts
-index 157cdaa..bc4d6cd 100644
+index 0edfb2b..e93fb3d 100644
 --- a/packages/opencode/src/server/shared/workspace-routing.ts
 +++ b/packages/opencode/src/server/shared/workspace-routing.ts
 @@ -5,6 +5,7 @@ type Rule = { method?: string; path: string; exact?: boolean; action: "local" |
@@ -430,37 +343,44 @@ index 157cdaa..bc4d6cd 100644
 +  { method: "POST", path: "/sync/start", exact: true, action: "local" },
    { method: "GET", path: "/session", action: "local" },
  ]
-
+ 
 diff --git a/packages/opencode/src/session/session.ts b/packages/opencode/src/session/session.ts
-index f75ac91..2be1f37 100644
+index 038ec9a..4776d6f 100644
 --- a/packages/opencode/src/session/session.ts
 +++ b/packages/opencode/src/session/session.ts
-@@ -576,8 +576,23 @@ export const layer: Layer.Layer<
-
+@@ -301,6 +301,7 @@ export type ListInput = {
+ 
+ export type GlobalListInput = {
+   directory?: string
++  workspaceID?: WorkspaceV2.ID
+   roots?: boolean
+   start?: number
+   cursor?: number
+@@ -587,16 +588,23 @@ export const layer: Layer.Layer<
+ 
      const list = Effect.fn("Session.list")(function* (input?: ListInput) {
        const ctx = yield* InstanceState.context
-+      // kfactory: when the workspace-routing middleware has set
-+      // InstanceState.workspaceID (i.e. the request came in with a
-+      // resolvable x-opencode-workspace header / ?workspace= query),
-+      // propagate it into listByProject so the result is scoped to
-+      // that workspace. Without this, every workspace sharing the
-+      // same project_id collapses to a single result -- typical when
-+      // dispatches happen from a non-git front-opencode (project_id
-+      // stamped 'global'). Explicit input.workspaceID still wins via
-+      // the trailing spread.
++      // kfactory: scope to the route-resolved workspace; explicit
++      // input.workspaceID wins. Rationale on listByProject below.
 +      const wsID = yield* InstanceState.workspaceID
-       return Array.from(
--        listByProject({ projectID: ctx.project.id, experimentalWorkspaces: flags.experimentalWorkspaces, ...input }),
-+        listByProject({
-+          projectID: ctx.project.id,
-+          experimentalWorkspaces: flags.experimentalWorkspaces,
-+          ...(wsID ? { workspaceID: wsID } : {}),
-+          ...input,
-+        }),
-       )
+       return yield* listByProject(db, {
+         projectID: ctx.project.id,
+         experimentalWorkspaces: flags.experimentalWorkspaces,
+         ...input,
++        workspaceID: input?.workspaceID ?? wsID,
+       })
      })
-
-@@ -894,11 +909,20 @@ function* listByProject(
+ 
+     const listGlobal = Effect.fn("Session.listGlobal")(function* (input?: GlobalListInput) {
+       const conditions: SQL[] = []
+       if (input?.directory) conditions.push(eq(SessionTable.directory, input.directory))
++      // kfactory: workspace filter for /experimental/session?workspace=
++      // (the --continue scope). Rationale on listByProject below.
++      if (input?.workspaceID) conditions.push(eq(SessionTable.workspace_id, input.workspaceID))
+       if (input?.roots) conditions.push(isNull(SessionTable.parent_id))
+       if (input?.start) conditions.push(gte(SessionTable.time_updated, input.start))
+       if (input?.cursor) conditions.push(lt(SessionTable.time_updated, input.cursor))
+@@ -996,11 +1004,19 @@ function listByProject(
      experimentalWorkspaces: boolean
    },
  ) {
@@ -478,33 +398,78 @@ index f75ac91..2be1f37 100644
 +  // server/shared/workspace-routing.ts), where ctx.project.id is the
 +  // FRONT project (typically "global"). The AND of those two diverges
 +  // and returns 0. Workspace_id is itself a unique scope, so dropping
-+  // the project_id condition is safe -- mirrors what 40b4ef5 did for
-+  // listGlobal below.
++  // the project_id condition is safe -- mirrors the listGlobal filter.
 +  const conditions = input.workspaceID
 +    ? [eq(SessionTable.workspace_id, input.workspaceID)]
 +    : [eq(SessionTable.project_id, input.projectID)]
    if (input.path !== undefined) {
      if (input.path) {
-       const conds = [eq(SessionTable.path, input.path), like(SessionTable.path, `${input.path}/%`)]
-@@ -942,6 +966,7 @@ function* listByProject(
-
- export function* listGlobal(input?: {
+       const conds = [
+diff --git a/packages/tui/src/app.tsx b/packages/tui/src/app.tsx
+index 17a9a55..df24b6c 100644
+--- a/packages/tui/src/app.tsx
++++ b/packages/tui/src/app.tsx
+@@ -136,6 +136,7 @@ export type TuiInput = {
+   args: Args
+   config: TuiConfig.Resolved
+   onSnapshot?: () => Promise<string[]>
++  workspace?: string
    directory?: string
-+  workspaceID?: WorkspaceID
-   roots?: boolean
-   start?: number
-   cursor?: number
-@@ -954,6 +979,13 @@ export function* listGlobal(input?: {
-   if (input?.directory) {
-     conditions.push(eq(SessionTable.directory, input.directory))
-   }
-+  // kfactory: filter by workspace_id when provided. The /experimental/session
-+  // handler forwards the request's `?workspace=` query param. Without this filter, `--continue`
-+  // picks the globally most-recently-updated root session regardless of
-+  // which workspace the operator attached to.
-+  if (input?.workspaceID) {
-+    conditions.push(eq(SessionTable.workspace_id, input.workspaceID))
-+  }
-   if (input?.roots) {
-     conditions.push(isNull(SessionTable.parent_id))
-   }
+   fetch?: typeof fetch
+   headers?: RequestInit["headers"]
+@@ -288,11 +289,12 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
+                                         <SDKProvider
+                                           url={input.url}
+                                           directory={input.directory}
++                                          workspace={input.workspace}
+                                           fetch={input.fetch}
+                                           headers={input.headers}
+                                           events={input.events}
+                                         >
+-                                          <ProjectProvider>
++                                          <ProjectProvider workspace={input.workspace}>
+                                             <SyncProvider>
+                                               <DataProvider>
+                                                 <ThemeProvider mode={mode}>
+diff --git a/packages/tui/src/context/project.tsx b/packages/tui/src/context/project.tsx
+index 0969a38..3811e55 100644
+--- a/packages/tui/src/context/project.tsx
++++ b/packages/tui/src/context/project.tsx
+@@ -8,7 +8,7 @@ type WorkspaceStatus = "connected" | "connecting" | "disconnected" | "error"
+ 
+ export const { use: useProject, provider: ProjectProvider } = createSimpleContext({
+   name: "Project",
+-  init: () => {
++  init: (props: { workspace?: string } = {}) => {
+     const sdk = useSDK()
+ 
+     const defaultPath = {
+@@ -29,7 +29,7 @@ export const { use: useProject, provider: ProjectProvider } = createSimpleContex
+         path: defaultPath,
+       },
+       workspace: {
+-        current: undefined as string | undefined,
++        current: props.workspace,
+         list: [] as Workspace[],
+         status: {} as Record<string, WorkspaceStatus>,
+       },
+diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
+index 93180c6..55e30e7 100644
+--- a/packages/tui/src/context/sdk.tsx
++++ b/packages/tui/src/context/sdk.tsx
+@@ -12,6 +12,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+   name: "SDK",
+   init: (props: {
+     url: string
++    workspace?: string
+     directory?: string
+     fetch?: typeof fetch
+     headers?: RequestInit["headers"]
+@@ -25,6 +26,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+         baseUrl: props.url,
+         signal: abort.signal,
+         directory: props.directory,
++        experimental_workspaceID: props.workspace,
+         fetch: props.fetch,
+         headers: props.headers,
+       })

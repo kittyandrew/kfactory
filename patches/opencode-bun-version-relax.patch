@@ -1,43 +1,28 @@
-Relax the bun-version check in packages/script/src/index.ts so opencode
-v1.15.11 builds with bun 1.3.13 from nixpkgs.
+Relax the bun-version check so nixpkgs's bun can build opencode.
 
-opencode's package.json pins `packageManager: "bun@1.3.14"` since
-opencode#27648 (chore: Upgrade Bun one final time). The PR is a pure
-metadata bump -- bun.lock + Dockerfile + storybook output -- with NO
-new bun-API calls, so the runtime works identically against bun 1.3.13.
-
-We can't ship bun 1.3.14 from nixpkgs today: PR NixOS/nixpkgs#519796
-is in DRAFT because bun 1.3.14 produces segfaulting binaries when
-building downstream packages (the PR's own nixpkgs-review run reports
-SIGSEGVs on opencode itself, gitlab-duo, and filen-cli built with the
-new bun). Until that gets resolved upstream, opencode's strict version
-check would keep kfactory pinned below opencode v1.15.11.
-
-Bypass shape: replace the strict `^${version}` range with `>=1.3.13`
-so 1.3.13 satisfies the check. Drops opencode's safety guard but the
-guard is provably-conservative for the v1.15.4 -> v1.15.11 upgrade we
-care about (read the diff: no `import { ... } from "bun"` API delta
-on the opencode runtime path).
-
-When nixpkgs ships bun 1.3.14, drop this patch and let upstream's
-check pass on its own.
+opencode's build script enforces `^${packageManager}` from the root
+package.json; nixpkgs lags upstream's bun pin (NixOS/nixpkgs#519796:
+newer bun produced segfaulting downstream builds). This relaxes the
+range to `>=1.3.13`. The "no new bun-API usage in the gap" safety
+argument is re-verified on every opencode bump -- record in
+docs/spec.md's "Four-patch opencode stack" decisions entry. Drop when
+nixpkgs ships a bun satisfying upstream's pin.
 
 diff --git a/packages/script/src/index.ts b/packages/script/src/index.ts
-index d148ce0..47ce6b8 100644
+index d148ce0..5afb0f0 100644
 --- a/packages/script/src/index.ts
 +++ b/packages/script/src/index.ts
-@@ -10,8 +10,12 @@ if (!expectedBunVersion) {
+@@ -10,8 +10,11 @@ if (!expectedBunVersion) {
    throw new Error("packageManager field not found in root package.json")
  }
-
+ 
 -// relax version requirement
 -const expectedBunVersionRange = `^${expectedBunVersion}`
-+// kfactory: relax to `>=1.3.13` so nixpkgs currently-shipped bun
-+// (1.3.13) satisfies the check. opencode upstream requires bun
-+// 1.3.14 via packageManager metadata; the v1.15.11 bump did not add
-+// new bun runtime API usage, so strict enforcement is conservative.
-+// Drop this when nixpkgs ships a usable bun >=1.3.14.
++// kfactory: relax the strict `^packageManager` range so the bun that
++// nixpkgs ships can build opencode. Safety is re-verified per bump in
++// docs/spec.md's "Four-patch opencode stack" entry (kfactory repo). Drop
++// this patch when nixpkgs ships a bun satisfying upstream's pin.
 +const expectedBunVersionRange = `>=1.3.13`
-
+ 
  if (!semver.satisfies(process.versions.bun, expectedBunVersionRange)) {
    throw new Error(`This script requires bun@${expectedBunVersionRange}, but you are using bun@${process.versions.bun}`)

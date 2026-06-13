@@ -1,7 +1,7 @@
 {
   # Keep in sync with inputs.opencode.url in flake.nix; replay fixtures
   # assert against this so opencode bumps cannot silently keep stale DB fixtures.
-  opencodeVersion = "v1.15.11";
+  opencodeVersion = "v1.17.4";
 
   opencodePatchStack = [
     # Bun-version build workaround; deletion condition lives in the patch header.
@@ -18,15 +18,15 @@
   pluginSrcs = {
     kfactory-adapter = {
       src = ../../plugins/kfactory-adapter;
-      npmDepsHash = "sha256-TNfy6yjxGAd/FRGf48OlrnOwjrZl9soUV56PXyWuymg=";
+      npmDepsHash = "sha256-lUlCrlOTwN4R/Pr7dO9yS2uMl30Y0c9vdOUFhe+i55Q=";
     };
     ntfy = {
       src = ../../plugins/ntfy;
-      npmDepsHash = "sha256-2eyFV7/SOMofRQp63Kzj/RC4n/poMZUTmBXuA0/UbsI=";
+      npmDepsHash = "sha256-zvCJCA8KS2mlBo0JI0O7Nq54JZ8KvdhkCC67r5VK3R4=";
     };
     loop = {
       src = ../../plugins/loop;
-      npmDepsHash = "sha256-GkorgQmXVBt30+hKwk3svGv0kDAcn4EJykSwMB7bPC4=";
+      npmDepsHash = "sha256-gQxcx+5LOwMlulZKA/7SrP7iL47fG1tQLh2jbI/Klbw=";
       keepNodeModules = true;
     };
   };

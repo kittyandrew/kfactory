@@ -5,3 +5,5 @@ result-*
 # `go build ./cmd/kfactory` drops the compiled binary in the repo root.
 # Don't track it.
 /kfactory
+/nix/e2e/regression-runner/regression-runner
+/dev-vm.img

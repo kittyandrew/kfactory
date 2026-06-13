@@ -304,7 +304,7 @@ func runLogout() {
 }
 
 // Serializes refresh across this CLI + the opencode TUI's `kfactory
-// auth refresh` subprocess (per bearer-auth patch). POSIX flock(2)
+// auth refresh` subprocess (per opencode-kfactory-refresh.patch). POSIX flock(2)
 // auto-releases on process exit -- no stale detection needed.
 func lockFilePath() (string, error) {
 	p, err := tokenPath()

@@ -21,4 +21,4 @@
 # Removing entries: if a baseline line stops appearing in actual output,
 # the diff will surface it -- delete the line.
 
-../core/src/filesystem.ts(5,24): error TS7016: Could not find a declaration file for module 'mime-types'. 'node_modules/.bun/mime-types@3.0.2/node_modules/mime-types/index.js' implicitly has an 'any' type.
+../core/src/fs-util.ts(5,24): error TS7016: Could not find a declaration file for module 'mime-types'. 'node_modules/.bun/mime-types@3.0.2/node_modules/mime-types/index.js' implicitly has an 'any' type.

@@ -1,8 +1,8 @@
--- Generated/minimized from anomalyco/opencode v1.15.11 (d2bd7eaad54bf39de04bf6e279d5953bd1666574).
+-- Generated/minimized from anomalyco/opencode v1.17.4 (abda3515f444c4d28a98953d153c5a3e1892d3d4).
 -- Source migrations:
---   packages/opencode/migration/20260127222353_familiar_lady_ursula/migration.sql
---   packages/opencode/migration/20260227213759_add_session_workspace_id/migration.sql
---   packages/opencode/migration/20260427172553_slow_nightmare/migration.sql
+--   packages/core/migration/20260127222353_familiar_lady_ursula/migration.sql
+--   packages/core/migration/20260227213759_add_session_workspace_id/migration.sql
+--   packages/core/migration/20260427172553_slow_nightmare/migration.sql
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE session (

@@ -188,7 +188,7 @@ in
 
       factory-kfactory-config-render =
         pkgs.runCommand "factory-kfactory-config-render" {
-          configFile = components.unified.passthru.opencodeConfig;
+          configFile = components.unified.passthru.configFile;
           nativeBuildInputs = [pkgs.gnugrep];
         } ''
           cfg=$configFile

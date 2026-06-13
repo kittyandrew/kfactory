@@ -52,8 +52,9 @@ in
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       ];
       Healthcheck = {
-        # Cheapest endpoint that proves the server's up AND the
-        # bearer-auth patch is loaded.
+        # Cheapest endpoint that proves the server is up and the
+        # experimental-workspaces surface responds. (The Bearer header is
+        # inert here: server-side opencode never validates Bearer.)
         Test = [
           "CMD"
           "${pkgs.curl}/bin/curl"

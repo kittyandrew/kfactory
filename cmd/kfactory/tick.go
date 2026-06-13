@@ -374,7 +374,9 @@ func tickScheduled(ctx context.Context, tok *tokenFile, server, taskID string, c
 			fail("tick: create workspace: %v", err)
 		}
 		fmt.Fprintf(os.Stderr, "kfactory: tick %s workspace %s (%s)\n", taskID, ws.ID, ws.Name)
-		return dispatchSessionAndPrompt(ctx, tok, server, ws.ID, cfg.InitialPrompt)
+		id := dispatchSessionAndPrompt(ctx, tok, server, ws.ID, cfg.InitialPrompt)
+		confirmFirstRunVisible(ctx, tok, server, ws.ID)
+		return id
 	}
 	firstRunComplete, err := scheduledWorkspaceFirstRunComplete(ctx, tok, server, existing.ID)
 	if err != nil {
@@ -384,7 +386,7 @@ func tickScheduled(ctx context.Context, tok *tokenFile, server, taskID string, c
 		fmt.Fprintf(os.Stderr,
 			"kfactory: tick %s workspace %s has no completed first run; sending initial prompt\n",
 			taskID, existing.ID)
-		return postContinuation(ctx, tok, server,
+		id := postContinuation(ctx, tok, server,
 			existing.ID,
 			cfg.InitialPrompt,
 			fmt.Sprintf("tick %s first-run recovery ", taskID),
@@ -392,6 +394,8 @@ func tickScheduled(ctx context.Context, tok *tokenFile, server, taskID string, c
 				return dispatchSessionAndPrompt(ctx, tok, server, existing.ID, cfg.InitialPrompt)
 			},
 		)
+		confirmFirstRunVisible(ctx, tok, server, existing.ID)
+		return id
 	}
 
 	switch cfg.Mode {
@@ -431,6 +435,45 @@ func tickScheduled(ctx context.Context, tok *tokenFile, server, taskID string, c
 			return dispatchSessionAndPrompt(ctx, tok, server, existing.ID, cfg.InitialPrompt)
 		},
 	)
+}
+
+// Blocks until the just-sent initial prompt is readable back from
+// opencode state. Since opencode v1.17.x, POST /session/<id>/prompt_async
+// admits input through an event-sourced queue, so the user message is no
+// longer synchronously visible when the request returns. The scheduled
+// flow's convergence invariant is "per-task lock released => first-run
+// completion observable"; without this wait, every flock waiter re-reads
+// pre-prompt state and re-sends initial_prompt. Timeout warns instead of
+// failing: the prompt WAS accepted, only the read-back lagged.
+func confirmFirstRunVisible(ctx context.Context, tok *tokenFile, server, workspaceID string) {
+	deadline := time.Now().Add(15 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		complete, err := scheduledWorkspaceFirstRunComplete(ctx, tok, server, workspaceID)
+		if err == nil && complete {
+			return
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			// Ctx expiry is exactly the case where the invariant is left
+			// unconfirmed -- warn here too, not only on deadline.
+			warnFirstRunUnconfirmed(workspaceID, ctx.Err())
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	warnFirstRunUnconfirmed(workspaceID, lastErr)
+}
+
+func warnFirstRunUnconfirmed(workspaceID string, err error) {
+	detail := ""
+	if err != nil {
+		detail = fmt.Sprintf(" (last check error: %v)", err)
+	}
+	fmt.Fprintf(os.Stderr,
+		"kfactory: tick: warning: initial prompt for %s not yet visible in opencode state; overlapping ticks may repeat it%s\n",
+		workspaceID, detail)
 }
 
 func dispatchSessionAndPrompt(ctx context.Context, tok *tokenFile, server, workspaceID, prompt string) string {

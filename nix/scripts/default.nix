@@ -10,5 +10,4 @@
   dev-down = import ./dev-down.nix {inherit pkgs;};
   dev-clean = import ./dev-clean.nix {inherit pkgs;};
   dev-test = import ./dev-test.nix {inherit pkgs;};
-  dev-test-ntfy = import ./dev-test-ntfy.nix {inherit pkgs;};
 }

@@ -1,42 +1,40 @@
 import { $ } from "bun"
 import { afterEach, describe, expect } from "bun:test"
 import { NodeServices } from "@effect/platform-node"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
-import * as Log from "@opencode-ai/core/util/log"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { Auth } from "../../src/auth"
-import { Bus } from "../../src/bus"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Config } from "../../src/config/config"
 import { getAdapter } from "../../src/control-plane/adapters"
 import { Workspace } from "../../src/control-plane/workspace"
 import { Env } from "../../src/env"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Plugin } from "../../src/plugin/index"
-import { InstanceBootstrap } from "../../src/project/bootstrap"
+import { InstanceBootstrap } from "../../src/project/bootstrap-service"
 import { InstanceStore } from "../../src/project/instance-store"
 import { Project } from "../../src/project/project"
 import { Vcs } from "../../src/project/vcs"
 import { Server } from "../../src/server/server"
 import { SessionPrompt } from "../../src/session/prompt"
 import { Session } from "../../src/session/session"
-import { Database } from "../../src/storage/db"
-import { SyncEvent } from "../../src/sync"
+import { Database } from "@opencode-ai/core/database/database"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { AccountTest } from "../fake/account"
 import { AuthTest } from "../fake/auth"
 import { NpmTest } from "../fake/npm"
+import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideTmpdirInstance, requireInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
-void Log.init({ print: false })
-
 const configLayer = Config.layer.pipe(
   Layer.provide(EffectFlock.defaultLayer),
-  Layer.provide(AppFileSystem.defaultLayer),
+  Layer.provide(FSUtil.defaultLayer),
   Layer.provide(Env.defaultLayer),
   Layer.provide(AuthTest.empty),
   Layer.provide(AccountTest.empty),
@@ -44,31 +42,34 @@ const configLayer = Config.layer.pipe(
   Layer.provide(FetchHttpClient.layer),
 )
 
+const noopBootstrapLayer = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+
 const workspaceLayer = (experimentalWorkspaces: boolean) =>
   Workspace.layer.pipe(
     Layer.provide(Auth.defaultLayer),
     Layer.provide(Session.defaultLayer),
-    Layer.provide(SyncEvent.defaultLayer),
     Layer.provide(SessionPrompt.defaultLayer),
     Layer.provide(Project.defaultLayer),
     Layer.provide(Vcs.defaultLayer),
     Layer.provide(FetchHttpClient.layer),
-    Layer.provide(AppFileSystem.defaultLayer),
+    Layer.provide(Database.defaultLayer),
+    Layer.provide(EventV2Bridge.defaultLayer),
+    Layer.provide(FSUtil.defaultLayer),
     Layer.provide(RuntimeFlags.layer({ experimentalWorkspaces })),
-    Layer.provide(InstanceStore.defaultLayer.pipe(Layer.provide(InstanceBootstrap.defaultLayer))),
+    Layer.provide(InstanceStore.defaultLayer.pipe(Layer.provide(noopBootstrapLayer))),
   )
 
 const it = testEffect(
   Layer.mergeAll(
     NodeServices.layer,
     Plugin.layer.pipe(
-      Layer.provide(Bus.layer),
+      Layer.provide(EventV2Bridge.defaultLayer),
       Layer.provide(configLayer),
       Layer.provide(RuntimeFlags.layer({ disableDefaultPlugins: true })),
     ),
     workspaceLayer(true),
     CrossSpawnSpawner.defaultLayer,
-  ),
+  ).pipe(Layer.provide(Ripgrep.defaultLayer)),
 )
 
 type WorkspaceInfo = { id: string; name: string; directory: string; type: string }
@@ -84,7 +85,7 @@ function asFileUrl(filePath: string): string {
 }
 
 async function makeRepo(root: string): Promise<string> {
-  const repo = path.join(root, "owner", "repo")
+  const repo = path.join(root, "my-owner", "my-repo")
   await fs.mkdir(repo, { recursive: true })
   await $`git init`.cwd(repo).quiet()
   await $`git config core.fsmonitor false`.cwd(repo).quiet()
@@ -174,7 +175,7 @@ function withKfactoryAdapterProject<A, E, R>(self: (directory: string, workspace
 
 afterEach(async () => {
   await disposeAllInstances()
-  Database.close()
+  await resetDatabase()
 })
 
 describe("kfactory adapter plugin interaction", () => {
@@ -197,7 +198,8 @@ describe("kfactory adapter plugin interaction", () => {
         const first = yield* Effect.promise(() => createWorkspace(directory, repoUrl, { slugSuffix: "beef" }))
 
         expect(first.type).toBe("kfactory")
-        expect(first.name.endsWith("--repo--beef")).toBe(true)
+        // Hyphenated owner/repo round-trip through the slug grammar.
+        expect(first.name).toBe("my-owner--my-repo--beef")
         expect(first.directory).toBe(path.join(workspaces, first.name))
         const readme = yield* Effect.promise(() => Bun.file(path.join(first.directory, "README.md")).text())
         expect(readme).toContain("kfactory adapter contract")
@@ -230,7 +232,7 @@ describe("kfactory adapter plugin interaction", () => {
             }),
           }),
         )
-        expect(response.status).toBe(500)
+        expect(response.status).toBe(400)
 
         const rows = yield* Effect.promise(() =>
           requestJson<WorkspaceInfo[]>("/experimental/workspace", { headers: { "x-opencode-directory": directory } }),
@@ -240,24 +242,32 @@ describe("kfactory adapter plugin interaction", () => {
     ),
   )
 
-  it.live("rejects lossy repo slug segments before persisting a workspace", () =>
+  it.live("rejects repo segments not representable in the slug grammar before persisting a workspace", () =>
     withKfactoryAdapterProject((directory) =>
       Effect.gen(function* () {
-        const response = yield* Effect.promise(() =>
-          Server.Default().app.request("/experimental/workspace", {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-opencode-directory": directory,
-            },
-            body: JSON.stringify({
-              type: "kfactory",
-              branch: null,
-              extra: { repoUrl: "https://example.invalid/owner/re-po", slugSuffix: "beef" },
-            }),
-          }),
-        )
-        expect(response.status).toBe(500)
+        // `~` is outside the alphabet; `a--b` would alias the `--`
+        // delimiter and break the injective decomposition. Both must
+        // fail closed before any clone/DB row.
+        const reject = (repoUrl) =>
+          Effect.gen(function* () {
+            const response = yield* Effect.promise(() =>
+              Server.Default().app.request("/experimental/workspace", {
+                method: "POST",
+                headers: {
+                  "content-type": "application/json",
+                  "x-opencode-directory": directory,
+                },
+                body: JSON.stringify({
+                  type: "kfactory",
+                  branch: null,
+                  extra: {repoUrl, slugSuffix: "beef"},
+                }),
+              }),
+            )
+            expect(response.status).toBe(400)
+          })
+        yield* reject("https://example.invalid/owner/re~po")
+        yield* reject("https://example.invalid/owner/re--po")
 
         const rows = yield* Effect.promise(() =>
           requestJson<WorkspaceInfo[]>("/experimental/workspace", { headers: { "x-opencode-directory": directory } }),
@@ -341,7 +351,7 @@ describe("kfactory adapter plugin interaction", () => {
             }),
           }),
         )
-        expect(response.status).toBe(500)
+        expect(response.status).toBe(400)
         expect(yield* Effect.promise(() => pathExists(finalDir))).toBe(false)
 
         const rows = yield* Effect.promise(() =>

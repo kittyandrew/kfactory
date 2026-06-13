@@ -41,6 +41,9 @@ product decisions live in `docs/spec.md`.
 
 ## Patch stack status
 
+(2026-05 snapshot at the v1.15.11 pin -- superseded by docs/spec.md's
+"Four-patch opencode stack" + v1.17.4 bump decisions entries.)
+
 - Current opencode patch stack is split by ownership: `opencode-bun-version-relax.patch`, `opencode-static-bearer.patch`, `opencode-workspace-routing.patch`, `opencode-kfactory-refresh.patch`.
 - `opencode-bun-version-relax.patch` is temporary packaging relief until nixpkgs Bun satisfies upstream `packageManager: "bun@1.3.14"`. A self-expiring check fails once the relaxation is no longer needed.
 - `opencode-static-bearer.patch` adds generic Bearer client emission via flag/env. It is optional deployment plumbing while reverse-proxy JWT attach is required.

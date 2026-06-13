@@ -28,11 +28,15 @@ Nix-built containers, one Docker bridge network.
 ## What it tests
 
 - `kfactory dispatch` end-to-end (POST → adapter clone → session create → prompt).
-- `kfactory list` (workspace enumeration + ordering).
-- `kfactory attach` (TUI launch + workspace resolution by id / slug / index).
-- `kfactory tick` scheduled-task serial and concurrent first-run behavior.
-- `/loop` slash command + auto-continuation.
-- `ntfy` plugin's `session.idle` → 3-second-wait → POST to ntfy.
+- `kfactory list` (workspace enumeration + ordering + branch enrichment).
+- `kfactory attach` reference resolution (id / slug / index ordering).
+- Session isolation (workspace-scoped `/session` + `/experimental/session`),
+  `/sync/start` workspace targeting, live SSE event delivery.
+- `kfactory tick` scheduled-task create-on-miss, modes, and concurrent
+  first-run convergence (8 racers → exactly one initial prompt).
+- `ntfy` plugin's idle event → debounce-wait → POST to ntfy.
+- `opencode-heal` + recovery-sweep round trip against a staged stuck
+  assistant turn (queue emit, row marking, sync-kick, prompt injection).
 
 What it does **NOT** test:
 
@@ -42,6 +46,12 @@ What it does **NOT** test:
 - oauth2-proxy / reverse proxy layer. opencode is reached directly.
 - Workspace-to-workspace isolation (single-process, single-UID, etc.
   — same as production at single-operator scale).
+- Anything requiring real assistant turns or model tool calls: the
+  environment ships NO LLM provider, so the `/loop` sentinel run, the
+  `permission.asked` notification, and the live opencode-pty phases are
+  skipped in the runner (each carries an `@TODO` for a future fake-LLM
+  provider). Their contracts are covered by plugin unit tests,
+  `nix/unit/opencode/*`, and the `nix/replay` fixtures instead.
 
 ## Prerequisites
 

@@ -14,24 +14,25 @@ func (r *runner) phaseRecovery() error {
 		return err
 	}
 	sess = strings.TrimSpace(sess)
-	msg, _ := r.sql("SELECT id FROM session_message WHERE session_id='" + sess + "' AND type='assistant' ORDER BY time_created DESC LIMIT 1;")
-	table := "session_message"
-	msg = strings.TrimSpace(msg)
-	if msg == "" {
-		msg, err = r.sql("SELECT id FROM message WHERE session_id='" + sess + "' AND json_extract(data, '$.role')='assistant' ORDER BY time_created DESC LIMIT 1;")
-		if err != nil {
-			return err
-		}
-		msg = strings.TrimSpace(msg)
-		table = "message"
+	if sess == "" {
+		return fmt.Errorf("could not locate a session for %s", ws)
 	}
-	if sess == "" || msg == "" {
-		return fmt.Errorf("could not locate session/message: sess=%q msg=%q", sess, msg)
-	}
-	if _, err := r.sql("UPDATE " + table + " SET data = json_remove(data, '$.time.completed', '$.finish') WHERE id='" + msg + "';"); err != nil {
+	// The regression environment has no LLM provider, so sessions never
+	// contain real assistant turns; synthesize the mid-stream assistant
+	// row in the same spirit as the opencode-heal replay fixtures
+	// (nix/replay/opencode-heal: v1-stuck-assistant.sql), but with the
+	// FULL v1 AssistantMessage shape (packages/core/src/v1/session.ts)
+	// so the live /session/<id>/message decode keeps working.
+	const msg = "msg_regression_stuck0001"
+	stuckData := `{"id":"` + msg + `","sessionID":"` + sess + `","role":"assistant",` +
+		`"time":{"created":1},"parentID":"msg_regression_parent01",` +
+		`"modelID":"regression","providerID":"regression","mode":"build","agent":"build",` +
+		`"path":{"cwd":"/","root":"/"},"cost":0,` +
+		`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}`
+	if _, err := r.sql("INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data) VALUES ('" + msg + "', '" + sess + "', strftime('%s','now')*1000, strftime('%s','now')*1000, json('" + stuckData + "'));"); err != nil {
 		return err
 	}
-	stuck, err := r.sql("SELECT count(*) FROM " + table + " WHERE id='" + msg + "' AND json_extract(data, '$.time.completed') IS NULL;")
+	stuck, err := r.sql("SELECT count(*) FROM message WHERE id='" + msg + "' AND json_extract(data, '$.time.completed') IS NULL;")
 	if err != nil || strings.TrimSpace(stuck) != "1" {
 		return fmt.Errorf("failed to manufacture stuck state count=%q err=%v", stuck, err)
 	}
@@ -47,8 +48,8 @@ func (r *runner) phaseRecovery() error {
 	if !jsonArrayContains(queueJSON, ws) {
 		return fmt.Errorf("heal queue missing %s: %s", ws, queueJSON)
 	}
-	finish, _ := r.sql("SELECT json_extract(data, '$.finish') FROM " + table + " WHERE id='" + msg + "';")
-	errorName, _ := r.sql("SELECT json_extract(data, '$.error.name') FROM " + table + " WHERE id='" + msg + "';")
+	finish, _ := r.sql("SELECT json_extract(data, '$.finish') FROM message WHERE id='" + msg + "';")
+	errorName, _ := r.sql("SELECT json_extract(data, '$.error.name') FROM message WHERE id='" + msg + "';")
 	if strings.TrimSpace(finish) != "interrupted-by-restart" || strings.TrimSpace(errorName) != "MessageAbortedError" {
 		return fmt.Errorf("heal row not marked correctly: finish=%q error=%q", finish, errorName)
 	}

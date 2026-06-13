@@ -1,5 +1,7 @@
 # Bare git repo with one trivial commit. Bundled into both images
-# at /srv/test-repo.git so the regression tests never needs the public network:
+# at /srv/test-repo.git so the regression tests never need the public
+# network. Hyphenated basename on purpose: exercises the slug alphabet's
+# hyphen support.
 # kfactory client dispatches against it; kfactory-adapter clones from
 # it. Reproducible via Nix; built once, referenced from both image
 # files.

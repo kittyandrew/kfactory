@@ -15,33 +15,61 @@ Stack identity: `.claude/rules/020-patches.md`. Re-diff workflow:
    derivation 'opencode-node_modules-<version>'`, upstream's
    `nix/hashes.json` is stale for this tag -- a recurring upstream CI
    race (anomalyco/opencode#18227 has been fixed and re-broken multiple
-   times). kfactory routes around it via a `.override { node_modules =
-   ... }` block in `flake.nix`'s patched opencode construction. Refresh the
-   embedded hash literal:
-   ```bash
-   nix build .#checks.x86_64-linux.factory-opencode-kfactory 2>&1 | awk '/got:/ {print $2}'
+   times; it last bit kfactory at v1.15.11 and was fixed upstream by
+   v1.17.4). The workaround, if it recurs: wrap the patched opencode's
+   base package in `nix/shared/opencode-components.nix` with
+   ```nix
+   (opencode.packages.${system}.default.override {
+     node_modules = opencode.packages.${system}.node_modules_updater.override {
+       hash = "sha256-<got-hash>";
+     };
+   })
    ```
-   Paste the resulting `sha256-...` into the `hash = "...";` argument
-   of the `node_modules_updater.override` call. The override is
-   **single-platform** (x86_64-linux only); if kfactory ever ships
-   aarch64-linux or darwin builds, expand to a platform-keyed attrset
-   matching `hashes.json`'s shape.
-   When upstream eventually publishes a release with correct hashes,
-   remove the entire `.override { node_modules = ... }` block. Verify
-   by deleting the override locally, re-running
-   `nix build .#checks.x86_64-linux.factory-opencode-kfactory`, and confirming
-   it succeeds without a hash error.
-5. The plugin typechecks use the published `@opencode-ai/plugin` types,
-   not the source, so they're independent of this bump.
+   where `<got-hash>` comes from
+   `nix build .#checks.x86_64-linux.factory-opencode-kfactory 2>&1 | awk '/got:/ {print $2}'`.
+   The override is **single-platform** (x86_64-linux only); expand to a
+   platform-keyed attrset matching `hashes.json`'s shape if kfactory
+   ever ships other systems. Remove the override again as soon as a
+   later upstream tag publishes correct hashes (verify by deleting it
+   and rebuilding `factory-opencode-kfactory`).
+5. Bump the `@opencode-ai/plugin` pin in each `plugins/<name>/package.json`
+   to the new opencode version, regenerate lockfiles + `npmDepsHash`
+   per `.claude/rules/010-plugin.md` -- the published types are
+   versioned in lockstep with opencode releases.
 6. `factory-opencode-typecheck` catches type-semantic drift across any
-   of the kfactory opencode patches against the bumped source.
+   of the kfactory opencode patches against the bumped source. Its
+   baseline (`checks/factory-opencode-typecheck.baseline`) holds the
+   known upstream noise; expect it to churn on big upstream refactors.
+7. The replay fixture gate (`nix/replay/default.nix`) throws on any
+   version mismatch BY DESIGN. Re-derive
+   `nix/replay/opencode-heal/fixtures/<version>/schema.sql` against the
+   new source (`generate-fixtures.sh` validates the cited migrations
+   still exist), review consumed-surface drift for the heal tables
+   (session/message/part/session_message), rename the fixtures dir,
+   and update `fixtureVersion` + the schema path in
+   `nix/replay/default.nix`.
+8. Read every NEW upstream DB migration in the bump range for
+   destructive statements against state kfactory consumes (workspace
+   rows, session.workspace_id, v1 message/part tables). The runtime
+   executes the TS modules in
+   `packages/core/src/database/migration/`; the sibling SQL bodies in
+   `packages/core/migration/<name>/migration.sql` mirror them and are
+   the easier review surface. Destructive migrations become documented
+   operator actions, never carve-out patches -- policy + the v1.16.0
+   precedent live in docs/spec.md's v1.17.4 bump decisions entry.
 
 ## What to verify on every edit
 
 - `nix flake check` -- in particular the kfactory opencode patches
   must all pass `factory-opencode-patch-applies` AND the resulting
   tree must pass `factory-opencode-typecheck`.
-- For changes to the subprocess-refresh logic in `attach.ts`: verify
-  the spawned binary name still matches the binary you ship (today:
-  `spawn("kfactory", ["auth", "refresh"])`) and that the exit-code
-  constants stay in sync with `cmd/kfactory/exit.go`.
+- For changes to the subprocess-refresh logic
+  (`packages/core/src/kfactory-bearer-refresh.ts` in the refresh
+  patch): verify the spawned binary name still matches the binary you
+  ship (today: `spawn("kfactory", ["auth", "refresh"])`) and that the
+  exit-code constants stay in sync with `cmd/kfactory/exit.go`.
+- Re-audit `ServerAuth.header()` callers in the bumped source:
+  `bearerFromCache` throws on a broken cache, so any NEW upstream
+  call site reachable with `OPENCODE_SERVER_BEARER_CACHE_PATH` set
+  widens the blast radius (the refresh patch header records the
+  v1.17.4 caller set).

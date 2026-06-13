@@ -41,11 +41,6 @@ func (r *runner) ocexec(args ...string) (string, error) {
 	return command("docker", full...)
 }
 
-func (r *runner) ocexecStdin(args []string, stdin string) (string, error) {
-	full := append([]string{"exec", "-i", r.opencodeContainer}, args...)
-	return commandStdin(stdin, "docker", full...)
-}
-
 func command(name string, args ...string) (string, error) {
 	return commandStdin("", name, args...)
 }

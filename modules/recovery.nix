@@ -60,9 +60,9 @@ in {
       description = ''
         Name of the systemd service running opencode-serve. The
         recovery hooks attach to its ExecStartPre/ExecStartPost via
-        a drop-in. Operator names the unit; kfactory doesn't ship
-        the opencode-serve unit itself (per the "no NixOS module for
-        opencode" stance).
+        a drop-in. The operator names the unit (or uses the
+        `factoryGuest` module, which wires this automatically to its
+        own `factory-opencode` unit).
       '';
       example = "opencode";
     };
@@ -178,9 +178,12 @@ in {
       # (list, clobbers) -- preserves operator's existing Environment=.
       # XDG_CONFIG_HOME via `users.users.<name>.home` handles non-/home
       # deployments (e.g. persistent-volume `/var/lib/factory/<user>`).
+      # mkDefault so a co-located factoryGuest (which sets the same value at
+      # normal priority on this unit) wins without a merge conflict; standalone
+      # recovery on an operator's own unit still gets it from here.
       environment = {
         KFACTORY_RECOVERY_QUEUE = cfg.queuePath;
-        XDG_CONFIG_HOME = "${config.users.users.${cfg.user}.home}/.config";
+        XDG_CONFIG_HOME = lib.mkDefault "${config.users.users.${cfg.user}.home}/.config";
       };
     };
 

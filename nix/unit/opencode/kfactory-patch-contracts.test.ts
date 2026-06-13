@@ -7,27 +7,29 @@ import path from "node:path"
 import { getAdapter, registerAdapter } from "../../src/control-plane/adapters"
 import type { WorkspaceAdapter } from "../../src/control-plane/types"
 import { Workspace } from "../../src/control-plane/workspace"
-import { WorkspaceTable } from "../../src/control-plane/workspace.sql"
+import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
-import { ProjectID } from "../../src/project/schema"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { Project } from "../../src/project/project"
 import { Server } from "../../src/server/server"
 import { Session } from "@/session/session"
-import { SessionTable } from "@/session/session.sql"
-import { Database } from "@/storage/db"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { Database } from "@opencode-ai/core/database/database"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, requireInstance, tmpdirScoped } from "../fixture/fixture"
 import { workspaceLayerWithRuntimeFlags } from "../fixture/workspace"
-import { testEffect } from "../lib/effect"
+import { testEffectShared } from "../lib/effect"
 
-const it = testEffect(
+const it = testEffectShared(
   Layer.mergeAll(
     Project.defaultLayer,
     Session.defaultLayer,
     workspaceLayerWithRuntimeFlags({ experimentalWorkspaces: true }),
     FetchHttpClient.layer,
     RuntimeFlags.layer({ experimentalWorkspaces: true }),
-  ),
+    Database.defaultLayer,
+  ).pipe(Layer.provide(Ripgrep.defaultLayer)),
 )
 
 function unique(prefix: string): string {
@@ -63,11 +65,11 @@ describe("kfactory opencode patch contracts", () => {
   it.effect("global adapter registration is a fallback, not an override", () =>
     Effect.gen(function* () {
       const type = unique("global-adapter")
-      const projectID = ProjectID.make(unique("project"))
+      const projectID = ProjectV2.ID.make(unique("project"))
       const global = localAdapter("/tmp/global-adapter")
       const local = localAdapter("/tmp/local-adapter")
 
-      registerAdapter(ProjectID.global, type, global)
+      registerAdapter(ProjectV2.ID.global, type, global)
       expect(getAdapter(projectID, type)).toBe(global)
 
       registerAdapter(projectID, type, local)
@@ -129,9 +131,7 @@ describe("kfactory opencode patch contracts", () => {
         )
         expect(response.status).toBe(200)
         const created = (yield* Effect.promise(() => response.json())) as { id: string }
-        const row = yield* Effect.sync(() =>
-          Database.use((db) => db.select().from(SessionTable).where(eq(SessionTable.id, created.id)).get()),
-        )
+        const row = yield* Database.Service.use(({ db }) => db.select().from(SessionTable).where(eq(SessionTable.id, created.id)).get())
         expect(row?.workspace_id).toBe(info.id)
       }),
     { git: true },
@@ -158,14 +158,12 @@ describe("kfactory opencode patch contracts", () => {
         const a = yield* sessions.create({ title: "a", workspaceID: wsA.id })
         const b = yield* sessions.create({ title: "b", workspaceID: wsB.id })
 
-        yield* Effect.sync(() =>
-          Database.use((db) =>
-            db
-              .update(SessionTable)
-              .set({ project_id: otherProject.project.id })
-              .where(eq(SessionTable.id, b.id))
-              .run(),
-          ),
+        yield* Database.Service.use(({ db }) =>
+          db
+            .update(SessionTable)
+            .set({ project_id: otherProject.project.id })
+            .where(eq(SessionTable.id, b.id))
+            .run(),
         )
 
         const listed = yield* sessions.list({ workspaceID: wsB.id, roots: true, limit: 10 })
@@ -195,10 +193,8 @@ describe("kfactory opencode patch contracts", () => {
         const wsB = yield* workspace.create({ type: typeB, branch: null, projectID: instance.project.id, extra: null })
         const a = yield* sessions.create({ title: "a", workspaceID: wsA.id })
         const b = yield* sessions.create({ title: "b", workspaceID: wsB.id })
-        yield* Effect.sync(() =>
-          Database.use((db) =>
-            db.update(SessionTable).set({ project_id: otherProject.project.id }).where(eq(SessionTable.id, b.id)).run(),
-          ),
+        yield* Database.Service.use(({ db }) =>
+          db.update(SessionTable).set({ project_id: otherProject.project.id }).where(eq(SessionTable.id, b.id)).run(),
         )
 
         const response = yield* Effect.promise(() =>
@@ -234,9 +230,7 @@ describe("kfactory opencode patch contracts", () => {
         const exit = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null }).pipe(Effect.exit)
         expect(Exit.isFailure(exit)).toBe(true)
 
-        const rows = yield* Effect.sync(() =>
-          Database.use((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.type, type)).all()),
-        )
+        const rows = yield* Database.Service.use(({ db }) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.type, type)).all())
         expect(rows).toHaveLength(0)
       }),
     { git: true },
@@ -265,13 +259,9 @@ describe("kfactory opencode patch contracts", () => {
         const exit = yield* workspace.remove(info.id).pipe(Effect.exit)
         expect(Exit.isFailure(exit)).toBe(true)
 
-        const row = yield* Effect.sync(() =>
-          Database.use((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, info.id)).get()),
-        )
+        const row = yield* Database.Service.use(({ db }) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, info.id)).get())
         expect(row?.id).toBe(info.id)
-        const sessionRow = yield* Effect.sync(() =>
-          Database.use((db) => db.select().from(SessionTable).where(eq(SessionTable.id, sessionInfo.id)).get()),
-        )
+        const sessionRow = yield* Database.Service.use(({ db }) => db.select().from(SessionTable).where(eq(SessionTable.id, sessionInfo.id)).get())
         expect(sessionRow?.id).toBe(sessionInfo.id)
       }),
     { git: true },
@@ -292,10 +282,8 @@ describe("kfactory opencode patch contracts", () => {
 
         registerAdapter(instance.project.id, type, localAdapter(target, "sync-start-contract"))
         const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
-        yield* Effect.sync(() =>
-          Database.use((db) =>
-            db.update(WorkspaceTable).set({ project_id: otherProject.project.id }).where(eq(WorkspaceTable.id, info.id)).run(),
-          ),
+        yield* Database.Service.use(({ db }) =>
+          db.update(WorkspaceTable).set({ project_id: otherProject.project.id }).where(eq(WorkspaceTable.id, info.id)).run(),
         )
 
         yield* workspace.startWorkspaceSyncing(instance.project.id, { workspaceID: info.id })
@@ -321,10 +309,8 @@ describe("kfactory opencode patch contracts", () => {
 
         registerAdapter(instance.project.id, type, localAdapter(target, "sync-http-query-contract"))
         const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
-        yield* Effect.sync(() =>
-          Database.use((db) =>
-            db.update(WorkspaceTable).set({ project_id: otherProject.project.id }).where(eq(WorkspaceTable.id, info.id)).run(),
-          ),
+        yield* Database.Service.use(({ db }) =>
+          db.update(WorkspaceTable).set({ project_id: otherProject.project.id }).where(eq(WorkspaceTable.id, info.id)).run(),
         )
 
         const response = yield* Effect.promise(() =>
@@ -358,10 +344,8 @@ describe("kfactory opencode patch contracts", () => {
 
         registerAdapter(instance.project.id, type, localAdapter(target, "sync-http-header-contract"))
         const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
-        yield* Effect.sync(() =>
-          Database.use((db) =>
-            db.update(WorkspaceTable).set({ project_id: otherProject.project.id }).where(eq(WorkspaceTable.id, info.id)).run(),
-          ),
+        yield* Database.Service.use(({ db }) =>
+          db.update(WorkspaceTable).set({ project_id: otherProject.project.id }).where(eq(WorkspaceTable.id, info.id)).run(),
         )
 
         const response = yield* Effect.promise(() =>
